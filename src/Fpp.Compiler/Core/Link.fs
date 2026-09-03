@@ -154,6 +154,90 @@ let private substScheme (inst : string list) (sch : Scheme) : Scheme =
             | TApp (h, args) -> TApp (go h, List.map go args)
         { Quantified = []; Constraints = []; Body = go sch.Body }
 
+/// Specialize the BINDER SCHEMES inside a stamped body.
+///
+/// `substScheme` above fixes the clone's SIGNATURE; the body was left alone,
+/// so a clone stamped at `int` still bound `'a` locals — and a `'a` local
+/// rides the UNIFORM representation, which is the only reason a concrete
+/// program boxes anything. A census over a small program found 113 of 233
+/// top-level functions still binding a type variable after monomorphization.
+///
+/// The substitution is the decl's own quantified variables against the
+/// instantiation, applied to every binder the body introduces: lambda
+/// parameters, `let`s, and pattern binders.
+let private substBinderTypes (inst : string list) (declSch : Scheme) (e : Expr) : Expr =
+    if List.isEmpty declSch.Quantified || declSch.Quantified.Length <> inst.Length then e
+    else
+    // ONLY scalar instantiations. Specializing a binder to a REFERENCE type
+    // changes no representation — both ride the uniform word — while it does
+    // perturb how a typeclass witness is chosen, which cost four adaptive-suite
+    // tests (typeclass materialization, derived instances, generic contexts).
+    // A SCALAR is the case that matters: that binder stops being a boxed word
+    // and becomes a raw register.
+    let scalarNames =
+        [ "int"; "float"; "float32"; "float16"; "int64"; "uint32"; "uint64"
+          "int16"; "uint16"; "byte"; "sbyte"; "bool"; "char"; "nativeint" ]
+    let m = dictNew<int, Type> ()
+    List.zip declSch.Quantified inst
+    |> List.iter (fun (v, n) ->
+        if List.contains n scalarNames then dictSet m (prunedId v) (TCon (n, [])))
+    let rec go (t : Type) : Type =
+        match prune t with
+        | TVar v -> (match dictTryFind m v.Id with Some c -> c | None -> TVar v)
+        | TCon (n, args) -> TCon (n, List.map go args)
+        | TFun (a, b) -> TFun (go a, go b)
+        | TTuple ts -> TTuple (List.map go ts)
+        | TApp (h, args) -> TApp (go h, List.map go args)
+    // a binder's own quantified vars SHADOW the decl's: leave those alone
+    let goSch (sc : Scheme) =
+        if List.isEmpty sc.Quantified then { sc with Body = go sc.Body } else sc
+    let rec goPat (p : Pat) =
+        match p with
+        | PVar (v, sc) -> PVar (v, goSch sc)
+        | PAs (inner, v, sc) -> PAs (goPat inner, v, goSch sc)
+        | PCtor (n, sc, ps) -> PCtor (n, sc, List.map goPat ps)
+        | PTuple ps -> PTuple (List.map goPat ps)
+        | PListLit ps -> PListLit (List.map goPat ps)
+        | PArrLit (k, ps) -> PArrLit (k, List.map goPat ps)
+        | PAnd (a, b) -> PAnd (goPat a, goPat b)
+        | POr ps -> POr (List.map goPat ps)
+        | PCons (h, t) -> PCons (goPat h, goPat t)
+        | other -> other
+    let rec walk (x : Expr) : Expr =
+        let x2 =
+            match x with
+            | ELam (ps, b) -> ELam (ps |> List.map (fun (v, sc) -> v, goSch sc), walk b)
+            | ELet (rc, v, sc, rhs, b) -> ELet (rc, v, goSch sc, walk rhs, walk b)
+            | EMatch (sx, cs) -> EMatch (walk sx, cs |> List.map (fun (p, g, b) -> goPat p, Option.map walk g, walk b))
+            | ETry (b, cs) -> ETry (walk b, cs |> List.map (fun (p, g, b2) -> goPat p, Option.map walk g, walk b2))
+            | EApp (g, args) -> EApp (walk g, List.map walk args)
+            | EIf (a, b, c) -> EIf (walk a, walk b, walk c)
+            | ETuple xs -> ETuple (List.map walk xs)
+            | EListLit xs -> EListLit (List.map walk xs)
+            | ESeq xs -> ESeq (List.map walk xs)
+            | EPrim (op, xs) -> EPrim (op, List.map walk xs)
+            | ECtor (n, sc, xs) -> ECtor (n, sc, List.map walk xs)
+            | ERecord (n, fs) -> ERecord (n, fs |> List.map (fun (k, v) -> k, walk v))
+            | ERecordExt (n, b, fs) -> ERecordExt (n, walk b, fs |> List.map (fun (k, v) -> k, walk v))
+            | EField (b, fn, o) -> EField (walk b, fn, o)
+            | EIfaceCall (i, mn, recv, args) -> EIfaceCall (i, mn, walk recv, List.map walk args)
+            | ECast (t, b, d) -> ECast (t, walk b, d)
+            | ETypeTest (t, b) -> ETypeTest (t, walk b)
+            | EFieldSet (b, fn, o, v) -> EFieldSet (walk b, fn, o, walk v)
+            | EWhile (c, b) -> EWhile (walk c, walk b)
+            | EAssign (v, b) -> EAssign (v, walk b)
+            | EArray (n, xs) -> EArray (n, List.map walk xs)
+            | EIndex (n, a, i) -> EIndex (n, walk a, walk i)
+            | EIndexSet (n, a, i, v) -> EIndexSet (n, walk a, walk i, walk v)
+            | EArrayLen (n, a) -> EArrayLen (n, walk a)
+            | EArrayCreate (n, a, b) -> EArrayCreate (n, walk a, walk b)
+            | EArrayPin (n, a) -> EArrayPin (n, walk a)
+            | EArrayUnpin (n, a) -> EArrayUnpin (n, walk a)
+            | EArrayBytes (n, a) -> EArrayBytes (n, walk a)
+            | other -> other
+        x2
+    walk e
+
 let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
     let r = mapExpr f
     let e2 =
@@ -1095,6 +1179,60 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
              // generic through its captures — the enclosing stamp's
              // substitution rides along explicitly
              for k, nm in substOverride do dictSet subst k nm
+             // A marker can name a type variable that is not either spelling of
+             // the scheme's own. `t * (One - One * t)` in a `when Num<'a>` body
+             // renders its constant as `$class:Num:One:#4`, where #4 is the
+             // FRESH variable the constant was typed with and was unified with
+             // 'a only afterwards — so the string was baked before the two
+             // became one, and stamping left it. The backend then had a class
+             // constant at an unresolved type and emitted a trap, while the
+             // same body with `let one : 'a = One` bound first worked
+             // (KNOWN-ISSUES #3). In a clone with ONE type parameter there is
+             // nothing else a leftover variable can be.
+             // The mapping is taken from the marker's CLASS, never guessed: a
+             // body can nest a generic lambda with type variables of its own,
+             // and mapping those to the instantiation is how a vtable slot
+             // ended up unresolved in the adaptive suite. `$class:Num:One:#4`
+             // says the constraint is Num, the scheme says Num applies to 'a,
+             // and 'a's position picks the instantiation — evidence, not
+             // position.
+             let qIndexOf (t : Type) : int =
+                 match prune t with
+                 | TVar v ->
+                     let mutable idx = -1
+                     List.iteri
+                         (fun i (qv : Var) -> if idx < 0 && prunedId qv = prunedId v then idx <- i)
+                         sch.Quantified
+                     idx
+                 | _ -> -1
+             let classVarInst (cls : string) : string option =
+                 // every constraint for the class must AGREE on which variable
+                 // it applies to. A body that mentions a constant repeatedly
+                 // carries one constraint per occurrence until they merge, and
+                 // demanding exactly one left the nested spelling unresolved.
+                 let idxs =
+                     sch.Constraints
+                     |> List.filter (fun c -> c.Class = cls && not (List.isEmpty c.Args))
+                     |> List.map (fun c -> qIndexOf (List.head c.Args))
+                     |> List.filter (fun i -> i >= 0 && i < inst.Length)
+                 match idxs with
+                 | [] -> None
+                 | first :: rest ->
+                     if rest |> List.forall (fun i -> i = first) then Some (List.item first inst)
+                     else None
+             mapExpr
+                 (fun x ->
+                     (match x with
+                      | EUnknown n when n.StartsWith "$class:" ->
+                          let parts = n.Substring(7).Split ':'
+                          if parts.Length >= 3 && parts.[2].StartsWith "#"
+                             && (dictTryFind subst parts.[2]).IsNone then
+                              (match classVarInst parts.[0] with
+                               | Some nm -> dictSet subst parts.[2] nm
+                               | None -> ())
+                      | _ -> ())
+                     x)
+                 e |> ignore
              // forward the class-var -> concrete-type map (WasmLin-only): this
              // stamped member's `'k` is concrete here, keyed by the SAME id the
              // body's TVar carries, so the backend seeds a constant witness.
@@ -1364,9 +1502,15 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                          | other -> other)
                      x
              let clone =
+                 // the binder schemes in the BODY are specialized too, not just
+                 // the signature — see substBinderTypes. NOT env-gated: an
+                 // env-gated pass cannot be validated by the fixpoint, because
+                 // GetEnvironmentVariable answers null inside the wasm-hosted
+                 // compiler, so stage-0 would run it and stage-1 would not.
+                 let body0 = objFix (allocFix (selfFix (rewrite mangled selfKey subst false e)))
+                 let body1 = substBinderTypes inst sch body0
                  DLet (rc, nv, substScheme inst sch,
-                       alphaRename (10000000 + (abs (strHash mangled) % 1000000) * 10)
-                           (objFix (allocFix (selfFix (rewrite mangled selfKey subst false e)))))
+                       alphaRename (10000000 + (abs (strHash mangled) % 1000000) * 10) body1)
              dictSet stamped mangled clone
          | None -> ())
         i <- i + 1
@@ -1674,8 +1818,10 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
                      demand (v.Path, v.Offset)
                      scan e)
         // an exported function is a root: the HOST is the caller, and
-        // nothing in the program names it
-        | DExport (v, _) -> demand (v.Path, v.Offset)
+        // nothing in the program names it. The `$inline` marker is NOT a
+        // root — it is a note about a function, and pinning it would keep
+        // every fully-inlined body alive forever.
+        | DExport (v, nm) -> if nm <> "$inline" then demand (v.Path, v.Offset)
         | _ -> ()
     let mutable i = 0
     while i < vecLen work do
@@ -1695,6 +1841,9 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
     |> List.filter (fun d ->
         match d with
         | DLet (_, v, _, ELam _) -> (dictTryFind keep (v.Path, v.Offset)).IsSome
+        // a marker whose function died goes with it, or a later pass meets
+        // a DExport naming nothing
+        | DExport (v, "$inline") -> (dictTryFind keep (v.Path, v.Offset)).IsSome
         | DExtern (v, _) -> (dictTryFind keep (v.Path, v.Offset)).IsSome
         // a value nobody reads, whose initializer cannot have an effect, does
         // not need to be computed — and dropping it drops whatever only its

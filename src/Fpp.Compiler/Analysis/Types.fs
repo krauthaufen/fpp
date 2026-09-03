@@ -64,6 +64,34 @@ let tBool = TCon ("bool", [])
 let tUnit = TCon ("unit", [])
 let tList (t : Type) = TCon ("list", [ t ])
 
+/// The primitive scalars have TWO SPELLINGS EACH, and they are one type.
+/// F# writes `int`/`int32`, `float`/`double`, `byte`/`uint8` for the same
+/// thing; here each spelling used to become its own nominal type, so
+/// `let (b : byte) = (a : uint8)` was a type error and `let n : int32 = 1`
+/// annotated a type no backend knows. Both spellings are WRITTEN in the same
+/// program all the time — the .NET names come in with ported code — so this
+/// is not a surface anyone can be asked to avoid.
+///
+/// One canonical name per scalar. The alias is NOT rewritten where it is
+/// written: it survives inference so a diagnostic can echo the spelling the
+/// author used, the way fsc does. It is equal to its canonical form at every
+/// point that compares type names — `unify`, and Classes' three head
+/// matchers — and it is canonicalized on the way OUT, in `typeConName` and
+/// `instConName` below, which is how every downstream consumer names a type.
+/// A name that reaches emission unnormalized has no class id to test
+/// against, so the test is silently false. The backends' own scattered
+/// `"float" | "double"` pairs are left alone as a backstop — a name can
+/// still arrive already-spelled from a serialized `.fppir` package.
+let canonTypeName (n : string) : string =
+    match n with
+    | "int32" -> "int"
+    | "uint" -> "uint32"
+    | "double" -> "float"
+    | "single" -> "float32"
+    | "uint8" -> "byte"
+    | "int8" -> "sbyte"
+    | other -> other
+
 /// What a SPECULATIVE unification has changed, so it can be put back.
 /// Threaded explicitly rather than kept in module state: two workspaces
 /// type-check at once in the test harness, and a trial that recorded — and
@@ -85,12 +113,25 @@ let rec prune (t : Type) : Type =
     | TVar v ->
         match v.Link with
         | Some inner ->
-            let r = prune inner
-            // path compression is not recorded: it re-points a variable at
-            // the SAME representative it already had, so undoing a trial
-            // leaves it pointing where it should either way
-            v.Link <- Some r
-            r
+            // NO PATH COMPRESSION. The note that used to stand here said it
+            // re-points a variable at the SAME representative it already had,
+            // so a trial rollback leaves it pointing where it should either
+            // way. That holds only when no rollback happens in between.
+            //
+            // `v3 -> v1`; a trial links `v1 -> X` and RECORDS it; a `prune v3`
+            // then compresses `v3 -> X` and records NOTHING; the trial rolls
+            // back and restores v1 to free — but v3 still points at X. The tie
+            // between v3 and v1 is severed by a write the undo log never saw.
+            //
+            // That is why a binding's parameter and its own return annotation
+            // could be the SAME variable when its body started and two
+            // different ones when it ended, with no link-changing undo in the
+            // trail, no variable copied and no scope entry rewritten
+            // (KNOWN-ISSUES #3). Chains here are short; following them is
+            // cheaper than being wrong — restoring compression (safely, gated
+            // on a trial-depth counter) was measured and moved inference by
+            // nothing at all.
+            prune inner
         | None -> t
     | TApp (h, args) ->
         // a solved head collapses the application; a partial binding
@@ -105,12 +146,16 @@ let rec prune (t : Type) : Type =
 /// The name of a type AT an instantiation: `Pair<float,int>` is the distinct
 /// type `Pair$float$int`. Generic structs must be stamped per instantiation
 /// or their fields stay boxed, so the name has to carry the arguments.
+/// THE BOUNDARY out of inference. Everything downstream — stamping, class
+/// ids, layouts, the marker strings in InferResult — names a type through
+/// here, so canonicalizing at this one point is what lets the alias spelling
+/// survive inference for diagnostics without any of it reaching emission.
 let rec typeConName (t : Type) : string =
     match prune t with
-    | TCon (n, []) -> n
+    | TCon (n, []) -> canonTypeName n
     // bracketed so nested arguments stay unambiguous:
     // Pair<int, Pair<int,int>> -> Pair$<int.Pair$<int.int>>
-    | TCon (n, args) -> n + "$<" + String.concat "." (List.map typeConName args) + ">"
+    | TCon (n, args) -> canonTypeName n + "$<" + String.concat "." (List.map typeConName args) + ">"
     | TVar v -> "#" + string v.Id
     | TApp (h, args) ->
         typeConName h + "$<" + String.concat "." (List.map typeConName args) + ">"
@@ -132,7 +177,7 @@ let rec instConName (t : Type) : string =
     | TTuple ts ->
         "$tup" + string (List.length ts) + "$<" + String.concat "." (List.map instConName ts) + ">"
     | TCon (n, args) when not (List.isEmpty args) ->
-        n + "$<" + String.concat "." (List.map instConName args) + ">"
+        canonTypeName n + "$<" + String.concat "." (List.map instConName args) + ">"
     | other -> typeConName other
 
 /// Map every type inside a constraint.
@@ -341,13 +386,19 @@ let rec private unifySeen (seen : RefPairSet<Type>) (trial : Trial option) (t1 :
             v.Link <- Some other
             None
     | TCon (n1, a1), TCon (n2, a2) ->
-        if n1 = n2 && List.length a1 = List.length a2 then
+        // A SCALAR'S TWO SPELLINGS ARE ONE TYPE, and the alias survives
+        // inference so a DIAGNOSTIC can echo what was written — `int32` is
+        // reported as `int32`, the way fsc reports it, rather than as the
+        // canonical `int`. That is the only reason the alias is still here:
+        // it is equal to its canonical form everywhere, and the boundary out
+        // of inference canonicalizes, so nothing downstream ever sees one.
+        if canonTypeName n1 = canonTypeName n2 && List.length a1 = List.length a2 then
             List.zip a1 a2 |> List.tryPick (fun (x, y) -> unify x y)
         // widening is COMMITTING-only: during an overload TRIAL the
         // question is "does this candidate fit as declared", and letting a
         // seq subsume into a HashSet parameter made the wrong Overlaps
         // overload fit — the runtime then read Root off a seq
-        elif n1 <> n2 && subsumeHook.IsSome && trial.IsNone then
+        elif canonTypeName n1 <> canonTypeName n2 && subsumeHook.IsSome && trial.IsNone then
             // one side implements the other: the value widens, as it does
             // in F#. The hook names the class's DECLARED instantiation of
             // the interface; unifying against it is what pins the
@@ -459,12 +510,35 @@ let unifyTrialUnder (rigid : bool) (t1 : Type) (t2 : Type) (k : unit -> 'r) : 'r
         v.Level <- lvl
     out
 
+/// The variable id supply, PROCESS-WIDE and shared by every TypeState.
+///
+/// It has to be: schemes from a cached prelude outlive the TypeState that
+/// built them, so a per-instance counter restarting at 0 hands a FRESH
+/// variable an id a cached one already owns. Everything keyed by id then
+/// confuses the two — and the damage is silent. A binding's parameter and its
+/// own return annotation, the SAME variable when its body starts, came out as
+/// two after it, because each had been unified with a different imported
+/// variable that shared its number. The scheme then quantified both, and a
+/// `when Num<'a> when OfInt<'a>` function stamped `$float$int` with its
+/// operators substituted through the wrong one to `int` (KNOWN-ISSUES #3).
+///
+/// Interlocked because two workspaces type-check at once under Expecto.
+let private idSupply = ref 0
+
+/// The id supply, for a snapshot to record and restore. A run that skips
+/// the prelude must not restart the counter below where the prelude left
+/// it: a PROJECT variable would then be minted with an id the prelude
+/// already used, and the class/operator markers that name a variable by id
+/// inside a string would point at the wrong one. Restoring it is what makes
+/// a cached build byte-identical to an uncached one.
+let idSupplyMark () : int = idSupply.Value
+
+let reserveIds (n : int) : unit =
+    while idSupply.Value < n do
+        System.Threading.Interlocked.Increment idSupply |> ignore
+
 /// Variable supply and level tracking for one inference run.
 type TypeState() =
-    // the id supply is PROCESS-WIDE: schemes from a cached prelude live
-    // across TypeStates, and id-keyed substitutions must never confuse a
-    // cached variable with a fresh one that restarted the count
-    let mutable nextId = 0
     let mutable level = 0
 
     member _.Level = level
@@ -472,8 +546,8 @@ type TypeState() =
     member _.ExitLevel () = level <- level - 1
 
     member _.Fresh () : Type =
-        nextId <- nextId + 1
-        TVar { Id = nextId; Level = level; Link = None; Rigid = false }
+        let id = System.Threading.Interlocked.Increment idSupply
+        TVar { Id = id; Level = level; Link = None; Rigid = false }
 
     /// Quantify variables deeper than the current level. A constraint is
     /// carried into the scheme when it mentions a quantified variable — the

@@ -3500,6 +3500,19 @@ instance Pinnable<string>
     member s.Unpin =
         String.unpin s |> ignore
 
+
+/// `System.Environment.GetEnvironmentVariable`, which the wasm-hosted compiler
+/// could not answer before: `System` reaches the backend unresolved, so it
+/// returned null and every env-gated pass did nothing in stage-1 while doing
+/// something in stage-0 — which is exactly why the fixpoint could not check
+/// one: the byte mismatch it reported meant nothing. WASI gives the reactor a
+/// real environment, so this is just getenv.
+type EnvOps =
+    static member Get (name : string) : string =
+        let n = envGetLen name
+        if n < 0 then null
+        else String.ofArray (Array.init n (fun i -> char (envGetByte i)))
+
 module Seq =
     // the mapping runs ON MoveNext and the result is CACHED: applying it in
     // Current re-ran it on every read (F#'s enumerators promise Current is
@@ -6792,6 +6805,14 @@ extern let gcHeapRefs : obj -> int
 /// collection nor synchronous finalizers — there these are no-ops.
 extern let gcOnCleanup : obj -> (unit -> unit) -> unit
 extern let gcCollect : unit -> unit
+extern let gcAllocatedBytes : unit -> int
+
+/// The process environment. `envGetLen` answers the value's length in bytes,
+/// or -1 when the variable is unset, and leaves the value where `envGetByte`
+/// can read it a byte at a time — which avoids handing a buffer across the
+/// boundary in either direction.
+extern let envGetLen : string -> int
+extern let envGetByte : int -> int
 
 /// Weak references and ephemerons, over the collector's own. A WEAK ref is an
 /// ephemeron with key = value = the target: it keeps nothing alive and reads
@@ -6859,6 +6880,11 @@ type GC =
     /// force a full collection, then run every pending cleanup — the
     /// deterministic point
     static member Collect () : unit = gcCollect ()
+    /// bytes this program has allocated since it started. A COUNTER, not a
+    /// heap size: it never falls. "Did that loop allocate?" has no other
+    /// honest answer — a growable heap can absorb a lot without collecting
+    /// once, so the absence of a collection proves nothing.
+    static member AllocatedBytes () : int = gcAllocatedBytes ()
     /// .NET's tuned overload (generation, mode, blocking, compacting):
     /// every collection here is already full and compacting, so the
     /// arguments are accepted and ignored

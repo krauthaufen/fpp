@@ -37,6 +37,12 @@ type LReg =
 /// maps one op to exactly one instruction (wasm) or one C operator with no
 /// type inference of its own. `S`/`U` suffixes are signed/unsigned.
 type LOp =
+    /// branchless choose: operands are (then, else, condition) in the order
+    /// wasm's `select` pops them. A conditional whose arms are both cheap and
+    /// side-effect-free is this, not a branch — `Box3d.ExtendedBy` is six of
+    /// them, and clang's wasm emits six `select` where we emitted sixteen
+    /// branches.
+    | SelV
     // word (i32 / intptr) integer ops
     | AddW | SubW | MulW | DivSW | RemSW
     | AndW | OrW  | XorW | ShlW  | ShrSW | ShrUW

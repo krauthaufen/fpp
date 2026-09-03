@@ -11,7 +11,83 @@ let private readSource (path : string) : string =
 // `fpp check <files>` — batch diagnostics. Deliberately a second thin client
 // of the same Workspace the LSP server uses.
 
+/// The prelude snapshot: read before the build, written after a miss.
+///
+/// ALL of it lives here, in the CLI, and none in the compiler library —
+/// `Workspace.fs` is compiled by this compiler, and a host API the
+/// self-hosted build does not implement becomes a stub that takes its whole
+/// enclosing function with it. File IO there trapped stage-1 at module
+/// init, and only the fixpoint noticed.
+///
+/// The file is keyed by the COMPILER BINARY that wrote it — its path, size
+/// and write time. Nothing weaker is honest: the snapshot carries inferred
+/// types, so any change to inference invalidates it, and a key over the
+/// prelude source alone would hand a rebuilt compiler the previous one's
+/// conclusions. A prelude edited under a fixed binary is caught separately,
+/// by the source hash inside the snapshot.
+///
+/// `FPP_NO_PRELUDE_CACHE=1` turns it off; `FPP_CACHE_DIR` moves it.
+let mutable private cacheFilePath = ""
+
+let private preludeCacheFile (defines : string list) : string =
+    try
+        if System.Environment.GetEnvironmentVariable "FPP_NO_PRELUDE_CACHE" = "1" then ""
+        else
+            let asm = System.Reflection.Assembly.GetExecutingAssembly().Location
+            if isNull asm || asm = "" || not (System.IO.File.Exists asm) then ""
+            else
+                let fi = System.IO.FileInfo asm
+                let stamp = asm + "|" + string fi.Length + "|" + string fi.LastWriteTimeUtc.Ticks
+                let dir =
+                    match System.Environment.GetEnvironmentVariable "FPP_CACHE_DIR" with
+                    | null | "" ->
+                        let bas =
+                            match System.Environment.GetEnvironmentVariable "XDG_CACHE_HOME" with
+                            | null | "" ->
+                                System.IO.Path.Combine (
+                                    System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile,
+                                    ".cache")
+                            | x -> x
+                        System.IO.Path.Combine (bas, "fpp")
+                    | d -> d
+                // the DEFINE SET is part of the key: the prelude preprocesses
+                // per target, so a native project and a wasm one have
+                // different preludes from the one binary. The source hash
+                // inside the snapshot would catch the mix-up, but the two
+                // would then overwrite each other forever and never hit.
+                System.IO.Path.Combine (
+                    dir,
+                    "prelude-" + Fpp.PreludeCache.srcHash stamp
+                    + "-" + Fpp.PreludeCache.srcHash (String.concat ";" (List.sort defines)) + ".sx")
+    with _ -> ""
+
+let private preludeCacheLoad (file : string) : unit =
+    try
+        Fpp.PreludeCache.wanted <- file <> ""
+        if file <> "" && System.IO.File.Exists file then
+            Fpp.PreludeCache.input <- System.IO.File.ReadAllText file
+    with _ -> ()
+
+/// Called once the DEFINES are known, which is inside the command rather
+/// than at startup.
+let private preludeCacheBegin (defines : string list) : unit =
+    cacheFilePath <- preludeCacheFile defines
+    preludeCacheLoad cacheFilePath
+
+/// Through a temp file and MOVED into place: the gate suite runs eight
+/// compilers at once against one cache directory, and a reader must never
+/// see half a snapshot.
+let private preludeCacheStore (file : string) : unit =
+    try
+        if file <> "" && Fpp.PreludeCache.output <> "" then
+            System.IO.Directory.CreateDirectory (System.IO.Path.GetDirectoryName file) |> ignore
+            let tmp = file + "." + string (System.Diagnostics.Process.GetCurrentProcess().Id) + ".tmp"
+            System.IO.File.WriteAllText (tmp, Fpp.PreludeCache.output)
+            System.IO.File.Move (tmp, file, true)
+    with _ -> ()
+
 let private check (strict : bool) (defines : string list) (files : string list) : int =
+    preludeCacheBegin defines
     let ws = Workspace()
     // `check` sees the ORACLE's view of conditional code
     ws.Defines <- "WASM" :: defines
@@ -102,14 +178,20 @@ let private mergeGcModule (moduleBytes : byte[]) (out : string) : int =
         use p = System.Diagnostics.Process.Start psi
         p.WaitForExit()
         p.ExitCode
+    let timing = System.Environment.GetEnvironmentVariable "FPP_TIME" = "1"
+    let clk = System.Diagnostics.Stopwatch.StartNew ()
     let r1 = run wasmMerge [ "-all"; reactor; "fpprt"; modWasm; "mutator"; "-S"; "-o"; wat ]
+    if timing then eprintfn "TIME %-14s %6d ms" "wasm-merge" clk.ElapsedMilliseconds
+    clk.Restart ()
     if r1 <> 0 then (eprintfn "error: wasm-merge failed (is %s present? set FPP_WASM_MERGE / FPP_REACTOR)" wasmMerge; 1)
     else
         let r2 = run wasmTools [ "parse"; wat; "-o"; out ]
+        if timing then eprintfn "TIME %-14s %6d ms" "wasm-tools" clk.ElapsedMilliseconds
         (try System.IO.File.Delete modWasm; System.IO.File.Delete wat with _ -> ())
         if r2 <> 0 then (eprintfn "error: wasm-tools parse failed (set FPP_WASM_TOOLS)"; 1) else 0
 
 let private build (strict : bool) (defines : string list) (out : string) (files : string list) : int =
+    preludeCacheBegin defines
     let ws = Workspace()
     // the target IS the configuration: `#if WASM` code exists only in wasm
     // builds, `#if NATIVE` only in C builds — nothing compiles to a trap
@@ -544,6 +626,16 @@ let private openProject (proj : string) : (string list * string * string list) o
 
 let private isProject (f : string) = f.EndsWith Project.extension
 
+/// The single project in this directory, opened. `dev` and `bundle` take no
+/// project argument, so this is where "the project here" is decided.
+let private webProject (dir : string) =
+    match System.IO.Directory.GetFiles (dir, "*" + Project.extension) |> Array.sortBy id |> Array.tryHead with
+    | Some proj ->
+        (match openProject proj with
+         | Some (files, out, defs) -> Some (proj, files, out, defs)
+         | None -> None)
+    | None -> None
+
 [<EntryPoint>]
 let main argv =
     let argl0 = List.ofArray argv
@@ -560,39 +652,73 @@ let main argv =
     Fpp.Backend.WasmLin.gc <- useGc
     lowirBackend <- (argl0 |> List.exists (fun a -> a = "--lowir")) || useGc
     linearBackend <- standalone || useGc
-    match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear" && a <> "--lowir" && a <> "--gc") with
-    | [ "check"; proj ] when isProject proj ->
-        (match openProject proj with
-         | Some (files, _, defs) -> check strict defs files
-         | None -> 1)
-    | [ "build"; proj ] when isProject proj ->
-        (match openProject proj with
-         | Some (files, out, defs) -> build strict defs out files
-         | None -> 1)
-    | [ "build"; proj; "-o"; out ] when isProject proj ->
-        (match openProject proj with
-         | Some (files, _, defs) -> build strict defs out files
-         | None -> 1)
-    | "check" :: files when not (List.isEmpty files) -> check strict [] files
-    | "picks" :: files when not (List.isEmpty files) -> picks files
-    | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build strict [] out files
-    | "lib" :: "-o" :: out :: files when not (List.isEmpty files) -> buildLib out files
-    | [ "pack"; proj; "-o"; out ] when isProject proj -> pack proj out
-    | [ "restore"; proj ] when isProject proj -> restore proj
-    | [ "publish"; fpkg; reg ] when fpkg.EndsWith ".fpkg" -> publish fpkg reg
-    | [ "exe"; proj; "-o"; out ] when isProject proj ->
-        (match openProject proj with
-         | Some (files, _, _) -> buildExe out files
-         | None -> 1)
-    | "exe" :: "-o" :: out :: files when not (List.isEmpty files) -> buildExe out files
-    | _ ->
-        eprintfn "usage:"
-        eprintfn "  fpp check [--strict] <project.fppproj> | fpp check [--strict] <file>..."
-        eprintfn "  fpp build [--strict] [--linear] <project.fppproj> [-o out.wasm] | fpp build [--strict] -o out.wasm <file>..."
-        eprintfn "      --strict: fail when any function had to be stubbed (would trap if reached)"
-        eprintfn "  fpp lib -o out.fppir <file>..."
-        eprintfn "  fpp pack <project.fppproj> -o out.fpkg      (needs a `version` line)"
-        eprintfn "  fpp publish <pkg.fpkg> <registry-dir-or-url>"
-        eprintfn "  fpp restore <project.fppproj>               (solves `package` lines, writes fpp.lock)"
-        eprintfn "  fpp exe -o app <file>... | fpp exe <project.fppproj> -o app"
-        2
+    let rc =
+        match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear" && a <> "--lowir" && a <> "--gc") with
+        | [ "check"; proj ] when isProject proj ->
+            (match openProject proj with
+             | Some (files, _, defs) -> check strict defs files
+             | None -> 1)
+        | [ "build"; proj ] when isProject proj ->
+            (match openProject proj with
+             | Some (files, out, defs) -> build strict defs out files
+             | None -> 1)
+        | [ "build"; proj; "-o"; out ] when isProject proj ->
+            (match openProject proj with
+             | Some (files, _, defs) -> build strict defs out files
+             | None -> 1)
+        | "check" :: files when not (List.isEmpty files) -> check strict [] files
+        | "picks" :: files when not (List.isEmpty files) -> picks files
+        | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build strict [] out files
+        | "lib" :: "-o" :: out :: files when not (List.isEmpty files) -> buildLib out files
+        | [ "pack"; proj; "-o"; out ] when isProject proj -> pack proj out
+        | [ "restore"; proj ] when isProject proj -> restore proj
+        | [ "publish"; fpkg; reg ] when fpkg.EndsWith ".fpkg" -> publish fpkg reg
+        | [ "exe"; proj; "-o"; out ] when isProject proj ->
+            (match openProject proj with
+             | Some (files, _, _) -> buildExe out files
+             | None -> 1)
+        | "exe" :: "-o" :: out :: files when not (List.isEmpty files) -> buildExe out files
+        // ---- the browser workflow -------------------------------------------
+        // `dev` and `bundle` find the project themselves: a web project has one,
+        // and typing its name every time is friction the other verbs can afford
+        // because they are scripted and these two are not.
+        | [ "new"; name ] -> Web.scaffold name
+        | "dev" :: rest ->
+            let dir = System.IO.Directory.GetCurrentDirectory ()
+            let port =
+                match rest with
+                | [ "--port"; p ] -> (match System.Int32.TryParse p with | true, v -> v | _ -> 8080)
+                | _ -> 8080
+            (match webProject dir with
+             | Some (proj, files, out, defs) ->
+                 Web.dev dir port (fun () -> build false defs out files = 0)
+             | None -> eprintfn "error: no .fppproj here — `fpp new <name>` makes one"; 1)
+        | "bundle" :: rest ->
+            let dir = System.IO.Directory.GetCurrentDirectory ()
+            let outDir =
+                match rest with
+                | [ "-o"; o ] -> o
+                | _ -> System.IO.Path.Combine (dir, "dist")
+            (match webProject dir with
+             | Some (proj, files, out, defs) ->
+                 Web.bundle dir outDir (fun () -> build false defs out files = 0)
+             | None -> eprintfn "error: no .fppproj here — `fpp new <name>` makes one"; 1)
+        | "npm" :: rest -> Web.npm (System.IO.Directory.GetCurrentDirectory ()) rest
+        | _ ->
+            eprintfn "usage:"
+            eprintfn "  fpp check [--strict] <project.fppproj> | fpp check [--strict] <file>..."
+            eprintfn "  fpp build [--strict] [--linear] <project.fppproj> [-o out.wasm] | fpp build [--strict] -o out.wasm <file>..."
+            eprintfn "      --strict: fail when any function had to be stubbed (would trap if reached)"
+            eprintfn "  fpp lib -o out.fppir <file>..."
+            eprintfn "  fpp pack <project.fppproj> -o out.fpkg      (needs a `version` line)"
+            eprintfn "  fpp publish <pkg.fpkg> <registry-dir-or-url>"
+            eprintfn "  fpp restore <project.fppproj>               (solves `package` lines, writes fpp.lock)"
+            eprintfn "  fpp exe -o app <file>... | fpp exe <project.fppproj> -o app"
+            eprintfn "  fpp new <name>                              (a browser project: page, glue, wasm)"
+            eprintfn "  fpp dev [--port N]                          (build, serve, watch, reload)"
+            eprintfn "  fpp bundle [-o dist]                        (a directory any static host can take)"
+            eprintfn "  fpp npm <args>...                           (npm, in this project — for JS interop)"
+            2
+    // written AFTER the build: a miss fills it during the compile
+    preludeCacheStore cacheFilePath
+    rc

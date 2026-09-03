@@ -913,6 +913,23 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     | EApp (EUnknown "gcCollect", [ _ ]) ->
         stmt f "fpprt_collect();"
         unitV ()
+    // the environment: the C leg has getenv directly
+    | EApp (EUnknown "envGetLen", [ nameE ]) ->
+        let a = emitE st f nameE
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)fpp_env_get(" + sref a + "));")
+        d
+    | EApp (EUnknown "envGetByte", [ i ]) ->
+        let a = emitE st f i
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)fpp_env_byte((int)UNTAGI(" + sref a + ")));")
+        d
+    | EApp (EUnknown "gcAllocatedBytes", [ _ ]) ->
+        // the C leg TAGS its scalars, so the counter rides the same tagging
+        // an int literal would
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)fpprt_allocated_bytes());")
+        d
     // weak references and ephemerons: fpprt's, the same ones the wasm leg
     // imports. Only a real POINTER can be watched — a tagged scalar or null
     // is its own answer.
@@ -1304,6 +1321,9 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         emitE st f u1 |> ignore
         stmt f "fpprt_collect();"
         unitV ()
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ u1 ]) when v.Name = "gcAllocatedBytes" ->
+        emitE st f u1 |> ignore
+        emitE st f (EApp (EUnknown "gcAllocatedBytes", [ u1 ]))
     | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a ]) when
             v.Name = "gcWeakNew" || v.Name = "gcWeakGet" || v.Name = "gcEphKey"
             || v.Name = "gcEphValue" || v.Name = "gcWeakSupported" ->
@@ -3262,7 +3282,8 @@ let emitC (decls : Decl list) : string * string list =
                 [ "box"; "unbox"; "float16Bits"; "doubleBits"; "bitsDouble"; "singleBits"
                   "stackDepth"; "stackFrame"
                   // cleanup intrinsics: lowered in emitE, never raw C externs
-                  "gcOnCleanup"; "gcCollect" ]
+                  "gcOnCleanup"; "gcCollect"; "gcAllocatedBytes"
+                  "envGetLen"; "envGetByte" ]
             if not (List.contains v.Name builtinNames)
                && not (v.Name.StartsWith "mem") then
                 let rec peel (t : Type) (acc : Type list) =

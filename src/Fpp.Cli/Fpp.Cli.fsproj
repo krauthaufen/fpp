@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="Web.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
@@ -22,5 +23,8 @@
          via FPP_REACTOR) -->
     <None Include="../../tests/tooling/gc/fpprt_reactor_mmc.wasm" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../tests/tooling/gc/fpprt_reactor.wasm" CopyToOutputDirectory="PreserveNewest" />
+    <!-- the browser loader ships beside the binary: `fpp dev`/`bundle` copy it
+         into the project, since a static host cannot reach into the install -->
+    <None Include="../../stdlib/fpp-js.mjs" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

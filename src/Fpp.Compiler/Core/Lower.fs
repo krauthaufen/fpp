@@ -45,6 +45,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (existMatch : Dict<int, string>)
           (dictUses : Dict<int, int * int>) : LowerResult =
 
+    // A SYNTHETIC LOCAL MUST NOT LIVE IN THE SOURCE'S PATH. Every one below is
+    // minted at `<some node's offset> + <a bias>`, and the biases are small —
+    // 1000, 50000, 600000, 670000. The backend keys its function table by
+    // `path:offset`, so in a source longer than the bias the synthetic local
+    // lands ON a real top-level function and is taken for one: the interface
+    // eta parameter `_eta0` at 223,642 + 670,000 met `YieldFrom` at 893,642 in
+    // the 917 KB adaptive port, was eta-expanded to that function's arity, and
+    // the resulting closure read a FREE variable as its second argument. MapExt
+    // then built an unordered tree, because `cmp.Compare(key, n.Key)` answered
+    // on garbage — with no diagnostic anywhere, and only in a source big enough
+    // to reach the bias. Its own path cannot be any file's, so the collision
+    // cannot happen at any size.
+    let synPath = "(syn)"
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
 
@@ -216,6 +229,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     for off, tn in strTypes do dictSet strTypeAt off tn
     let memberIndex = dictNew<string, Resolve.Definition> ()
     for k, d in dictPairs projectMembers do dictSet memberIndex k d
+    if System.Environment.GetEnvironmentVariable "FPP_MEMBER_DUMP" = "1" then
+        for k, _ in dictPairs projectMembers do
+            if k.Contains "ToString" then eprintfn "MEMBER %s" k
     for k, d in binder.Members do dictSet memberIndex k d
 
     /// The exception a `with` clause is handling, while its body is lowered.
@@ -391,7 +407,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if argCount > 0 && not (nm.Contains "`")
                && (dictTryFind tyAliases ("$arity:" + nm + ":" + string argCount)).IsSome
             then nm + "`" + string argCount
-            else nm)
+            // the WRITTEN spelling of a scalar reaches here too — `:? uint8`
+            // would name a class id that does not exist, and the test is
+            // silently false. Inference canonicalizes the type; this
+            // canonicalizes the name emission tests against.
+            else canonTypeName nm)
 
 
     /// A BINARY (`0b1011`) or OCTAL (`0o17`) literal, rewritten to decimal
@@ -1084,7 +1104,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // `_` is a simple parameter with no name, not a structured
                 // one: falling to the tupled path collapsed `let f _ o n`
                 // into a one-tuple lambda while every call stayed curried
-                | PWild -> Some ({ Path = path; Offset = offsetOf p + 640000; Name = "_ignored" }, mono (TCon ("?", []))), PWild
+                | PWild -> Some ({ Path = synPath; Offset = offsetOf p + 640000; Name = "_ignored" }, mono (TCon ("?", []))), PWild
                 | other -> None, other)
         if binds |> List.forall (fun (b, _) -> b.IsSome) then
             binds |> List.map (fun (b, _) -> b.Value), []
@@ -1104,7 +1124,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | PVar (v, s) -> v, s
                 | PLit LUnit -> { Path = path; Offset = offsetOf p; Name = "_unit" }, mono tUnit
                 | other ->
-                    let arg = { Path = path; Offset = offsetOf p + 660000; Name = "_arg" }
+                    let arg = { Path = synPath; Offset = offsetOf p + 660000; Name = "_arg" }
                     let sch = mono (TCon ("?", []))
                     bodyW <- EMatch (EVar (arg, sch), [ other, None, bodyW ])
                     arg, sch)
@@ -1310,8 +1330,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               let anon = mono (TCon ("?", []))
                               ELam ([ v, anon ], EApp (EUnknown "isNull", [ EVar (v, anon) ]))
                           else
+                          // the ALIAS SPELLINGS are the same conversions:
+                          // `double` is `float`, `int32` is `int`, `uint8` is
+                          // `byte`. Canonicalize the name rather than growing
+                          // the list — the list exists in four copies, and a
+                          // name added to three of them is a conversion that
+                          // types and then reaches the backend as an unknown.
+                          let cname = canonTypeName t.Text
                           let isConv =
-                              List.contains t.Text
+                              List.contains cname
                                   [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"
                                     "float"; "float32"; "float16"; "string"; "char"; "byte"
                                     "sbyte"; "nativeint" ]
@@ -1325,15 +1352,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    | Some pd -> Some (EApp (EVar (varIdOf pd, schemeOf pd), [ arg ]))
                                    | None -> None
                                let routed =
-                                   if t.Text = "string" && k = "s" then viaPrelude "FloatFmt.ToStrS"
-                                   elif (t.Text = "float32" || t.Text = "single") && k = "t" then viaPrelude "FloatFmt.OfStrS"
-                                   elif t.Text = "string" && (k = "f" || k = "d") then viaPrelude "FloatFmt.ToStr"
-                                   elif (t.Text = "float" || t.Text = "double") && k = "t" then viaPrelude "FloatFmt.OfStr"
+                                   if cname = "string" && k = "s" then viaPrelude "FloatFmt.ToStrS"
+                                   elif cname = "float32" && k = "t" then viaPrelude "FloatFmt.OfStrS"
+                                   elif cname = "string" && (k = "f" || k = "d") then viaPrelude "FloatFmt.ToStr"
+                                   elif cname = "float" && k = "t" then viaPrelude "FloatFmt.OfStr"
                                    else None
                                let body =
                                    match routed with
                                    | Some e -> e
-                                   | None -> EApp (EUnknown (t.Text + "#" + k), [ arg ])
+                                   | None -> EApp (EUnknown (cname + "#" + k), [ arg ])
                                ELam ([ v, anon ], body)
                            | None -> EUnknown t.Text))
                  | None -> note (offsetOf n) "type-variable expression")
@@ -1440,13 +1467,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->
                      (match tokensOf head |> List.tryHead with
                       | Some t ->
-                          List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ]
+                          List.contains (canonTypeName t.Text) [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ]
                           && (dictTryFind useDefs t.Offset).IsNone
                       | None -> false)
                  | _ -> false) ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | [ head; a ] ->
                      let t = (tokensOf head |> List.head)
+                     // the alias spellings name the same conversion
+                     let cname = canonTypeName t.Text
                      // no entry means the source is int, which is the kind
                      // OpKinds leaves out
                      let k = match dictTryFind opKinds t.Offset with Some x -> x | None -> ""
@@ -1461,10 +1490,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | Some d -> Some (EApp (EVar (varIdOf d, schemeOf d), [ arg ]))
                          | None -> None
                      let routed =
-                         if t.Text = "string" && k = "s" then viaPrelude "FloatFmt.ToStrS"
-                         elif (t.Text = "float32" || t.Text = "single") && k = "t" then viaPrelude "FloatFmt.OfStrS"
-                         elif t.Text = "string" && (k = "f" || k = "d") then viaPrelude "FloatFmt.ToStr"
-                         elif (t.Text = "float" || t.Text = "double") && k = "t" then viaPrelude "FloatFmt.OfStr"
+                         if cname = "string" && k = "s" then viaPrelude "FloatFmt.ToStrS"
+                         elif cname = "float32" && k = "t" then viaPrelude "FloatFmt.OfStrS"
+                         elif cname = "string" && (k = "f" || k = "d") then viaPrelude "FloatFmt.ToStr"
+                         elif cname = "float" && k = "t" then viaPrelude "FloatFmt.OfStr"
                          else None
                      (match routed, dictTryFind strTypeAt t.Offset with
                       | Some e, _ -> e
@@ -1472,9 +1501,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // the Show class' `str`, the same route `%A` takes to
                       // `show`. The runtime walker answered "?" — it sees
                       // words, not field or case names.
-                      | None, Some tn when t.Text = "string" ->
+                      // an OVERRIDDEN ToString wins, as it does in F#. `string x`
+                      // went straight to the Show class and printed the record
+                      // form even for a type that overrides ToString, while
+                      // `x.ToString ()` beside it answered correctly
+                      // (KNOWN-ISSUES #8). The override is an ordinary member,
+                      // so the project-wide member index finds it by owner.
+                      | None, Some tn when
+                            cname = "string" && (dictTryFind memberIndex (tn + ".ToString")).IsSome ->
+                          (match dictTryFind memberIndex (tn + ".ToString") with
+                           | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ arg; ELit LUnit ])
+                           | None -> EApp (EUnknown ("$class:Show:str:" + tn), [ arg ]))
+                      | None, Some tn when cname = "string" ->
                           EApp (EUnknown ("$class:Show:str:" + tn), [ arg ])
-                      | None, _ -> EApp (EUnknown (t.Text + "#" + k), [ arg ]))
+                      | None, _ -> EApp (EUnknown (cname + "#" + k), [ arg ]))
                  | _ -> note (offsetOf n) "conversion shape")
             | AppExpr when
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
@@ -1961,6 +2001,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | [ "System"; "String"; "Join" ] ->
                                  dictTryFind memberIndex "StringOps.Join"
                              | _ -> None
+                     // `System.Environment.GetEnvironmentVariable name`
+                     let sysEnv =
+                         if head.NodeKind <> DotExpr then None
+                         else
+                             match Green.tokens (GNode head)
+                                   |> List.filter (fun t -> t.Kind = Ident)
+                                   |> List.map (fun t -> t.Text) with
+                             | [ "System"; "Environment"; "GetEnvironmentVariable" ]
+                             | [ "Environment"; "GetEnvironmentVariable" ] ->
+                                 dictTryFind memberIndex "EnvOps.Get"
+                             | _ -> None
+                     match sysEnv with
+                     | Some d -> EApp (EVar (varIdOf d, schemeOf d), loweredArgs)
+                     | None ->
                      match sysJoin with
                      | Some d -> EApp (EVar (varIdOf d, schemeOf d), loweredArgs)
                      | None ->
@@ -2409,7 +2463,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                EApp (f, xs)
                            | lv ->
                                let arity = if op.Text = "||>" then 2 else 3
-                               let tmp = { Path = path; Offset = offsetOf n + 670000; Name = "_pp" }
+                               let tmp = { Path = synPath; Offset = offsetOf n + 670000; Name = "_pp" }
                                let sch = mono (TCon ("?", []))
                                let binders =
                                    List.init arity (fun i ->
@@ -2432,7 +2486,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           let first, second =
                               if op.Text = ">>" then lowerExpr (GNode l), lowerExpr (GNode r)
                               else lowerExpr (GNode r), lowerExpr (GNode l)
-                          let arg = { Path = path; Offset = offsetOf n + 660000; Name = "_cx" }
+                          let arg = { Path = synPath; Offset = offsetOf n + 660000; Name = "_cx" }
                           let sch = mono (TCon ("?", []))
                           ELam ([ arg, sch ], EApp (second, [ EApp (first, [ EVar (arg, sch) ]) ]))
                       | _ ->
@@ -2856,8 +2910,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // with the same suffix/class resolution an infix
                      // occurrence would get at this offset
                      let op = Green.tokens (GNode n) |> List.find (fun t -> t.Kind = Operator && t.Text <> ":")
-                     let va = { Path = path; Offset = offsetOf n + 610000; Name = "_opl" }
-                     let vb = { Path = path; Offset = offsetOf n + 610001; Name = "_opr" }
+                     let va = { Path = synPath; Offset = offsetOf n + 610000; Name = "_opl" }
+                     let vb = { Path = synPath; Offset = offsetOf n + 610001; Name = "_opr" }
                      let sch = mono (TCon ("?", []))
                      let la = EVar (va, sch)
                      let lb = EVar (vb, sch)
@@ -3057,7 +3111,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     match dictTryFind fieldOwners (offsetOf p) with
                                     | Some o -> o
                                     | None -> "StructTuple" + string elems.Length
-                                let arg = { Path = path; Offset = offsetOf p + 650000; Name = "_sarg" }
+                                let arg = { Path = synPath; Offset = offsetOf p + 650000; Name = "_sarg" }
                                 let sch = mono (TCon (tn, []))
                                 bodyW <- structLetElems elems tn (EVar (arg, sch)) bodyW
                                 arg, sch
@@ -3067,7 +3121,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 | PLit LUnit -> { Path = path; Offset = offsetOf p; Name = "_unit" }, mono tUnit
                                 | _ ->
                                     // a structured sibling: bind and match
-                                    let arg = { Path = path; Offset = offsetOf p + 650000; Name = "_arg" }
+                                    let arg = { Path = synPath; Offset = offsetOf p + 650000; Name = "_arg" }
                                     let sch = mono (TCon ("?", []))
                                     bodyW <- EMatch (EVar (arg, sch), [ lowerPat p, None, bodyW ])
                                     arg, sch)
@@ -3700,9 +3754,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      if arity > 0 then
                          let recv = lowerExpr (GNode lhs)
                          let sch = mono (TCon ("?", []))
+                         // A SYNTHETIC LOCAL MUST NOT LIVE IN THE SOURCE'S PATH.
+                         // These were `{ Path = path; Offset = t.Offset + 670000 }`,
+                         // and the backend keys its function table by
+                         // `path:offset` — so in a source longer than 670,000
+                         // characters the parameter collided with a REAL
+                         // top-level function at that offset, was taken for a
+                         // function of its arity, and got eta-expanded into a
+                         // closure with a free variable. It then read a garbage
+                         // second argument: the adaptive port's MapExt built an
+                         // unordered tree because `cmp.Compare(key, n.Key)` at
+                         // offset 223,642 met `YieldFrom` at 893,642. Its own
+                         // path cannot be any file's.
                          let ps =
                              List.init arity (fun k ->
-                                 { Path = path; Offset = t.Offset + 670000 + k; Name = "_eta" + string k })
+                                 { Path = synPath; Offset = t.Offset + 670000 + k; Name = "_eta" + string k })
                          ELam (ps |> List.map (fun v -> v, sch),
                                EIfaceCall (iface, t.Text, recv, ps |> List.map (fun v -> EVar (v, sch))))
                      else EIfaceCall (iface, t.Text, lowerExpr (GNode lhs), [])
@@ -4441,9 +4507,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     // a static property is re-evaluated per access, so it
                     // lifts to a function of unit rather than a value
                     // initializer that every program would have to run
-                    [ { Path = path; Offset = d.Offset + 500000; Name = "_unit" }, mono tUnit ]
+                    [ { Path = synPath; Offset = d.Offset + 500000; Name = "_unit" }, mono tUnit ]
                 else binds
             vecAdd decls (DLet (false, varIdOf d, sch, ELam (allBinds, mbody)))
+            // `member inline` / `static member inline` — same marker as
+            // `let inline`; the token is a direct child of the MemberDecl
+            if tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "inline") then
+                vecAdd decls (DExport (varIdOf d, "$inline"))
             Some (d.Name, varIdOf d)
         | None -> None
 
@@ -4483,7 +4553,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         match dictTryFind fieldOwners (offsetOf core) with
                         | Some o -> o
                         | None -> "StructTuple" + string elems.Length
-                    let arg = { Path = path; Offset = offsetOf core + 650000; Name = "_sarg" }
+                    let arg = { Path = synPath; Offset = offsetOf core + 650000; Name = "_sarg" }
                     let sch = mono (TCon (tn, []))
                     bodyW <- structLetElems elems tn (EVar (arg, sch)) bodyW
                     arg, sch
@@ -4492,7 +4562,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | PVar (v, s) -> v, s
                 | PLit LUnit -> { Path = path; Offset = offsetOf p; Name = "_unit" }, mono tUnit
                 | other ->
-                    let arg = { Path = path; Offset = offsetOf p + 660000; Name = "_arg" }
+                    let arg = { Path = synPath; Offset = offsetOf p + 660000; Name = "_arg" }
                     let sch = mono (TCon ("?", []))
                     bodyW <- EMatch (EVar (arg, sch), [ other, None, bodyW ])
                     arg, sch)
@@ -4993,7 +5063,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         match paramBinds ps with
                         | binds, [] -> ELam (binds, body)
                         | _, structured ->
-                            let arg = { Path = path; Offset = cd.Offset + 600000; Name = "_arg" }
+                            let arg = { Path = synPath; Offset = cd.Offset + 600000; Name = "_arg" }
                             let asch = mono (TCon ("?", []))
                             (match structured with
                              | [ p ] -> ELam ([ arg, asch ], EMatch (EVar (arg, asch), [ p, None, body ]))
@@ -5053,7 +5123,38 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | _ -> "?"
                 let cm = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then "&" else ""
                 v.Name, cm + tn
-            vecAdd decls (DRecord (name, tyParams, instanceFields |> List.map clsFieldTy, false))
+            // a `[<Struct>]` CLASS is a value type: its storage IS the
+            // constructor's parameters, and the constructor's body already
+            // builds an ERecord of exactly those fields — so marking the
+            // record as a struct is what puts them where the by-value ABI
+            // looks (KNOWN-ISSUES #11).
+            // A `[<Struct>]` CLASS is a value type — `[<Struct>] type V3(x, y,
+            // z : float)` is the other spelling F# offers for one, and its
+            // storage IS the constructor's parameters. The constructor's body
+            // already builds an `ERecord` of exactly those fields, so saying
+            // "this record is a struct" is all the by-value ABI needs. Without
+            // it every construction allocated: 64 bytes an iteration where the
+            // record spelling allocates none (KNOWN-ISSUES #11).
+            //
+            // On STRICT terms, because this flag also decides shape interning
+            // for the type everywhere: no type parameters, no base, no
+            // interface implementations, and every field a scalar. A
+            // ref-carrying or dispatched struct-class reaches the runtime as an
+            // interned shape rather than a class instance, and an interface
+            // call on it then finds no vtable row — which is how the adaptive
+            // suite failed with "no vtable entry (tid …)".
+            let clsFields = instanceFields |> List.map clsFieldTy
+            let scalarFieldTys =
+                [ "float"; "float32"; "float16"; "int"; "int64"; "uint32"; "uint64"
+                  "int16"; "uint16"; "byte"; "sbyte"; "bool"; "char"; "nativeint" ]
+            let inlineStruct =
+                pendingStruct
+                && List.isEmpty tyParams
+                && List.length clsFields >= 2
+                && not (nodesOf n |> List.exists (fun m ->
+                            m.NodeKind = InterfaceImpl || m.NodeKind = InheritDecl))
+                && clsFields |> List.forall (fun (_, ty) -> List.contains ty scalarFieldTys)
+            vecAdd decls (DRecord (name, tyParams, clsFields, inlineStruct))
 
             // ---- the constructor ----------------------------------------
             match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
@@ -5098,7 +5199,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match paramBinds [ ctorPat.Value ] with
                     | binds, [] -> ELam (binds, body)
                     | _, structured ->
-                        let arg = { Path = path; Offset = tyDef.Offset + 600000; Name = "_arg" }
+                        let arg = { Path = synPath; Offset = tyDef.Offset + 600000; Name = "_arg" }
                         let sch = mono (TCon ("?", []))
                         (match structured with
                          | [ p ] -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ p, None, body ]))
@@ -5246,6 +5347,43 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                        view (EVar (cv, anon)) (EAssign (cv, EVar (nv, anon)))))
         | EApp (f, args) -> EApp (fixAddrs f, List.map fixAddrs args)
         | ELam (ps, b) -> ELam (ps, fixAddrs b)
+        // `&x` of THIS binding somewhere below: every view over one local is
+        // the same pair of closures around the same captured cell, so it is
+        // built ONCE, here at the binding, and every `&x` under it names the
+        // shared copy. Built at the use it was 47 bytes a call — a view
+        // record and two closures per ITERATION in a loop passing `&acc`.
+        // (The alias is unaffected: all copies captured the same cell.)
+        | ELet (r, v, sc, rhs, b) when
+              (let rec wants (e : Expr) : bool =
+                  match e with
+                  | EApp (EUnknown "$addr", [ EVar (tv, _) ]) when tv.Path = v.Path && tv.Offset = v.Offset -> true
+                  | _ ->
+                      let hit = vecNew<bool> ()
+                      vecAdd hit false
+                      mapChildren (fun c -> (if wants c then vecSet hit 0 true); c) e |> ignore
+                      vecGet hit 0
+               wants b) ->
+            addrSeq <- addrSeq + 1
+            let vv = { Path = synPath; Offset = 97000000 + addrSeq; Name = "_brl" + string addrSeq }
+            let anon = mono (TCon ("?", []))
+            let rec subst (e : Expr) : Expr =
+                match e with
+                | EApp (EUnknown "$addr", [ EVar (tv, _) ]) when tv.Path = v.Path && tv.Offset = v.Offset ->
+                    EVar (vv, anon)
+                | ELet (_, iv, _, _, _) when iv.Path = v.Path && iv.Offset = v.Offset ->
+                    // an inner REBINDING of the same variable shadows this
+                    // one: its own ELet arm builds its own view
+                    e
+                | other -> mapChildren subst other
+            addrSeq <- addrSeq + 1
+            let uv = { Path = path; Offset = 93000000 + addrSeq; Name = "_bru" + string addrSeq }
+            let nv = { Path = path; Offset = 94000000 + addrSeq; Name = "_brv" + string addrSeq }
+            let view =
+                ERecord ("ByRefView",
+                         [ "Get", ELam ([ uv, anon ], EVar (v, sc))
+                           "Set", ELam ([ nv, anon ], EAssign (v, EVar (nv, anon))) ])
+            ELet (r, v, sc, fixAddrs rhs,
+                  ELet (false, vv, anon, view, fixAddrs (subst b)))
         | ELet (r, v, sc, rhs, b) -> ELet (r, v, sc, fixAddrs rhs, fixAddrs b)
         | EIf (a, b, c) -> EIf (fixAddrs a, fixAddrs b, fixAddrs c)
         | ESeq xs -> ESeq (List.map fixAddrs xs)
@@ -5319,6 +5457,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some (SimpleLet (isRec, v, sch, rhs, _)) ->
                      vecAdd decls (DLet (isRec, v, sch, rhs))
                      if pendingExport then vecAdd decls (DExport (v, v.Name))
+                     // `let inline` — the marker rides a DExport, like
+                     // [<JsImport>], so the IR needs no new case. The
+                     // optimizer's inliner reads it and inlines the body at
+                     // every call site regardless of its size; without SRTP
+                     // (out of scope) that is the whole meaning F# gives the
+                     // keyword. Parsed-and-dropped it was a silent lie.
+                     if tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "inline") then
+                         vecAdd decls (DExport (v, "$inline"))
                  | Some (DestructureLet (pat, rhs, _)) ->
                      // a top-level destructure: bind the RHS once (effects run
                      // once, in place), then give every pattern binder its own
@@ -5474,7 +5620,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 cat acc (str " }")
             else
                 let binder (i : int) (k : int) =
-                    { Path = path; Offset = off + 1000 + i * 20 + k; Name = "_sv" + string i + "_" + string k }
+                    { Path = synPath; Offset = off + 1000 + i * 20 + k; Name = "_sv" + string i + "_" + string k }
                 let clause (i : int) (cn : string, comps : string list) : Pat * Expr option * Expr =
                     let n = List.length comps
                     let pat =
@@ -5579,7 +5725,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // one clause per (case of a, case of b) pair the tags share,
                 // plus the tag ordering for the rest
                 let binder (side : string) (i : int) (j : int) (k : int) =
-                    { Path = path; Offset = off + 1000 + i * 400 + j * 20 + k * 2 + (if side = "a" then 0 else 1)
+                    { Path = synPath; Offset = off + 1000 + i * 400 + j * 20 + k * 2 + (if side = "a" then 0 else 1)
                       Name = "_o" + side + string i + "_" + string j + "_" + string k }
                 // a case's payload: one binder per component (a multi-payload
                 // case carries them as ONE tuple, taken apart here so each
@@ -5614,7 +5760,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                 match rest with
                                                 | [] -> one
                                                 | _ ->
-                                                    let cv = { Path = path; Offset = off + 50000 + i * 400 + j * 20 + k; Name = "_ou" }
+                                                    let cv = { Path = synPath; Offset = off + 50000 + i * 400 + j * 20 + k; Name = "_ou" }
                                                     ELet (false, cv, ish, one,
                                                           EIf (EPrim ("<>", [ EVar (cv, ish); ELit (LInt "0") ]),
                                                                EVar (cv, ish), fold (k + 1) rest))

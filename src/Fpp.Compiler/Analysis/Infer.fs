@@ -117,6 +117,38 @@ type FieldInfo =
       /// 0 = public, 1 = private (declaring type only), 2 = internal
       Access : int }
 
+/// A constraint in the pool, carrying what the last pass that failed to
+/// discharge it was looking at.
+///
+/// EVERY binding solves the WHOLE file's pool, not its own share of it, so
+/// a constraint that cannot yet be discharged is re-selected once per
+/// binding for the rest of the file. Re-running a selection whose inputs
+/// have all held still re-runs an identical failure: 3.45M of the 3.49M
+/// constraint visits in a fpp.base build were exactly that.
+///
+/// Three inputs decide a selection, and each is cheap to compare. The
+/// arguments can only move by binding a variable they were left blocked
+/// on; a new INSTANCE can turn `NoInstance` into a match; and the ambient
+/// givens can discharge it directly. The pruned form of an argument is
+/// otherwise fixed, so while all three hold the answer is the one already
+/// recorded.
+type WEntry =
+    { WOff : int
+      WCon : Constraint
+      /// variables the failed attempt was blocked on. An unbound `Link` on
+      /// every one proves the pruned arguments are unchanged.
+      mutable WVars : Var list
+      /// the class-table generation that attempt saw. -1 means the entry
+      /// has never been attempted, which always re-examines.
+      mutable WInst : int
+      /// the ambient givens it was tried against — an immutable list, only
+      /// ever replaced wholesale, so identity is the comparison.
+      mutable WGivens : Constraint list
+      /// the givens SEATED at its offset. A constraint raised later at the
+      /// same offset seats them if none were, and `byGiven` would then
+      /// discharge this one — so the seat is an input like the rest.
+      mutable WSeat : Constraint list }
+
 /// `shared` carries generalized schemes of earlier files keyed
 /// "path:offset" (and receives this file's); `aliases` carries type
 /// abbreviations keyed by short name across the project.
@@ -134,6 +166,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (classes : Classes.Tables) : InferResult =
     let st = TypeState()
     let diags = vecNew<int * string> ()
+    /// every `null` literal and the variable it was typed at, judged AFTER
+    /// inference: `null` takes a fresh variable so annotation and context
+    /// still flow through it, and the JUDGMENT is that the settled type must
+    /// be one that has null as a value. A union, record, struct or scalar
+    /// does not — `let x : DU = null` built and TRAPPED at the first match.
+    let nullSites = vecNew<int * Type> ()
+    /// every numeric printf hole and the variable it was typed at, judged
+    /// AFTER inference like the null literals: the hole is polymorphic so
+    /// any integer (or float) width fits, and the WIDTH is decided by the
+    /// recorded kind at expansion — but a type outside the family entirely
+    /// fell through every kind to the "?" renderer. `%d` swallowed a
+    /// ByRefCell and printed a question mark.
+    let numHoleSites = vecNew<int * char * Type> ()
     let opKindsRaw = vecNew<int * Type> ()
     let arrKindsRaw = vecNew<int * Type> ()
     // `for x in e` whose source type was still UNKNOWN when the loop was
@@ -540,6 +585,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let mutable curBlockMemberSigs = dictNew<string, int> ()
     /// types declared [<AbstractClass>] — constructing one is an error
     let abstractTypes = dictNew<string, bool> ()
+    /// "Type.Member" for every member a type supplies a BODY for — a
+    /// `default`, an `override`, or a plain concrete member. An abstract
+    /// slot with a body here is already filled, so a derived class need not
+    /// fill it again.
+    let concreteMembers = dictNew<string, bool> ()
     let memberSitesRaw = vecNew<int * string> ()
     let fieldOwnersRaw = vecNew<int * string> ()
     let pendingOwners = vecNew<int * Type> ()
@@ -570,7 +620,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // Wanted constraints accumulate as inference proceeds and are solved to
     // fixpoint. Anything still unsolved when a binding generalizes becomes
     // part of its scheme — the caller inherits the obligation.
-    let mutable wanted : (int * Constraint) list = []
+    let mutable wanted : WEntry list = []
     /// constraints the enclosing binding DECLARED (`when Num<'a>`); a wanted
     /// entailed by one of these is already discharged
     let mutable givens : Constraint list = []
@@ -591,11 +641,41 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// them to TYPED instructions instead of runtime dispatch
     let seatGivens = dictNew<int, Constraint list> ()
 
+    /// A fresh pool entry. `WInst = -1` marks it never attempted, so the
+    /// next pass examines it whatever the generations say.
+    let mkW (offset : int) (c : Constraint) : WEntry =
+        { WOff = offset; WCon = c; WVars = []; WInst = -1; WGivens = []; WSeat = [] }
+
+    let seatOf (offset : int) : Constraint list =
+        match dictTryFind seatGivens offset with
+        | Some g -> g
+        | None -> []
+
+    /// Record what an attempt that could not discharge `e` was looking at.
+    /// Only the outcomes that change NOTHING may mark: a deferral, an
+    /// ambiguity that is not yet ground, a missing instance for arguments
+    /// that are not yet ground. Anything that unifies, improves or reports
+    /// has had an effect, and re-running it is not a no-op.
+    let markBlocked (e : WEntry) : unit =
+        e.WInst <- Classes.instGeneration ()
+        e.WGivens <- givens
+        e.WSeat <- seatOf e.WOff
+        e.WVars <-
+            List.collect freeVars e.WCon.Args
+            @ List.collect (fun (_, t) -> freeVars t) e.WCon.Assoc
+
+    let stillBlocked (e : WEntry) : bool =
+        e.WInst >= 0
+        && e.WInst = Classes.instGeneration ()
+        && System.Object.ReferenceEquals (e.WGivens, givens)
+        && System.Object.ReferenceEquals (e.WSeat, seatOf e.WOff)
+        && e.WVars |> List.forall (fun v -> v.Link.IsNone)
+
     let addWanted (offset : int) (c : Constraint) : unit =
         if inMemberBody then dictSet eagerSeats offset true
         if not (List.isEmpty givens) && (dictTryFind seatGivens offset).IsNone then
             dictSet seatGivens offset givens
-        wanted <- wanted @ [ offset, c ]
+        wanted <- wanted @ [ mkW offset c ]
 
     let isGround (c : Constraint) : bool = List.isEmpty (List.collect freeVars c.Args)
 
@@ -686,6 +766,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let registerField (key : string) (fi : FieldInfo) : unit =
         dictSet knownTypes fi.TypeName true
+        // a MEMBER may not take a record FIELD's name. Accepted, `member
+        // r.Name = r.Name` resolved its own body's `r.Name` to the MEMBER
+        // and the program hung in it at run time — F# rejects the
+        // declaration, and the field entry (DefKey = None) is right here to
+        // ask. The member's own key token is the blame offset.
+        (match fi.DefKey, dictTryFind fields key with
+         | Some (dp, doff), Some prior when
+               prior.DefKey.IsNone && prior.TypeName = fi.TypeName && dp = path
+               && not (key.Contains ".get_") && not (key.Contains ".set_") ->
+             vecAdd diags
+                 (doff,
+                  "a member may not have the same name as a field of "
+                  + fi.TypeName + ": the name '" + key + "' already denotes the field")
+         | _ -> ())
         // A second entry keyed by the DEFINITION, so a use site that resolved
         // to the definition (a static member through its type, say) can ask
         // how many arguments it may leave off without knowing the receiver.
@@ -1417,7 +1511,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // unstamped template
                           (match (if dp = path then dictTryFind defSchemes doff
                                   else dictTryFind shared (dp + ":" + string doff)) with
-                           | Some sch when not (List.isEmpty sch.Quantified) && dp = path ->
+                           | Some sch when not (List.isEmpty sch.Quantified) && dp = path
+                                           && sch.Quantified |> List.forall (fun qv -> (dictTryFind subst qv.Id).IsSome) ->
                                let inst =
                                    sch.Quantified
                                    |> List.map (fun qv ->
@@ -1427,12 +1522,55 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                vecAdd instRaw (offset, inst)
                            | Some sch when not (List.isEmpty sch.Quantified) ->
                                // an IMPORTED scheme's variables are not the
-                               // FieldInfo's, so the subst cannot name them:
+                               // FieldInfo's — and neither are an INHERITED
+                               // member's, whose scheme belongs to the BASE
+                               // while `subst` is keyed by the receiver's own
+                               // parameters. A missed variable used to become
+                               // an unconstrained fresh one, so the stamper
+                               // monomorphized the access against an
+                               // instantiation unrelated to the receiver:
+                               // `n.Key` on `n = node :?> Inner<'K,'V>` read a
+                               // different layout than the write through the
+                               // base did, and MapExt built an unordered tree.
+                               // so the subst cannot name them:
                                // instantiate it and TIE the copy to this
                                // use's declaration by unification — the
                                // fresh list then prunes concrete for the
                                // stamper
-                               let ty, fresh, _ = instantiateImported sch
+                               let ty, fresh0, _ = instantiateImported sch
+                               // TIE THE SELF, not just the member's type. The
+                               // member names only the variables it mentions —
+                               // `Key : 'K` leaves the class' 'V free — and a
+                               // variable left free here is one the stamper
+                               // freshens into an instantiation unrelated to
+                               // the receiver. `tracked` does this for a member
+                               // declared on the receiver's OWN type; an
+                               // inherited one needs the base's arguments,
+                               // which `declaringOwner` already carried down.
+                               let selfArgs =
+                                   if fi.IsStatic then None
+                                   else
+                                       match prune ty with
+                                       | TFun (selfT, _) ->
+                                           (match prune selfT with
+                                            | TCon (sn, sargs) when sn = own && sargs.Length = List.length ownArgs ->
+                                                List.iter2 (unifyAt offset) sargs ownArgs
+                                                Some sargs
+                                            | _ -> None)
+                                       | _ -> None
+                               // and take the INSTANTIATION from those same
+                               // arguments. `instantiateImported` reads its
+                               // fresh list off `sch.Quantified`, whose
+                               // variables are a separate copy from the ones
+                               // the BODY carries when the member is inherited
+                               // from a generic base — so every entry missed
+                               // the substitution and came back untethered.
+                               // The self's arguments ARE the class'
+                               // parameters, in order, and they are tied.
+                               let fresh =
+                                   match selfArgs with
+                                   | Some sargs when List.length sargs = List.length fresh0 -> sargs
+                                   | _ -> fresh0
                                let memT =
                                    if not fi.IsStatic then
                                        (match prune ty with TFun (_, r) -> r | _ -> ty)
@@ -1639,6 +1777,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             (match dictTryFind aliases ("$adecl:" + d.Path + ":" + string d.Offset) with
              | Some (ps, TCon (dn, _)) when ps.Length = argc && dn <> "" -> dn
              | _ -> arityName tok.Text argc)
+        // The WRITTEN spelling is kept: `int32` stays `int32` through
+        // inference so a diagnostic can name the type the way the author
+        // did. It unifies with `int` (Types.unify compares canonically) and
+        // the boundary below canonicalizes every name that leaves, so
+        // lowering and the backends still see one name per scalar.
         | _ -> arityName tok.Text argc
 
     let rec typeFromNode (vars : Dict<string, Type>) (n : GreenNode) : Type =
@@ -2202,10 +2345,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// One solving pass. Returns whether anything changed, and the wanteds
     /// that survive.
     let solveOnce () : bool =
+        if wanted |> List.forall stillBlocked then false
+        else
         let mutable progress = false
-        let survivors = vecNew<int * Constraint> ()
-        let queue = vecNew<int * Constraint> ()
-        for w in wanted do vecAdd queue w
+        let survivors = vecNew<WEntry> ()
+        let queue = vecNew<WEntry> ()
+        // an entry nothing has moved keeps the answer it already got, and
+        // skips selection entirely — it does still SURVIVE, so the pool it
+        // rebuilds is the same pool
+        for w in wanted do
+            if stillBlocked w then vecAdd survivors w else vecAdd queue w
         let mutable i = 0
         // an instance context that re-demands its own class would grow the
         // queue forever INSIDE this pass — dedupe repeats, bound the work
@@ -2214,10 +2363,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             c.Class + "|" + String.concat "," (List.map typeString c.Args)
         let budget = vecLen queue * 4 + 256
         while i < vecLen queue && i < budget do
-            let offset, c = vecGet queue i
+            let entry = vecGet queue i
+            let offset = entry.WOff
+            let c = entry.WCon
             i <- i + 1
             let k = keyOf c
-            if (dictTryFind seenKey k).IsSome then vecAdd survivors (offset, c)
+            if (dictTryFind seenKey k).IsSome then vecAdd survivors entry
             else
             dictSet seenKey k true
             match (match byGiven c with
@@ -2239,7 +2390,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | "Ordered", [ TTuple ts ] ->
                     progress <- true
                     for t in ts do
-                        vecAdd queue (offset, { Class = "Ordered"; Args = [ t ]; Assoc = [] })
+                        vecAdd queue (mkW offset { Class = "Ordered"; Args = [ t ]; Assoc = [] })
                 | _ ->
                 match Classes.select classes ((dictTryFind eagerSeats offset).IsSome) c.Class c.Args c.Assoc with
                 | Classes.Solved (inst, sub) ->
@@ -2264,7 +2415,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | None ->
                             vecAdd diags (offset, "instance " + inst.Class + " does not define the associated type " + n)
                     for ctx in inst.Context do
-                        vecAdd queue (offset, mapConstraint (Classes.substInst sub) ctx)
+                        vecAdd queue (mkW offset (mapConstraint (Classes.substInst sub) ctx))
                 | Classes.Improve inst ->
                     // exactly one instance could still apply, so its head is
                     // forced: committing to it is improvement, not a guess
@@ -2283,8 +2434,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     // a FAILED improvement is terminal: re-queueing the
                     // unchanged constraint would improve it again, forever,
                     // inside this very pass — the fuel counter never fires
-                    if not failed then vecAdd queue (offset, c)
-                | Classes.Deferred -> vecAdd survivors (offset, c)
+                    if not failed then vecAdd queue (mkW offset c)
+                | Classes.Deferred ->
+                    markBlocked entry
+                    vecAdd survivors entry
                 | Classes.Ambiguous insts ->
                     // overlapping instances that order neither way. More
                     // information cannot break the tie, so say so here
@@ -2308,7 +2461,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         + String.concat " and " (i.Context |> List.map (fun k ->
                                             k.Class + "<" + String.concat ", " (List.map typeString k.Args) + ">")))))
                              + " — neither is more specific, and a `when` context does not select")
-                    else vecAdd survivors (offset, c)
+                    else
+                        markBlocked entry
+                        vecAdd survivors entry
                 | Classes.NoInstance ->
                     if c.Class = "Show"
                        && (match c.Args |> List.map prune with
@@ -2316,21 +2471,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | _ -> false) then
                         // derived renderer: requeue, it exists now
                         progress <- true
-                        vecAdd queue (offset, c)
+                        vecAdd queue (mkW offset c)
                     elif c.Class = "Ordered"
                        && (match c.Args |> List.map prune with
                            | [ TCon (tn, _) ] -> deriveOrdered tn
                            | _ -> false) then
                         // derived structural comparison: requeue, it exists now
                         progress <- true
-                        vecAdd queue (offset, c)
+                        vecAdd queue (mkW offset c)
                     elif c.Class = "Arb"
                        && (match c.Args |> List.map prune with
                            | [ TCon (tn, _) ] -> deriveArbGeneric tn
                            | _ -> false) then
                         // derived on demand: requeue, the instance now exists
                         progress <- true
-                        vecAdd queue (offset, c)
+                        vecAdd queue (mkW offset c)
                     elif isGround c && c.Class = "Show" then
                         // `%A` is OPTIONAL: a type with no renderer of its own
                         // (a class, `obj`) falls back to the runtime walker
@@ -2344,7 +2499,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             (offset,
                              "no instance " + c.Class + "<"
                              + String.concat ", " (List.map typeString c.Args) + ">")
-                    else vecAdd survivors (offset, c)
+                    else
+                        markBlocked entry
+                        vecAdd survivors entry
         // whatever the budget cut off survives untouched for the next pass
         while i < vecLen queue do
             vecAdd survivors (vecGet queue i)
@@ -2415,6 +2572,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let mutable noDeref = false
 
     let mutable patExpect : Type option = None
+    /// typing a MATCH-CLAUSE pattern: or-alternatives there REBIND one name,
+    /// and the alternatives must agree on its type — `| x, 0.0 | 0, x ->`
+    /// bound x at int in one arm and float in the other, and `string x`
+    /// answered off the wrong representation with no diagnostic anywhere.
+    /// Parameters stay out: `let f (x : int) (x : string)` is legal
+    /// shadowing, not an or-pattern.
+    let mutable inClausePat = false
 
     /// What the expression about to be typed is expected to BE. Consumed by
     /// whoever reads it, so nothing inherits it by accident.
@@ -2451,7 +2615,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // defaulted to int behind the body's back.
             let constrained =
                 wanted
-                |> List.collect (fun (_, c) -> constraintVars c)
+                |> List.collect (fun e -> constraintVars e.WCon)
                 |> List.map (fun v -> v.Id)
                 |> Set.ofList
             let sch = st.Generalize ty
@@ -2468,10 +2632,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         givens <- givens @ declared
         solveWanted ()
         givens <- saved
-        let sch = st.GeneralizeWith (declared @ List.map snd wanted) ty
+        let sch = st.GeneralizeWith (declared @ List.map (fun e -> e.WCon) wanted) ty
         let moved (c : Constraint) =
             sch.Constraints |> List.exists (fun k -> System.Object.ReferenceEquals (k, c))
-        wanted <- wanted |> List.filter (fun (_, c) -> not (moved c))
+        wanted <- wanted |> List.filter (fun e -> not (moved e.WCon))
         sch
 
     /// Which function an operator or a named member resolves to.
@@ -2911,6 +3075,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | StringLit -> tString
         | CharLit -> tChar
         | Keyword when t.Text = "true" || t.Text = "false" -> tBool
+        | Keyword when t.Text = "null" ->
+            let v = st.Fresh ()
+            vecAdd nullSites (t.Offset, v)
+            v
         | _ -> st.Fresh ()
 
     // ---- patterns ---------------------------------------------------------
@@ -2941,8 +3109,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | Some t ->
                  match dictTryFind defsAt t.Offset with
                  | Some _ ->
-                     // a binding introduced here
-                     let ty = st.Fresh ()
+                     // a binding introduced here. In a match clause the NAME
+                     // keys the type, so every or-alternative rebinding it
+                     // gets the same variable — see `inClausePat`.
+                     let ty =
+                         if inClausePat then
+                             match dictTryFind pvars ("$bind:" + t.Text) with
+                             | Some prior -> prior
+                             | None ->
+                                 let v = st.Fresh ()
+                                 dictSet pvars ("$bind:" + t.Text) v
+                                 v
+                         else st.Fresh ()
                      setScheme t.Offset (mono ty)
                      recordDef t ty
                      ty
@@ -3441,7 +3619,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | None when t.Text = "isNull" ->
                           TFun (st.Fresh (), tBool)
                       | None when
-                            List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ] ->
+                            List.contains (canonTypeName t.Text) [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ] ->
                           // a builtin conversion USED AS A VALUE (`|> int`,
                           // `List.map int`): F#'s result type is FIXED by the
                           // name — without this the piped result stayed a
@@ -3453,7 +3631,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // this into a real function. Without it the name
                           // reached emission as itself and the stub trapped.
                           vecAdd opKindsRaw (t.Offset, src)
-                          TFun (src, TCon (t.Text, []))
+                          // the RESULT is the canonical scalar: `double` and
+                          // `float` name one type, and a result spelled
+                          // `double` was a nominal type of its own
+                          TFun (src, TCon (canonTypeName t.Text, []))
                       | None ->
                           // truly unbound: nothing resolved it, nothing
                           // will — remembered so the resolver's
@@ -3520,7 +3701,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match head.NodeKind, args with
                       | IdentExpr, [ onlyArg ] when
                             (match tokensOf head |> List.tryHead with
-                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ]
+                             | Some t -> List.contains (canonTypeName t.Text) [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ]
                              | None -> false) ->
                           (match tokensOf head |> List.tryHead with
                            | Some ct ->
@@ -3571,7 +3752,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                         match c with
                                                         // any integer width, decided by
                                                         // the recorded kind at expansion
-                                                        | 'd' | 'i' | 'x' | 'X' | 'o' | 'u' -> st.Fresh ()
+                                                        | 'd' | 'i' | 'x' | 'X' | 'o' | 'u' ->
+                                                            let v = st.Fresh ()
+                                                            vecAdd numHoleSites (ft.Offset + 1 + i, c, v)
+                                                            v
                                                         | 's' -> tString
                                                         | 'c' -> tChar
                                                         | 'b' -> tBool
@@ -3580,7 +3764,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                         // too, and float32 is its own type
                                                         // here, so pinning the hole to
                                                         // `float` rejected it
-                                                        | 'f' | 'e' | 'E' | 'g' | 'G' -> st.Fresh ()
+                                                        | 'f' | 'e' | 'E' | 'g' | 'G' ->
+                                                            let v = st.Fresh ()
+                                                            vecAdd numHoleSites (ft.Offset + 1 + i, c, v)
+                                                            v
                                                         | _ -> st.Fresh ()   // %A and %O take anything
                                                     vecAdd opKindsRaw (ft.Offset + 1 + i, ty)
                                                     // `%A` renders through the Show class, so the
@@ -4078,10 +4265,43 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    // — and an undemanded generic class is a
                                    // template the stamper drops, leaving the
                                    // call to name nothing
+                                   // NOT gated on the class being declared in
+                                   // THIS file. `explicitCtorTypes` is filled
+                                   // while inferring a type declaration, so it
+                                   // holds only local classes — while this arm
+                                   // also serves the prelude's, whose `ctors`
+                                   // entry is project-wide. Undemanded, the
+                                   // constructor never stamped: the canonical
+                                   // one built `ResizeArray<V>`'s backing as a
+                                   // REF array while the stamped Add/Item/
+                                   // ToArray read it as POD, and a `V` element
+                                   // came back as a pointer made of a double's
+                                   // bits. `ResizeArray` of any struct faulted
+                                   // on the first read.
                                    (match prune res with
                                     | TCon (_, ras) when
                                         not (List.isEmpty ras)
-                                        && (dictTryFind explicitCtorTypes ht.Text).IsSome ->
+                                        && ((dictTryFind explicitCtorTypes ht.Text).IsSome
+                                            // ... or the instantiation carries a
+                                            // STRUCT, whatever file declared the
+                                            // class. That is the case where the
+                                            // canonical constructor is not merely
+                                            // slower but WRONG: it builds the
+                                            // backing storage at the uniform
+                                            // element type while the members —
+                                            // which do stamp — read it packed.
+                                            // `ResizeArray<V>` faulted on its
+                                            // first read, a `V` coming back as a
+                                            // pointer made of a double's bits.
+                                            //
+                                            // Demanding one for EVERY generic
+                                            // construction is too much: it asks
+                                            // for stamps nothing can supply and
+                                            // the adaptive suite trapped.
+                                            || ras |> List.exists (fun t ->
+                                                   match prune t with
+                                                   | TCon (n, _) -> (dictTryFind structTypes n) = Some true
+                                                   | _ -> false)) ->
                                         vecAdd instRaw (ht.Offset, ras)
                                     | _ -> ())
                                    // widen per argument, not on the tuple
@@ -5175,7 +5395,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let cvars = dictNew<string, Type> ()
                         for m in nodesOf c do
                             if isPatKind m.NodeKind then
-                                unify (patType cvars m) exnTy |> ignore
+                                inClausePat <- true
+                                let pt = patType cvars m
+                                inClausePat <- false
+                                unify pt exnTy |> ignore
                         let bodies = nodesOf c |> List.filter (fun m -> isExprish m.NodeKind)
                         (match List.tryLast bodies with
                          | Some b -> unify (exprType (GNode b)) result |> ignore
@@ -5224,13 +5447,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 // equation: the tested type need not even be
                                 // one we have a declaration for. Typing its
                                 // binder is enough.
-                                if isTypeTest m then patType cvars m |> ignore
+                                inClausePat <- true
+                                if isTypeTest m then
+                                    patType cvars m |> ignore
+                                    inClausePat <- false
                                 else
                                     // the scrutinee is what this pattern must
                                     // be, and a comma pattern needs to know
                                     patExpect <- Some scrut
                                     let pt = patType cvars m
                                     patExpect <- None
+                                    inClausePat <- false
                                     unifyArg barOff scrut pt
                         // bar-separated ALTERNATIVES (several pattern nodes
                         // in one clause) must bind the same names: a binder
@@ -5613,6 +5840,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | Some d when d.Kind = Resolve.DefType -> Some (arityNameOfDef d)
                          | _ -> None)
                     | None -> None
+                // `V3<int>.ZeroV` WRITES the class' arguments. `headIdent`
+                // above keeps only the NAME, so they were dropped: the class
+                // parameters below were freshened, the specialization demand
+                // recorded those fresh variables, and the stamper settled them
+                // at `$ref` — `V3<int>.ZeroV` trapped while
+                // `let z : V3<int> = V3.ZeroV` worked (KNOWN-ISSUES #5).
+                let staticArgs =
+                    match nodesOf n |> List.tryHead with
+                    | Some h when h.NodeKind = AppExpr ->
+                        (match nodesOf h |> List.tryFind (fun m -> m.NodeKind = TyParams) with
+                         | Some tp ->
+                             nodesOf tp
+                             |> List.filter (fun x -> isTypeKind x.NodeKind)
+                             |> List.map (typeFromNode tyScope)
+                         | None -> [])
+                    | _ -> []
                 (match staticOwner, lastIdent with
                  | Some _, Some name -> dictSet staticAccessOk name.Offset true
                  | _ -> ())
@@ -5633,6 +5876,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          let subst = dictNew<int, Type> ()
                          for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
                          for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
+                         // and TIE the class parameters to what the use wrote
+                         if not (List.isEmpty staticArgs)
+                            && List.length staticArgs = List.length fi.Params then
+                             List.iter2
+                                 (fun (pv : Var) (a : Type) ->
+                                     match dictTryFind subst (prunedId pv) with
+                                     | Some f -> unifyAt name.Offset f a
+                                     | None -> ())
+                                 fi.Params staticArgs
                          vecAdd memberSitesRaw (name.Offset, tn)
                          let declared = substVars subst fi.FieldType
                          // the declared `when` context is this use's
@@ -5651,11 +5903,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               (match dictTryFind defSchemes doff with
                                | Some sch when not (List.isEmpty sch.Quantified) ->
                                    let inst =
-                                       sch.Quantified
-                                       |> List.map (fun qv ->
-                                           match dictTryFind subst qv.Id with
-                                           | Some t -> t
-                                           | None -> st.Fresh ())
+                                       // what the use WROTE, when it wrote it.
+                                       // The substitution above is keyed by the
+                                       // FieldInfo's parameters, and the
+                                       // definition scheme's quantified
+                                       // variables are a different set — so
+                                       // pinning the former left this lookup
+                                       // missing and the demand freshened to
+                                       // `$ref` anyway.
+                                       if not (List.isEmpty staticArgs)
+                                          && List.length staticArgs = List.length sch.Quantified
+                                       then staticArgs
+                                       else
+                                           sch.Quantified
+                                           |> List.map (fun qv ->
+                                               match dictTryFind subst qv.Id with
+                                               | Some t -> t
+                                               | None -> st.Fresh ())
                                    vecAdd instRaw (name.Offset, inst)
                                | _ -> ())
                           | Some (dp, doff) ->
@@ -6078,6 +6342,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            && not ((k.Substring (tn.Length + 1)).Contains "#")
                         then Some (k.Substring (tn.Length + 1)) else None)
                 let owner =
+                    // COPY-AND-UPDATE takes its type from the BASE: `{ r with
+                    // X = 7 }` is an r, whatever else declares an X. Without
+                    // this the owner came from the written labels alone, so a
+                    // second record sharing them captured the literal — and
+                    // an anonymous record, whose synthesized type is
+                    // deliberately not a by-label candidate, had nothing to
+                    // resolve to at all.
+                    let baseOwner =
+                        match baseExpr, fieldNames with
+                        | Some b, first :: _ ->
+                            (match prune (exprType (GNode b)) with
+                             | TCon (bn, _) when fieldNames |> List.forall (fun m -> (dictTryFind fields (bn + "." + m)).IsSome) ->
+                                 dictTryFind fields (bn + "." + first)
+                             | _ -> None)
+                        | _ -> None
+                    match baseOwner with
+                    | Some i -> Some i
+                    | None ->
                     match expectOwner with
                     | Some i -> Some i
                     | None ->
@@ -6356,6 +6638,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     and inferLet (n : GreenNode) : Type =
         let isRec =
             tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "rec")
+        // `let rec inline` asks for a body copied into itself forever — the
+        // inliner refuses recursive candidates, so left accepted the keyword
+        // was a silent no-op, which is the one thing `inline` must never be
+        (if isRec && tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "inline") then
+            match tokensOf n |> List.tryFind (fun t -> t.Kind = Keyword && t.Text = "inline") with
+            | Some t -> vecAdd diags (t.Offset, "a recursive function cannot be inline: its body would be copied into itself without end")
+            | None -> ())
         // split at `=`
         let mutable seenEq = false
         let before = vecNew<Green> ()
@@ -6376,6 +6665,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let ascriptionOf () =
             vecToList before
             |> List.tryPick (fun c -> match c with GNode t when isTypeKind t.NodeKind -> Some (typeFromNode vars t) | _ -> None)
+        // `let r : byref<int> = ...` — the same DECLARATION-driven rule as a
+        // byref parameter: reads dereference, writes go through. The
+        // declaration is the only sound driver — `ref<'a>` is the SAME
+        // ByRefCell type, and a `let r = ref 5` must keep reading as the
+        // cell. (Unannotated `let r = f ()` from a byref-returning f keeps
+        // cell semantics: writes alias, and a read in a scalar position is
+        // now a type error rather than a silent "?".)
+        (match vecToList before |> List.tryFind (fun c -> match c with GNode pn -> pn.NodeKind = IdentPat | _ -> false) with
+         | Some (GNode bp) ->
+             (match vecToList before
+                    |> List.tryPick (fun c ->
+                        match c with
+                        | GNode t when isTypeKind t.NodeKind ->
+                            Green.tokens (GNode t)
+                            |> List.filter (fun x -> x.Kind = Ident)
+                            |> List.tryHead
+                        | _ -> None) with
+              | Some ht when ht.Text = "byref" || ht.Text = "outref" ->
+                  (match Green.tokens (GNode bp) |> List.tryFind (fun x -> x.Kind = Ident) with
+                   | Some bt -> dictSet byrefParams bt.Offset true
+                   | None -> ())
+              | _ -> ())
+         | _ -> ())
         let isDestructure =
             (vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false))
             // `let (x, y) as whole = e` binds the parts AND the whole — a
@@ -6496,6 +6808,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             givens <- savedGivens
             // with `in`, the last after-expr is the continuation, the first
             // is the binding body
+
             let bodyTy =
                 match bodyTys, hasIn with
                 | b :: _, true -> b
@@ -6649,6 +6962,44 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | Some t when (dictTryFind defsAt t.Offset).IsSome ->
                  if isMutable || expansiveValue then setScheme t.Offset (mono funTy)
                  else setScheme t.Offset (generalizeBinding declared funTy)
+                 // an ACTIVE PATTERN definition must answer its cases'
+                 // carrier: the parser spells `(|A|B|)` as `$ap$A$B`. A
+                 // total multi-case answers ActiveChoiceN, a partial
+                 // (`$ap$A$_`) an option, a single total case its payload
+                 // (no constraint). Checked at the DEFINITION: left to the
+                 // uses, an unused bad definition was accepted outright —
+                 // F# rejects it — and a used one failed far from the
+                 // mistake.
+                 if t.Text.StartsWith "$ap$" then
+                     let rest = substr t.Text 4 (strLen t.Text - 4)
+                     let mutable nCases = 0
+                     let mutable isPartial = false
+                     let mutable partStart = 0
+                     for i in 0 .. strLen rest do
+                         if i = strLen rest || charAt rest i = '$' then
+                             let piece = substr rest partStart (i - partStart)
+                             (if piece = "_" then isPartial <- true
+                              elif piece <> "" then nCases <- nCases + 1)
+                             partStart <- i + 1
+                     let rec strip (k : int) (ty : Type) : Type =
+                         if k <= 0 then prune ty
+                         else
+                             match prune ty with
+                             | TFun (_, r) -> strip (k - 1) r
+                             | other -> other
+                     (match strip (List.length paramPats) funTy with
+                      | TCon (rn, _) when
+                            (if isPartial then rn <> "Option"
+                             else nCases > 1 && rn <> ("ActiveChoice" + string nCases)) ->
+                          vecAdd diags
+                              (t.Offset,
+                               (if isPartial then
+                                   "a partial active pattern must return an option, not '" + rn + "'"
+                                else
+                                   "an active pattern with " + string nCases
+                                   + " cases must return a " + string nCases
+                                   + "-way choice, not '" + rn + "'"))
+                      | _ -> ())
              | _ -> ())
             // `let x = e in body` evaluates to the continuation, typed HERE
             // — after generalization — so every use in it instantiates the
@@ -6881,6 +7232,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   | _ -> dictSet bases name (ownParams, baseTy)
               | None -> ())
          | None -> ())
+        // A CONCRETE class must fill every abstract slot it inherits. Left
+        // unimplemented the slot stays 0, `$novt`, and the call TRAPS when
+        // reached — accepted at compile time and dead at run time, which is
+        // the shape this compiler refuses to ship. `[<AbstractClass>]` opts
+        // out, exactly as in F#.
+        //
+        // Only the members declared on the base are checked, not the whole
+        // chain: a base that inherits its own abstract slots is checked at
+        // ITS declaration, so a missing one is reported once, where it is
+        // introduced, rather than again at every descendant.
         currentBase <-
             match dictTryFind bases name with
             | Some (_, bt) -> Some bt
@@ -6899,6 +7260,199 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let memberDecls = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
         let isAbstractM (m : GreenNode) =
             tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "abstract")
+        // A VALUE TYPE cannot dispatch, inherit, or run a constructor body of
+        // `let`s — F# rejects all three, and here each was worse than
+        // rejected: accepted and silently broken. The abstract slot has no
+        // vtable to land in (a struct receiver carries no header), `inherit`
+        // has no base object to embed, and a class-body `let` was DROPPED
+        // WHOLE, side effects included.
+        (if (dictTryFind structTypes name).IsSome
+            || (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+                | Some t -> (dictTryFind structTypes t.Text).IsSome
+                | None -> false) then
+            for m in memberDecls |> List.filter isAbstractM do
+                (match tokensOf m |> List.filter (fun t -> t.Kind = Ident) with
+                 | [ _; nm ] | [ nm ] -> vecAdd diags (nm.Offset, "a struct cannot declare an abstract member: a value has no vtable to dispatch through")
+                 | _ -> ())
+            (match nodesOf n |> List.tryFind (fun m -> m.NodeKind = InheritDecl) with
+             | Some ih ->
+                 (match Green.tokens (GNode ih) |> List.tryHead with
+                  | Some t -> vecAdd diags (t.Offset, "a struct cannot inherit: a value embeds no base object")
+                  | None -> ())
+             | None -> ())
+            for m in nodesOf n do
+                // `static let` is legal on a struct (the adaptive port's
+                // CountingHashSet keeps its Traceable instances that way);
+                // it is the INSTANCE `let` — a constructor body a value
+                // type does not run — that F# forbids and this dropped
+                if m.NodeKind = LetDecl
+                   && not (tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static")) then
+                    match Green.tokens (GNode m) |> List.tryHead with
+                    | Some lt -> vecAdd diags (lt.Offset, "a struct cannot contain an instance `let` binding")
+                    | None -> ()
+            // a struct field OF THE STRUCT'S OWN TYPE has no finite layout —
+            // the value would contain itself by value. Checked on the raw
+            // written name: the field walk below prunes through aliases, but
+            // the direct self-reference is what the layout recursion dies on.
+            let selfNames =
+                [ name ]
+                @ (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+                   | Some t when t.Text <> name -> [ t.Text ]
+                   | _ -> [])
+            // a field whose TYPE names the struct itself has no finite
+            // layout. The first Ident of a val field / record field is the
+            // field's NAME — a field may legitimately be NAMED like the
+            // type — so only identifiers after it are the type's.
+            let checkFieldTokens (toks : Token list) =
+                match toks |> List.filter (fun t -> t.Kind = Ident) with
+                // exactly ONE type identifier, and it is the struct: the
+                // BARE self type. `S option` stays legal — the option is a
+                // heap reference, so the layout is finite (matching F#,
+                // which rejects only the by-value cycle).
+                | [ _name; only ] when List.contains only.Text selfNames ->
+                    vecAdd diags (only.Offset, "a struct cannot contain a field of its own type: the value would have no finite size")
+                | _ -> ()
+            for m in nodesOf n do
+                if m.NodeKind = MemberDecl
+                   && tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "val") then
+                    checkFieldTokens (Green.tokens (GNode m))
+                elif m.NodeKind = RecordRepr then
+                    for f in nodesOf m do
+                        if f.NodeKind = RecordField then
+                            checkFieldTokens (Green.tokens (GNode f)))
+        let memberNameTok (m : GreenNode) =
+            match tokensOf m |> List.filter (fun t -> t.Kind = Ident) with
+            | [ _; nm ] -> Some nm
+            | [ nm ] -> Some nm
+            | _ -> None
+        // ONE NAME, ONE SLOT. A vtable row is keyed by (interface, member),
+        // so a second abstract of the same name takes the first one's row and
+        // makes it unreachable — a call lands on whichever registered last.
+        // F# rejects the declaration, and the CLASS-member side of this rule
+        // is already enforced at its declaration; this is the interface side.
+        for m in memberDecls do
+            if not (isAbstractM m)
+               || tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "default") then
+                match memberNameTok m with
+                | Some t -> dictSet concreteMembers (name + "." + t.Text) true
+                | None -> ()
+        let seenAbstract = dictNew<string, bool> ()
+        for m in memberDecls |> List.filter isAbstractM do
+            // `abstract inline` is a contradiction now that `inline` is
+            // real: inlining copies a KNOWN body to the call site, and an
+            // abstract member's body is chosen by dispatch at run time
+            if tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "inline") then
+                (match memberNameTok m with
+                 | Some t -> vecAdd diags (t.Offset, "an abstract member cannot be inline: there is no known body to copy to the call site")
+                 | None -> ())
+            match memberNameTok m with
+            | Some t ->
+                if (dictTryFind seenAbstract t.Text).IsSome then
+                    vecAdd diags
+                        (t.Offset,
+                         "duplicate abstract member '" + t.Text + "' on " + name
+                         + ": one name is one dispatch slot, so the second is unreachable")
+                else dictSet seenAbstract t.Text true
+            | None -> ()
+
+        // An INTERFACE inheriting an interface inherits its slots; it does
+        // not fill them — the implementing CLASS does. `IOpReader\`2 :
+        // IAdaptiveObject` is that shape, and it is the normal spelling.
+        let isInterfaceDecl =
+            not (List.isEmpty memberDecls) && List.forall isAbstractM memberDecls
+        // and an EXTENSION (`type X with ...`) is not a declaration of X at
+        // all — it adds members to a type declared elsewhere, so it neither
+        // owns X's slots nor has to fill them. `type IOpReader<..> with` in
+        // the adaptive port is exactly this, and reads as a concrete type
+        // with a base to every test above.
+        let isExtensionDecl =
+            tokensOf n |> List.exists (fun k -> k.Kind = Keyword && k.Text = "with")
+            && not (tokensOf n |> List.exists (fun k -> k.Kind = Operator && k.Text = "="))
+        // Three extension shapes F# rejects and this compiler used to accept
+        // AND SILENTLY BREAK — each found by running the accepted program:
+        //
+        //  * an extension on a BUILTIN type. `string`'s members are a fixed
+        //    builtin set (DIVERGENCES.md), so the added member resolves to
+        //    nothing — and the statement using it was DROPPED WHOLE: the
+        //    program ran, printed nothing, exit 0.
+        //  * a `let` inside an extension block: silently discarded, effects
+        //    included.
+        //  * an `override` inside an extension block: registered nowhere the
+        //    dispatch looks, so the real method keeps answering.
+        (if isExtensionDecl then
+            (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+             | Some t when
+                   List.contains t.Text
+                       [ "string"; "int"; "float"; "float32"; "float16"; "int64"
+                         "uint64"; "uint32"; "int16"; "uint16"; "byte"; "sbyte"
+                         "bool"; "char"; "unit"; "nativeint"; "obj"; "seq"
+                         "list"; "array"; "option"; "voption" ] ->
+                 vecAdd diags
+                     (t.Offset,
+                      "'" + t.Text + "' cannot be extended: its members are a fixed builtin set, so the added member would resolve to nothing")
+             | _ -> ())
+            for m in nodesOf n do
+                if m.NodeKind = LetDecl then
+                    // the binder is inside an IdentPat NODE, so direct tokens
+                    // hold only the `let` keyword — blame that
+                    match Green.tokens (GNode m) |> List.tryHead with
+                    | Some lt -> vecAdd diags (lt.Offset, "a `let` binding is not allowed in a type extension")
+                    | None -> ()
+                elif m.NodeKind = MemberDecl
+                     && tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "override") then
+                    match tokensOf m |> List.tryFind (fun t -> t.Kind = Ident) with
+                    | Some ot -> vecAdd diags (ot.Offset, "an `override` is not allowed in a type extension: dispatch never sees it, so the original method keeps answering")
+                    | None -> ())
+        // `abstractTypes` is keyed by the token as WRITTEN, while `name` may
+        // carry the arity decoration (`AbstractReader\`2`) — ask under both,
+        // or an [<AbstractClass>] at a second arity looks concrete
+        let isAbstractDecl =
+            (dictTryFind abstractTypes name).IsSome
+            || (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+                | Some t -> (dictTryFind abstractTypes t.Text).IsSome
+                | None -> false)
+        (if not isAbstractDecl && not isInterfaceDecl && not isExtensionDecl then
+            // what THIS class supplies, then each ancestor in turn: a slot is
+            // filled by the nearest type below the one that declared it
+            let have = dictNew<string, bool> ()
+            for m in memberDecls do
+                match memberNameTok m with
+                | Some t -> dictSet have t.Text true
+                | None -> ()
+            let mutable cur =
+                match dictTryFind bases name with
+                | Some (_, TCon (bn, _)) -> Some bn
+                | _ -> None
+            let seenTy = dictNew<string, bool> ()
+            let mutable fuel = 32
+            while cur.IsSome && fuel > 0 do
+                fuel <- fuel - 1
+                let bn = cur.Value
+                if (dictTryFind seenTy bn).IsSome then cur <- None
+                else
+                dictSet seenTy bn true
+                (match dictTryFind ifaces bn with
+                 | Some slots ->
+                     for mn, _ in slots do
+                         if (dictTryFind have mn).IsNone
+                            && (dictTryFind concreteMembers (bn + "." + mn)).IsNone then
+                             match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+                             | Some t ->
+                                 vecAdd diags
+                                     (t.Offset,
+                                      name + " does not implement inherited abstract member '"
+                                      + bn + "." + mn + "'")
+                             | None -> ()
+                 | None -> ())
+                // anything this ancestor supplies counts as filled for the
+                // ancestors above it
+                for k, _ in dictPairs concreteMembers do
+                    if k.StartsWith (bn + ".") then
+                        dictSet have (k.Substring (strLen bn + 1)) true
+                cur <-
+                    match dictTryFind bases bn with
+                    | Some (_, TCon (nb, _)) -> Some nb
+                    | _ -> None)
         if memberDecls |> List.exists isAbstractM then
             dictSet ifaces name
                 (memberDecls
@@ -7037,6 +7591,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | _ -> ())
             | UnionCase ->
                 let caseTok = tokensOf m |> List.tryFind (fun t -> t.Kind = Ident)
+                // a case name must start uppercase (F#'s FS0053) — and here
+                // it is not just fidelity: this compiler's own pattern rule
+                // reads a lowercase identifier in a case pattern as a BINDER
+                // whenever the case is out of scope, so a lowercase case
+                // declares something that silently stops matching the moment
+                // an `open` is missing
+                (match caseTok with
+                 | Some t when strLen t.Text > 0 && charAt t.Text 0 >= 'a' && charAt t.Text 0 <= 'z' ->
+                     vecAdd diags (t.Offset, "union case '" + t.Text + "' must start with an uppercase letter")
+                 | _ -> ())
                 let hasArrow = hasOpToken "->" m
                 let isGadt = hasArrow || hasOpToken ":" m
                 let tyNodes = nodesOf m |> List.filter (fun x -> isTypeKind x.NodeKind)
@@ -8501,7 +9065,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // int layouts with no `#` left, nothing marked it for
             // stamping, and every use ran the int body. Dropped instead,
             // the operators dispatch on their boxes at run time.
-            c.Args |> List.exists (fun a ->
+            // the ASSOCIATED types count too, not just the arguments.
+            // `Zero - One` inside a `when Num<'a>` body is `Sub<'z,'o>` whose
+            // RESULT is 'a: its arguments are ordinary inner variables, so the
+            // constraint did not look declaration-level, and defaulting them to
+            // int determined the association — grounding 'a itself. A sibling
+            // `member v.Length when Floating<'a>` then rendered
+            // `Floating:sqrt:int` and trapped for every receiver
+            // (KNOWN-ISSUES #2). Deciding a constraint whose projection is a
+            // declaration variable IS deciding that variable.
+            (c.Args @ (c.Assoc |> List.map snd)) |> List.exists (fun a ->
                 freeVars a |> List.exists (fun v -> v.Level = 0))
         // a declaration-level constraint pulls its ASSOCIATED variables
         // along before anything is dropped: the projection of a per-stamp
@@ -8512,16 +9085,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let mutable spread = true
         while spread do
             spread <- false
-            for _, c in wanted do
+            for e in wanted do
+                let c = e.WCon
                 if not (isGround c) && declLevel c then
                     for _, at in c.Assoc do
                         for v in freeVars at do
                             if v.Level <> 0 then
                                 v.Level <- 0
                                 spread <- true
-        wanted <- wanted |> List.filter (fun (_, c) -> isGround c || not (declLevel c))
-        match wanted |> List.tryFind (fun (_, c) -> not (isGround c)) with
-        | Some (offset, c) ->
+        wanted <- wanted |> List.filter (fun e -> isGround e.WCon || not (declLevel e.WCon))
+        match wanted |> List.tryFind (fun e -> not (isGround e.WCon)) with
+        | Some entry ->
+            let offset = entry.WOff
+            let c = entry.WCon
             (match Classes.select classes true c.Class (c.Args |> List.map (fun _ -> tInt)) [] with
              | Classes.Solved _ ->
                  // a defaulting unification can FAIL (the arg is a tuple,
@@ -8535,10 +9111,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          vecAdd diags (offset, err)
                      | None -> ()
                  if failed then
-                     wanted <- wanted |> List.filter (fun (_, w) -> not (System.Object.ReferenceEquals (w, c)))
+                     wanted <- wanted |> List.filter (fun e -> not (System.Object.ReferenceEquals (e.WCon, c)))
                  defaulting <- true
                  solveWanted ()
-             | _ -> wanted <- wanted |> List.filter (fun (_, w) -> not (System.Object.ReferenceEquals (w, c))))
+             | _ -> wanted <- wanted |> List.filter (fun e -> not (System.Object.ReferenceEquals (e.WCon, c))))
         | None -> ()
 
     // a class-member use binds to an instance member only once solving has
@@ -8655,6 +9231,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     for offset, recvTy, result, name in parked do
         if not (tryResolveDot true offset recvTy result name) then
             match prune recvTy with
+            // A FUNCTION HAS NO MEMBERS. `V3d.length` where `V3d` is the
+            // let-bound constructor function is F#'s reading of that name —
+            // a value shadows a module of its own name — and F# says so
+            // (FS0039). Here it reached emission unlowered and the module
+            // TRAPPED at the access, with `--strict` the only thing that
+            // mentioned it.
+            | TFun (_, _) when
+                  offset < 30000000
+                  && (dictTryFind classes.Classes "Num").IsSome ->
+                vecAdd diags (offset, "a function has no member '" + name + "'")
             | TCon (tn, _) when
                   offset < 30000000
                   // only when the PRELUDE is present: the dogfooding gate
@@ -8675,11 +9261,34 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   // the by-name guess (the arity-split sibling shape in
                   // the adaptive port does); only a name known NOWHERE is
                   // certainly a misspelling
-                  && (dictTryFind fields name).IsNone
-                  && List.isEmpty (fieldCandidates name)
-                  && (dictTryFind classes.MemberOwner name).IsNone
-                  && not (dictPairs fields
-                          |> List.exists (fun (k, _) -> k.EndsWith ("." + name))) ->
+                  && (((dictTryFind fields name).IsNone
+                       && List.isEmpty (fieldCandidates name)
+                       && (dictTryFind classes.MemberOwner name).IsNone
+                       && not (dictPairs fields
+                               |> List.exists (fun (k, _) -> k.EndsWith ("." + name))))
+                      // A receiver that CANNOT INHERIT is the exception to
+                      // "the name exists somewhere, so the guess may be
+                      // legitimate": a member declared on another type can
+                      // never be reached on one, so the name existing
+                      // elsewhere is exactly the evidence. `b.ToRot3d`, where
+                      // ToRot3d is declared on A only, compiled clean and left
+                      // a bare `.ToRot3d` in the tree, which the backend
+                      // answers with a trap (KNOWN-ISSUES #28).
+                      //
+                      // Records and unions qualify for the same reason
+                      // structs do — F# forbids inheriting from any of the
+                      // three. Restricting it to structs was arbitrary, and
+                      // the identical shape on a plain record still built and
+                      // trapped. CLASSES stay out: a member reached on one may
+                      // be declared on a BASE, and this test would call that a
+                      // misspelling.
+                      || (((dictTryFind structTypes tn) = Some true
+                           || (dictTryFind recordsReg tn).IsSome
+                           || (dictTryFind unionsReg tn).IsSome)
+                          && (dictTryFind fields (tn + "." + name)).IsNone
+                          && List.isEmpty (fieldCandidates (tn + "." + name))
+                          && dictPairs fields
+                             |> List.exists (fun (k, _) -> k.EndsWith ("." + name)))) ->
                 vecAdd diags (offset, tn + " has no member " + name)
             // the member EXISTS on the receiver's type but is private: the
             // visibility filter kept it out of every candidate list, and
@@ -8807,6 +9416,93 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | TCon (("byte" | "sbyte" | "int16" | "uint16"), []) -> "i"
         | _ -> ""
 
+    // A NAME MAY BIND ONLY ONCE IN ONE PATTERN. `match (1, 2) with (x, x) -> x`
+    // answered 2 — the second binder silently won — where F# rejects it
+    // (FS0038). Nobody writes that meaning "the last one"; they mean "both
+    // elements equal", which is not what a pattern says in this language.
+    //
+    // OR-ALTERNATIVES SHARE THEIR NAMES BY DESIGN: `| A x | B x ->` binds `x`
+    // on both sides and must. There is no OrPat node — a `|` is a TOKEN
+    // between sibling patterns — and it appears at any depth, parenthesised
+    // inside a pattern as readily as at the top of a clause. This compiler's
+    // own source has `(EVar (v, hsch) | EVarI (v, hsch, _))`, which a walk
+    // that merged children blindly rejected. So `|` starts a new BRANCH:
+    // duplicates are an error within one branch and expected across them.
+    let rec patNames (m : GreenNode) : (string * int) list =
+        if m.NodeKind = IdentPat then
+            // a DOTTED name is a qualified case, never a binder; an undotted
+            // one binds only when it introduced a definition here, which is
+            // what tells `x` apart from a nullary case name
+            if tokensOf m |> List.exists (fun t -> t.Kind = Operator && t.Text = ".") then []
+            else
+                match tokensOf m |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
+                | Some t when (dictTryFind defsAt t.Offset).IsSome -> [ (t.Text, t.Offset) ]
+                | _ -> []
+        else
+            let mutable branch : (string * int) list = []
+            let mutable earlier : (string * int) list = []
+            // In a RECORD pattern the field LABEL is an identifier too, and
+            // `{ a = a }` names the field and the binder the same thing —
+            // counted blindly that is a duplicate, and every such pattern was
+            // rejected. Only what follows an `=` binds.
+            let isRec = m.NodeKind = RecordPat
+            let mutable afterEq = not isRec
+            for c in m.Children do
+                match c with
+                | GToken t when isRec && t.Kind = Operator && t.Text = "=" -> afterEq <- true
+                | GToken t when isRec && t.Kind = Semicolon -> afterEq <- false
+                | GToken t when t.Kind = Operator && t.Text = "|" ->
+                    earlier <- earlier @ branch
+                    branch <- []
+                | GNode m2 when isPatKind m2.NodeKind && not afterEq -> ()
+                | GNode m2 when isPatKind m2.NodeKind ->
+                    let ns = patNames m2
+                    for nm, off in ns do
+                        if branch |> List.exists (fun (n2, _) -> n2 = nm) then
+                            vecAdd diags (off, "'" + nm + "' is bound twice in this pattern")
+                    branch <- branch @ ns
+                | _ -> ()
+            (earlier @ branch) |> List.distinctBy (fun (n2, _) -> n2)
+    let rec dupScan (inPat : bool) (g : Green) : unit =
+        match g with
+        | GNode n ->
+            if not inPat && isPatKind n.NodeKind then patNames n |> ignore
+            for c in n.Children do dupScan (inPat || isPatKind n.NodeKind) c
+        | GToken _ -> ()
+    dupScan false (GNode root)
+
+    // judge the numeric printf holes now that their variables have settled.
+    // A type still VARIABLE stays lenient — the argument may be a generic
+    // parameter of the enclosing binding, decided per instantiation.
+    for off, c, ty in vecToList numHoleSites do
+        match prune ty with
+        | TCon (tn, _) when
+              (if c = 'f' || c = 'e' || c = 'E' || c = 'g' || c = 'G' then
+                  not (List.contains tn [ "float"; "float32"; "float16" ])
+               else
+                  not (List.contains tn
+                          [ "int"; "int64"; "uint32"; "uint64"; "int16"
+                            "uint16"; "byte"; "sbyte"; "nativeint" ])) ->
+            vecAdd diags
+                (off,
+                 "%" + string c + " expects "
+                 + (if c = 'f' || c = 'e' || c = 'E' || c = 'g' || c = 'G' then "a float"
+                    else "an integer")
+                 + ", not '" + tn + "'")
+        | _ -> ()
+    // judge the null literals now that their variables have settled
+    for off, ty in vecToList nullSites do
+        match prune ty with
+        | TCon (tn, _) when
+              (dictTryFind unionsReg tn).IsSome
+              || (dictTryFind recordsReg tn).IsSome
+              || (dictTryFind structTypes tn) = Some true
+              || List.contains tn
+                  [ "int"; "float"; "float32"; "float16"; "int64"; "uint64"
+                    "uint32"; "int16"; "uint16"; "byte"; "sbyte"; "bool"
+                    "char"; "nativeint"; "unit" ] ->
+            vecAdd diags (off, "the type '" + tn + "' does not have 'null' as a proper value")
+        | _ -> ()
     { Diagnostics = vecToList diags
       FreshIdents =
           (let named = Set.ofList (vecToList namedArgNameOffs)
@@ -8934,7 +9630,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
       // record field is not in the subset the compiler itself compiles.)
       StrTypes =
         vecToList strHolesRaw
-        |> List.filter (fun (off, _) -> not (List.contains off (vecToList showUnsolved)))
+        // an unsatisfied Show normally drops the entry — the runtime walker
+        // handles it. But a type that OVERRIDES ToString has an answer of its
+        // own, and Lower can only route to it if the type reaches Lower at
+        // all: a class has no Show instance, so `string c` fell through to
+        // the walker and printed "?" while `c.ToString ()` beside it was
+        // right (KNOWN-ISSUES #8, the class half).
+        |> List.filter (fun (off, ty) ->
+            not (List.contains off (vecToList showUnsolved))
+            || (match prune ty with
+                | TCon (n, _) -> (dictTryFind fields (canonTypeName n + ".ToString")).IsSome
+                | _ -> false))
         // a PRIMITIVE keeps the conversion it already had: its `str` is
         // literally `string x`, so routing it through the class is an
         // infinite regress
@@ -8944,9 +9650,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             match prune ty with
             | TCon (n, targs) when not (List.isEmpty targs) ->
                 (match Types.instConName (prune ty) with
-                 | "" -> n
+                 | "" -> canonTypeName n
                  | nm -> nm)
-            | TCon (n, _) -> n
+            | TCon (n, _) -> canonTypeName n
             // a TUPLE is a type too, and `string (1, "a")` is one of the
             // shapes this exists for — it has no TCon name, so it is spelled
             // the way every other tuple instantiation is
@@ -8961,9 +9667,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             match prune ty with
             | TCon (n, targs) when not (List.isEmpty targs) ->
                 (match Types.instConName (prune ty) with
-                 | "" -> n
+                 | "" -> canonTypeName n
                  | inm -> inm)
-            | TCon (n, _) -> n
+            | TCon (n, _) -> canonTypeName n
             | TTuple _ as tt -> Types.instConName tt
             | _ -> "")
         |> List.filter (fun (_, n) -> n <> "" && not (n.StartsWith "#"))
@@ -8978,9 +9684,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // head resolved every specialized caller to ONE shared body
             | TCon (n, targs) when not (List.isEmpty targs) ->
                 (match Types.instConName (prune ty) with
-                 | "" -> n
+                 | "" -> canonTypeName n
                  | inm -> inm)
-            | TCon (n, _) -> n
+            | TCon (n, _) -> canonTypeName n
             // a variable of the enclosing binding: named so that stamping
             // substitutes the caller's argument and the operator resolves
             // in the specialized copy

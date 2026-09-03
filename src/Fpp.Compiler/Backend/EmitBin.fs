@@ -291,15 +291,29 @@ let endFn (f : Fn) : unit =
         // `x`s in one function are two slots, and a reader must be able to tell
         // which is which
         |> List.sortBy fst
+        // A SET of the names already handed out, not a scan of them. This
+        // walked the whole accumulator per local to count collisions, which is
+        // quadratic in the locals of a function — and inlining makes functions
+        // with a great many locals. It was 40% of a whole fpp.base build (24 s
+        // of 52), spent entirely on the debug name section.
+        //
+        // The old count-and-append rule could also collide: a source `x'`
+        // followed by `x` both came out `x'`, because the second counted the
+        // first and appended one quote. Taking the first FREE candidate cannot.
         |> List.fold
-            (fun acc (i, n) ->
+            (fun (acc, assigned) (i, n) ->
                 match acc with
-                | (j, _) :: _ when j = i -> acc
+                | (j, _) :: _ when j = i -> (acc, assigned)
                 | _ ->
-                    let taken = acc |> List.filter (fun (_, m) -> m = n || m.StartsWith (n + "'"))
-                    let n2 = if List.isEmpty taken then n else n + String.replicate (List.length taken) "'"
-                    (i, n2) :: acc)
-            []
+                    let mutable k = 0
+                    let mutable cand = n
+                    while (dictTryFind assigned cand).IsSome do
+                        k <- k + 1
+                        cand <- n + String.replicate k "'"
+                    dictSet assigned cand true
+                    ((i, cand) :: acc, assigned))
+            ([], dictNew<string, bool> ())
+        |> fst
         |> List.rev
     if not (List.isEmpty names) then vecAdd f.M.LocalNames (idx, names)
     f.M.CodeCount <- f.M.CodeCount + 1

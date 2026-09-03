@@ -4,6 +4,23 @@ open Fpp.Prelude
 open Fpp.Analysis.Types
 open Fpp.Core.Ir
 
+/// Digits only, no `System.Int32.TryParse`: the SELF-HOSTED compiler has no
+/// such API, so a flag reader written with one answers differently in stage-0
+/// and stage-1 — and the fixpoint then reports a byte mismatch that is really
+/// the two stages configuring themselves differently, not a miscompile.
+let private intOr (dflt : int) (s : string) : int =
+    if isNull s || s = "" then dflt
+    else
+        let mutable ok = true
+        let mutable acc = 0
+        for i in 0 .. strLen s - 1 do
+            let c = s.[i]
+            if c >= '0' && c <= '9' then acc <- acc * 10 + (int c - int '0')
+            else ok <- false
+        if ok then acc else dflt
+
+
+
 // Optimization passes over the CORE IR, after monomorphization and before
 // emission. They live here rather than in the backend on purpose: these are
 // decisions that need TYPES and shapes, which the backend has already thrown
@@ -126,8 +143,12 @@ let private freshenBinders (counter : Vec<int>) (e : Expr) : Expr =
              | _ -> ())
             x)
         e |> ignore
-    if dictPairs subst |> List.isEmpty then e
-    else
+    // NO early return when there is nothing to rename. The second walk is what
+    // gives the copy FRESH NODES, and the lambda lift keys a closure by node
+    // REFERENCE — hand two inlined copies the same ELam object and both get one
+    // lifted function with one set of captures. Returning `e` unchanged here is
+    // exactly that: `List.sort` and `Array.sort` each inlined fine on their own
+    // and trapped in a program containing both.
     let sub (v : VarId) =
         match dictTryFind subst (v.Path, v.Offset) with
         | Some nv -> nv
@@ -172,8 +193,27 @@ let private freshenBinders (counter : Vec<int>) (e : Expr) : Expr =
 /// `let t = (a, b) in match t with (x, y) -> ...` and the chain shows up.
 /// This is the pass that makes inlining worth anything.
 let fuseTuples (decls : Decl list) : Decl list =
+    let allPVar (ps : Pat list) = ps |> List.forall (fun p -> match p with PVar _ -> true | _ -> false)
     let rewrite (e : Expr) : Expr =
         match e with
+        // the shape INLINING actually produces. A tupled parameter is bound by
+        // the inliner as an ordinary argument let, so the scrutinee is that
+        // VARIABLE and not the literal — matching only the literal meant the
+        // pass never fired on inlined code, and every inlined tupled call
+        // built a real tuple. On ray-triangle that was 886 MB of tuples that
+        // the by-value ABI had been keeping in registers.
+        | ELet (false, tv, _, ETuple xs, EMatch ((EVar (sv, _) | EVarI (sv, _, _)), [ (PTuple ps, None, body) ])) when
+              (sv.Path, sv.Offset) = (tv.Path, tv.Offset)
+              && ps.Length = xs.Length && allPVar ps
+              // the binding exists only to be destructured: any OTHER use of
+              // it needs the tuple to be a real value
+              && not (mentions (let d = dictNew<string * int, bool> () in dictSet d (tv.Path, tv.Offset) true; d) body) ->
+            List.fold2
+                (fun acc p x ->
+                    match p with
+                    | PVar (v, sch) -> ELet (false, v, sch, x, acc)
+                    | _ -> acc)
+                body (List.rev ps) (List.rev xs)
         | EMatch (ETuple xs, [ (PTuple ps, None, body) ]) when
               ps.Length = xs.Length
               && ps |> List.forall (fun p -> match p with PVar _ -> true | _ -> false) ->
@@ -234,7 +274,9 @@ let uncurryTupleArgs (decls : Decl list) : Decl list =
                 for _, v in ms do dictSet pinned (v.Path, v.Offset) true
         | DMembers (_, own) -> for _, v in own do dictSet pinned (v.Path, v.Offset) true
         | DExtern (v, _) -> dictSet pinned (v.Path, v.Offset) true
-        | DExport (v, _) -> dictSet pinned (v.Path, v.Offset) true
+        // the `$inline` marker is a hint, not an export — it must not pin
+        // its function against the shim rewrite
+        | DExport (v, nm) -> if nm <> "$inline" then dictSet pinned (v.Path, v.Offset) true
         | _ -> ()
     let candInfo = dictNew<string * int, string * (VarId * Scheme) list * Scheme> ()
     for d in decls do
@@ -341,7 +383,10 @@ let uncurryTupleArgs (decls : Decl list) : Decl list =
 /// A body small enough that the call costs more than the code. Measured in
 /// IR nodes; a call is an allocation-free direct call in the best case and a
 /// closure application in the worst, so the threshold is not tiny.
-let private inlineThreshold = 6
+let private inlineThreshold =
+    // FPP_INLINE_THRESHOLD overrides it for measurement; see the note on
+    // `optimize` for why the default sat at 6 for so long.
+    intOr 120 (System.Environment.GetEnvironmentVariable "FPP_INLINE_THRESHOLD")
 
 /// Inline non-recursive functions at FULL-ARITY call sites.
 ///
@@ -349,52 +394,316 @@ let private inlineThreshold = 6
 /// has mutable locals and assignment, so substituting an argument used twice
 /// would evaluate it twice, and one used under a branch would move its
 /// effects. Binding preserves both the order and the count.
+/// Every variable this expression BINDS, as (path, offset) keys.
+///
+/// Needed because the copy keeps the original binders (see `expand`), and
+/// monomorphized clones of one source function share their VarIds — inlining
+/// `f<int>` into `f<float>` would then bind one key twice in a single body
+/// and the two would share a register.
+let rec private binderKeys (e : Expr) (acc : Vec<string * int>) : unit =
+    let rec patKeys (p : Pat) =
+        match p with
+        | PVar (v, _) -> vecAdd acc (v.Path, v.Offset)
+        | PAs (inner, v, _) -> vecAdd acc (v.Path, v.Offset); patKeys inner
+        | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) | POr ps -> List.iter patKeys ps
+        | PAnd (a, b) -> patKeys a; patKeys b
+        | PCons (h, t) -> patKeys h; patKeys t
+        | PWild | PLit _ | PTypeTest _ -> ()
+    (match e with
+     | ELam (ps, _) -> for v, _ in ps do vecAdd acc (v.Path, v.Offset)
+     | ELet (_, v, _, _, _) -> vecAdd acc (v.Path, v.Offset)
+     | EMatch (_, cs) -> for p, _, _ in cs do patKeys p
+     | ETry (_, cs) -> for p, _, _ in cs do patKeys p
+     | _ -> ())
+    mapChildrenWith (fun c -> binderKeys c acc; c) e |> ignore
+
+/// Is every binder in this body REPRESENTATION-MONOMORPHIC?
+///
+/// A generic local rides the uniform word; a concrete scalar rides raw. The
+/// call boundary is where one becomes the other, and inlining removes the
+/// boundary — so a body that binds `'a` locals and is handed concrete
+/// arguments ends up storing a RAW int where a uniform word belongs. The
+/// stepped-range builder does exactly that: `[ 3 .. -1 .. -3 ]` inlined put a
+/// raw -2 in a list, and comparing the list read it as a pointer (wasm
+/// address 0xfffffffe). Checking the SIGNATURE is not enough; the locals have
+/// to be concrete too.
+let rec private monoBinders (e : Expr) : bool =
+    let schOk (sch : Scheme) = List.isEmpty (freeVars sch.Body)
+    let rec patOk (p : Pat) =
+        match p with
+        | PVar (_, sch) -> schOk sch
+        | PAs (inner, _, sch) -> schOk sch && patOk inner
+        | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) | POr ps -> List.forall patOk ps
+        | PAnd (a, b) -> patOk a && patOk b
+        | PCons (h, t) -> patOk h && patOk t
+        | PWild | PLit _ | PTypeTest _ -> true
+    let here =
+        match e with
+        | ELam (ps, _) -> ps |> List.forall (fun (_, sch) -> schOk sch)
+        | ELet (_, _, sch, _, _) -> schOk sch
+        | EMatch (_, cs) -> cs |> List.forall (fun (p, _, _) -> patOk p)
+        | ETry (_, cs) -> cs |> List.forall (fun (p, _, _) -> patOk p)
+        | _ -> true
+    if not here then false
+    else
+        let ok = vecNew<bool> ()
+        vecAdd ok true
+        mapChildrenWith (fun c -> (if not (monoBinders c) then vecSet ok 0 false); c) e |> ignore
+        vecGet ok 0
+
+/// A structural COPY: same binders, same offsets, brand-new nodes.
+///
+/// The inliner must not splice the callee's own `Expr` objects into the
+/// caller. Several analyses key on node IDENTITY — the bounds proof marks a
+/// safe access in a `refMap` keyed by the node, and the lambda lift names a
+/// closure the same way — so a shared node carries one context's conclusion
+/// into the other. Renaming the binders as well is wrong for a different
+/// reason (see `expand`): inference keys decisions by the variable the SOURCE
+/// bound. Copy the nodes, keep the names.
+let rec private deepCopy (e : Expr) : Expr = mapChildrenWith deepCopy e
+
+/// FPP_INLINE_MAX=<n>: inline only the first n sites, in a deterministic
+/// order. A bisection handle — the pass is otherwise all-or-nothing, and
+/// "which site breaks the self-host" is not answerable without one.
+/// Read with `intOr`, not `Int32.TryParse`/`Int32.MaxValue`: the self-hosted
+/// compiler has neither, and it did not fail on them — it read MaxValue as
+/// ZERO, so stage-1 capped itself at "inline no sites" and produced a smaller
+/// binary than stage-0 from the same source and the same flags. That is what
+/// the byte mismatch was; the inliner itself was fine.
+let private inlineMax = intOr 2147483647 (System.Environment.GetEnvironmentVariable "FPP_INLINE_MAX")
+
 let inlineCalls (decls : Decl list) : Decl list =
     let counter = vecNew<int> ()
     vecAdd counter 0
+    let sites = vecNew<int> ()
+    vecAdd sites 0
+    // FPP_INLINE_REPEAT=1: inline a callee MORE THAN ONCE per caller, with the
+    // copy's binders renamed. Vector math calls the same three-line helper
+    // several times in one function (Moeller-Trumbore: Dot four times, Cross
+    // twice), and one copy per caller leaves every repeat as a call passing a
+    // V3d by value and returning through sret.
+    // ON by default; FPP_INLINE_REPEAT=0 turns it off. Worth, on V8's
+    // optimising tier: Trafo3d.TransformPos 31 -> 13 ms. It costs box-extend
+    // ~8% in code size with nothing to win back, which is the trade.
+    //
+    // It was ruled INCORRECT for a while on the strength of an out-parameter
+    // test, and that verdict was wrong: the fault was the backend aliasing a
+    // binder to a CELL variable's root slot (which holds the pointer to the
+    // cell, not the value). Repeat inlining only moved a second copy onto the
+    // cell receiver that exposed it. The alias guard checks both ends now.
+    let repeatOn = System.Environment.GetEnvironmentVariable "FPP_INLINE_REPEAT" <> "0"
+    // How deep to keep expanding INSIDE a body just inlined. ONE is the
+    // measured sweet spot: ray/triangle goes 59 -> 20 ms at depth 1 and stays
+    // at 20 for 2 and 3, while the compile cost keeps climbing (transform:
+    // 40 s at depth 0, 53 s at 1, 122 s at 2) because the inliner revisits
+    // exponentially more of each copy. The emitted code barely moves — 494 KB
+    // to 493 KB — so this buys nothing past the first level.
+    let inlineDepth = intOr 1 (System.Environment.GetEnvironmentVariable "FPP_INLINE_DEPTH")
+    // A CALLER'S GROWTH BUDGET, in Core nodes. Every size test until now was
+    // on the CALLEE, so nothing bounded how much one function could take on:
+    // expanding recursively took the self-hosted compiler from 21 MB to 33 MB
+    // of wasm, which then ran out of wasm32 address space. A hot loop needs a
+    // few small bodies, not an unbounded supply.
+    let inlineBudget = intOr 600 (System.Environment.GetEnvironmentVariable "FPP_INLINE_BUDGET")
+    let freshCounter = vecNew<int> ()
+    vecAdd freshCounter 0
     // candidates: non-recursive top-level functions with small bodies
-    let bodies = dictNew<string * int, (VarId * Scheme) list * Expr> ()
+    // (params, body, SIZE). The size is a property of the candidate, not of the
+    // call site, but the budget guard below asked for it at every site and
+    // `sizeOf` walks the whole body — with thousands of sites against hundreds
+    // of candidates that is the pass re-measuring the same trees all day.
+    let bodies = dictNew<string * int, (VarId * Scheme) list * Expr * int> ()
     let selfKeys = dictNew<string * int, bool> ()
+    // `let inline` (the `$inline` DExport marker from Lower): the writer
+    // asked for the body at every call site, so the SIZE threshold and the
+    // caller's growth budget both step aside — that is what F# means by the
+    // keyword once SRTP is out of scope. The soundness guards do NOT step
+    // aside: a body that crosses an obj boundary, binds a type variable, or
+    // is a stamped clone is wrong to copy no matter what the writer asked.
+    let inlineMarked = dictNew<string * int, bool> ()
     for d in decls do
         match d with
-        | DLet (false, v, _, ELam (ps, body)) ->
-            if sizeOf body <= inlineThreshold then
+        | DExport (v, "$inline") -> dictSet inlineMarked (v.Path, v.Offset) true
+        | _ -> ()
+    for d in decls do
+        match d with
+        | DLet (false, v, vsch, ELam (ps, body)) ->
+            // ONLY a fully CONCRETE signature. A call is where the uniform-ABI
+            // coercion happens: a generic parameter takes a boxed word, and a
+            // raw scalar argument is boxed on the way in. The inliner replaces
+            // the call with `let p = arg`, which performs no coercion at all —
+            // so a generic parameter then reads a RAW scalar as a pointer.
+            // `List.sort [ 3u; 4000000000u ]` faulted at wasm address
+            // 0xee6b2800, which is 4000000000 itself. Monomorphization has
+            // already made the struct math concrete, which is the code this
+            // pass exists for; generic code keeps its call.
+            let concrete (sch : Scheme) = List.isEmpty (freeVars sch.Body)
+            // `obj` is the UNIFORM representation, and widening to it is a box
+            // the call boundary performs — on the way in for a parameter, on
+            // the way out for a result. `let returnsObjOf (v : int) : obj = v`
+            // inlines to `let v = 5 in v`, which boxes nothing, and the
+            // `:?> int` that follows then unboxes a value that was never a
+            // box. Neither side may be obj.
+            let rec resultOf (t : Type) (n : int) : Type =
+                if n <= 0 then t
+                else match prune t with
+                     | TFun (_, r) -> resultOf r (n - 1)
+                     | other -> other
+            let isObj (t : Type) = match prune t with TCon ("obj", _) -> true | _ -> false
+            let objFree (sch : Scheme) = not (isObj sch.Body)
+            // never a COMPILER-SYNTHESIZED function ($ordD@…, $eqD@…, the
+            // derived comparers and hashers). Those are stamped, and the
+            // stamp is context the body only has by BEING its own function:
+            // a `compare` over a payload with no bare type-var expression to
+            // key on reads the enclosing function's witness. Inlined, that
+            // witness is gone and the call falls back to the structural
+            // walker, which reads a raw uint32 as a pointer.
+            // A HOST EXTERN is intercepted by NAME in the backend
+            // (`preludeSourceRaw` becomes the baked prelude constant,
+            // `readTextRaw` and friends become WASI calls). Those
+            // interceptions depend on where the call sits, so a copy can
+            // escape them: inlining `preludeSource` into
+            // `EmitProgramWasmLinearWith` is what made the self-hosted
+            // compiler trap, and it is the ONLY site that did — found by
+            // bisecting 2444 inline sites down to one.
+            // ... and EVERY extern, not just the five host ones. An extern's
+            // lowering depends on the CALL SITE too: a `[<JsImport>]` one is
+            // emitted as a jsxl boundary import recognised at the call, so a
+            // copy that lands somewhere else leaves the name unresolved. That
+            // is what a second inlining round did to `gpuRun` — the webgpu
+            // demo stubbed its initializer and only `--strict` said so.
+            let hostExtern =
+                [ "preludeSourceRaw"; "readTextRaw"; "existsRaw"
+                  "listDirRaw"; "canonicalizeRaw" ]
+                @ (decls |> List.choose (fun d ->
+                    match d with
+                    | DExtern (ev, _) -> Some ev.Name
+                    | _ -> None))
+            let rec touchesHost (x : Expr) : bool =
+                match x with
+                | EVar (hv, _) | EVarI (hv, _, _) -> List.contains hv.Name hostExtern
+                | EUnknown n -> List.contains n hostExtern
+                | _ ->
+                    let hit = vecNew<bool> ()
+                    vecAdd hit false
+                    mapChildrenWith (fun c -> (if touchesHost c then vecSet hit 0 true); c) x |> ignore
+                    vecGet hit 0
+            let skipped =
+                match System.Environment.GetEnvironmentVariable "FPP_INLINE_SKIP" with
+                | null | "" -> false
+                | s -> s.Split ',' |> Array.exists (fun x -> x = v.Name)
+            if (sizeOf body <= inlineThreshold
+                || (dictTryFind inlineMarked (v.Path, v.Offset)).IsSome)
+               && not skipped
+               && not (touchesHost body)
+               // never a STAMPED clone either. `dictSlot$int$bool` is a
+               // monomorphization, and a stamp is context the body has only by
+               // being its own function — the backend threads hidden witness
+               // arguments to it. Inlined, those are gone. The earlier rule
+               // caught only names STARTING with `$` (the derived comparers);
+               // a stamp puts its instantiation after the name.
+               && not (v.Name.Contains "$")
+               && ps |> List.forall (fun (_, sch) -> concrete sch && objFree sch)
+               && monoBinders body
+               && not (isObj (resultOf vsch.Body (List.length ps))) then
                 let k = dictNew<string * int, bool> ()
                 dictSet k (v.Path, v.Offset) true
                 // a body that names itself is recursive whatever the
                 // declaration says, and inlining it would not terminate
                 if not (mentions k body) then
-                    dictSet bodies (v.Path, v.Offset) (ps, body)
+                    dictSet bodies (v.Path, v.Offset) (ps, body, sizeOf body)
                     dictSet selfKeys (v.Path, v.Offset) true
         | _ -> ()
     if dictPairs bodies |> List.isEmpty then decls
     else
     let expand (owner : string * int) (e : Expr) : Expr =
-        mapExpr
-            (fun x ->
-                match x with
-                | EApp (EVar (f, _), args) when (f.Path, f.Offset) <> owner ->
-                    (match dictTryFind bodies (f.Path, f.Offset) with
-                     | Some (ps, body) when ps.Length = args.Length ->
-                         let fresh = freshenBinders counter (ELam (ps, body))
-                         (match fresh with
-                          | ELam (ps2, body2) ->
-                              // innermost-last so the first argument binds
-                              // outermost, which is the evaluation order the
-                              // call site had
-                              List.fold2
-                                  (fun acc (pv, psch) a -> ELet (false, pv, psch, a, acc))
-                                  body2 (List.rev ps2) (List.rev args)
-                          | _ -> x)
-                     | _ -> x)
-                | other -> other)
-            e
-    // two rounds: inlining exposes call sites that were behind a call. A
-    // fixpoint would be unbounded, and the second round already reaches the
-    // cases that matter (an accessor behind an accessor).
+        // nodes of inlined material this caller has taken on
+        let spent = vecNew<int> ()
+        vecAdd spent 0
+        // ONE inlining per callee per caller, and NO renaming of the binders.
+        //
+        // Renaming looks obviously right and is what broke the derived
+        // comparers: a binder carries more here than its scheme, because
+        // decisions taken during inference are keyed by the variable the
+        // SOURCE bound, and a `$inline` VarId with a synthetic offset matches
+        // none of them. `compare` on an option's `uint32` payload then fell
+        // back to the structural walker, which read the raw 4000000000 as a
+        // pointer. Keeping the original binders keeps every one of those
+        // lookups — and the one thing renaming was for, the same key bound
+        // twice in one function, cannot arise if a callee is inlined at most
+        // once per caller.
+        let used = dictNew<string * int, bool> ()
+        // keys the CALLER already binds: a copy that re-binds one of them
+        // would share its register with the caller's own variable
+        let ownKeys = dictNew<string * int, bool> ()
+        (let acc = vecNew<string * int> ()
+         binderKeys e acc
+         for k in vecToList acc do dictSet ownKeys k true)
+        // RECURSIVE at the point of insertion. The calls that matter are the
+        // ones that arrive WITH a copied body — `IntersectTriangle` brings
+        // twelve Dot/Cross calls in with it, and a single sweep never looks
+        // at them again. Expanding the copy immediately reaches exactly those,
+        // where a second global round would re-sweep everything and grow the
+        // whole program (the self-host then runs out of wasm32 address space).
+        let rec go (depth : int) (e2 : Expr) : Expr =
+            mapExpr
+                (fun x ->
+                    match x with
+                    | EApp (EVar (f, _), args) when
+                            (f.Path, f.Offset) <> owner
+                            && (repeatOn || (dictTryFind used (f.Path, f.Offset)).IsNone) ->
+                        (match dictTryFind bodies (f.Path, f.Offset) with
+                         | Some (ps, body, bsize) when
+                                vecGet sites 0 < inlineMax
+                                && (vecGet spent 0 + bsize <= inlineBudget
+                                    || (dictTryFind inlineMarked (f.Path, f.Offset)).IsSome)
+                                && ps.Length = args.Length
+                                && (repeatOn
+                                    || (let acc = vecNew<string * int> ()
+                                        binderKeys (ELam (ps, body)) acc
+                                        vecToList acc
+                                        |> List.forall (fun k ->
+                                            (dictTryFind ownKeys k).IsNone))) ->
+                             dictSet used (f.Path, f.Offset) true
+                             vecSet spent 0 (vecGet spent 0 + bsize)
+                             vecSet sites 0 (vecGet sites 0 + 1)
+                             if System.Environment.GetEnvironmentVariable "FPP_INLINE_DBG" = "1" then
+                                 eprintfn "SITE %d %s into %s:%d" (vecGet sites 0) f.Name (fst owner) (snd owner)
+                             (let acc = vecNew<string * int> ()
+                              binderKeys (ELam (ps, body)) acc
+                              for k in vecToList acc do dictSet ownKeys k true)
+                             (match (if repeatOn then freshenBinders freshCounter (ELam (ps, body))
+                                     else deepCopy (ELam (ps, body))) with
+                              | ELam (ps2, body2raw) ->
+                                  // expand what came in with it
+                                  let body2 =
+                                      if depth < inlineDepth then go (depth + 1) body2raw
+                                      else body2raw
+                                  // innermost-last so the first argument binds
+                                  // outermost, which is the evaluation order the
+                                  // call site had
+                                  List.fold2
+                                      (fun acc (pv, psch) a -> ELet (false, pv, psch, a, acc))
+                                      body2 (List.rev ps2) (List.rev args)
+                              | _ -> x)
+                         | _ -> x)
+                    | other -> other)
+                e2
+        go 0 e
+    // Inlining exposes call sites that were behind a call, so the pass is
+    // swept more than once. Measured on the fpp.base benchmarks it SATURATES
+    // at two rounds (ray-triangle 103 -> 97 ms, then 96 at four and eight) —
+    // past that nothing new is reached and the extra code costs box-extend
+    // 158 -> 164 ms. The wall is not the round count: a second `Dot` in the
+    // same caller needs a renamed copy, which is `FPP_INLINE_REPEAT`.
     let mutable out = decls
     let mutable round = 0
-    while round < 1 do
+    // FPP_INLINE_ROUNDS: inlining is a FIXPOINT, not a single pass. One round
+    // inlines `IntersectTriangle` into its caller and stops, so the Dot/Cross
+    // calls that came in WITH the copied body are never looked at — the
+    // ray/triangle loop kept five calls to three-component vector helpers.
+    let rounds = intOr 1 (System.Environment.GetEnvironmentVariable "FPP_INLINE_ROUNDS")
+    while round < rounds do
         out <-
             out
             |> List.map (fun d ->
@@ -419,4 +728,184 @@ let inlineCalls (decls : Decl list) : Decl list =
 /// call, a constant reaching a branch, a closure that stops being built —
 /// and none of those passes exist yet. It is kept, correct and gated, to be
 /// turned on with the unboxing work, which is when it starts to.
+/// LOOP-INVARIANT CODE MOTION.
+///
+/// A `let` inside a loop whose right-hand side depends on nothing the loop
+/// changes computes the same value every iteration. Moeller-Trumbore is the
+/// case that made this visible: `e1`, `e2`, `pv`, `det` and `inv` are built
+/// from the triangle and the ray direction, none of which move, and the
+/// ray/triangle benchmark recomputed all five two million times. Hoisting
+/// them by hand took it from 98 ms to 44; clang's wasm does the same thing
+/// and its inner loop holds 8 multiplies where the source has 15.
+///
+/// Only SPECULABLE right-hand sides move: evaluating one early must be
+/// invisible. That rules out anything that can trap (integer division, an
+/// array index and its bounds check), anything with an effect (an assignment,
+/// a store, a call — a call could do either), and anything inside a nested
+/// LAMBDA, whose body does not run here at all. Float arithmetic cannot trap,
+/// so it travels freely.
+///
+/// This runs AFTER inlining on purpose: an un-inlined call hides its
+/// arithmetic behind a name this pass must refuse to move, so the two passes
+/// only pay off together.
+let private nonTrappingOp (op : string) : bool =
+    // an integer divide traps on zero; the float ones are IEEE and do not.
+    // `?`-prefixed ops are prelude CALLS and `@` marks a class dispatch —
+    // neither is ours to speculate.
+    if op.StartsWith "?" || op.Contains "@" then false
+    elif op.StartsWith "/" || op.StartsWith "%" then op.EndsWith "f" || op.EndsWith "s"
+    else true
+
+let rec private speculable (e : Expr) : bool =
+    match e with
+    | ELit _ -> true
+    | EVar (_, _) | EVarI (_, _, _) -> true
+    | EField (x, _, _) -> speculable x
+    | ERecord (_, fs) -> fs |> List.forall (fun (_, x) -> speculable x)
+    | ETuple xs -> xs |> List.forall speculable
+    | EPrim (op, xs) -> nonTrappingOp op && (xs |> List.forall speculable)
+    | EIf (a, b, c) -> speculable a && speculable b && speculable c
+    | _ -> false
+
+/// Does `e` READ memory that something else could write — a field, an array
+/// element, an array length? Pure arithmetic over locals does not.
+let rec private readsMemory (e : Expr) : bool =
+    match e with
+    | EField (_, _, _) | EIndex (_, _, _) | EArrayLen (_, _) | EArrayBytes (_, _) -> true
+    | _ -> children e |> List.exists readsMemory
+
+/// Does `e` WRITE memory, or call something that might? A call is opaque: it
+/// can store through any reference it can reach.
+let rec private writesMemory (e : Expr) : bool =
+    match e with
+    | EFieldSet (_, _, _, _) | EIndexSet (_, _, _, _) -> true
+    // a builtin CONVERSION (`?float#i`, and every other name carrying the
+    // result type before the '#') computes a scalar from a scalar and writes
+    // nothing. Treating it as opaque cost the ray/triangle loop its hoists —
+    // its only remaining call is the int->float on the loop counter.
+    | EApp (EUnknown n, args) when n.Contains "#" -> args |> List.exists writesMemory
+    | EApp (_, _) | EIfaceCall (_, _, _, _) -> true
+    | _ -> children e |> List.exists writesMemory
+
+/// every variable ASSIGNED anywhere in `e` — the loop's moving parts
+let private assignedKeys (e : Expr) (acc : Dict<string * int, bool>) : unit =
+    mapExpr
+        (fun x ->
+            (match x with
+             | EAssign (v, _) -> dictSet acc (v.Path, v.Offset) true
+             | _ -> ())
+            x)
+        e |> ignore
+
+/// every variable READ in `e`
+let private usedKeys (e : Expr) (acc : Vec<string * int>) : unit =
+    mapExpr
+        (fun x ->
+            (match x with
+             | EVar (v, _) | EVarI (v, _, _) -> vecAdd acc (v.Path, v.Offset)
+             | _ -> ())
+            x)
+        e |> ignore
+
+/// the hoistable lets of a loop body, OUTERMOST first, not descending into a
+/// lambda (its body runs elsewhere, so nothing inside it is loop-invariant here)
+let rec private collectHoists
+        (moving : Dict<string * int, bool>) (bound : Dict<string * int, bool>)
+        (loopWrites : bool) (e : Expr) (acc : Vec<VarId * Scheme * Expr>) : unit =
+    match e with
+    | ELam (_, _) -> ()
+    | ELet (false, v, sch, rhs, body) ->
+        // A read of MUTABLE memory may only move if the loop writes none and
+        // calls nothing: `moving` tracks assignments to VARIABLES, so a field
+        // or element the loop stores into looks invariant to it. That is what
+        // broke 45 of the 100 adaptive tests — its graph nodes are mutated
+        // through fields, and a hoisted read floated above the write.
+        if speculable rhs
+           && (not loopWrites || not (readsMemory rhs))
+           && (dictTryFind moving (v.Path, v.Offset)).IsNone
+           && (let us = vecNew<string * int> ()
+               usedKeys rhs us
+               vecToList us
+               |> List.forall (fun k ->
+                   (dictTryFind moving k).IsNone && (dictTryFind bound k).IsNone)) then
+            vecAdd acc (v, sch, rhs)
+        else
+            // its own binder is loop-local from here on
+            dictSet bound (v.Path, v.Offset) true
+        collectHoists moving bound loopWrites rhs acc
+        collectHoists moving bound loopWrites body acc
+    | _ ->
+        for c in children e do collectHoists moving bound loopWrites c acc
+
+let private hoisted = vecNew<int> ()
+let private hoistedInit = vecAdd hoisted 0
+
+let hoistInvariants (decls : Decl list) : Decl list =
+    let rewrite (e : Expr) : Expr =
+        match e with
+        | EWhile (cond, body) ->
+            // what the loop CHANGES: anything it assigns
+            let moving = dictNew<string * int, bool> ()
+            assignedKeys cond moving
+            assignedKeys body moving
+            // and what it BINDS: those are not available before it runs
+            let bound = dictNew<string * int, bool> ()
+            (let bs = vecNew<string * int> ()
+             binderKeys body bs
+             for k in vecToList bs do dictSet bound k true)
+            let hoists = vecNew<VarId * Scheme * Expr> ()
+            // the FULL binder set, not an empty one: `collectHoists` only
+            // tracks the binders of `let`s it walks past, so a PATTERN binder
+            // (a match arm's variable) counted as outside the loop and an
+            // expression reading one could be hoisted above the match that
+            // binds it. Seeding with every binder in the body is the
+            // conservative answer, and the fixpoint below recovers what it
+            // costs: a binding hoisted this round is gone from the body next
+            // round, so its dependents become invariant then.
+            let loopWrites = writesMemory cond || writesMemory body
+            collectHoists moving bound loopWrites body hoists
+            // a hoist is only legal if the binder is not also bound elsewhere
+            // in the loop under a different value
+            let chosen =
+                vecToList hoists
+                |> List.filter (fun (v, _, _) ->
+                    (dictTryFind moving (v.Path, v.Offset)).IsNone)
+            if List.isEmpty chosen then e
+            else
+                vecSet hoisted 0 (vecGet hoisted 0 + List.length chosen)
+                let drop = dictNew<string * int, bool> ()
+                for v, _, _ in chosen do dictSet drop (v.Path, v.Offset) true
+                // take the bindings OUT of the body, keeping their continuation
+                let body2 =
+                    mapExpr
+                        (fun x ->
+                            match x with
+                            | ELet (false, v, _, _, k) when (dictTryFind drop (v.Path, v.Offset)).IsSome -> k
+                            | other -> other)
+                        body
+                // ... and wrap the loop in them, outermost first
+                List.foldBack
+                    (fun (v, sch, rhs) acc -> ELet (false, v, sch, rhs, acc))
+                    chosen (EWhile (cond, body2))
+        | other -> other
+    let pass (d : Decl) : Decl =
+        match d with
+        | DLet (rc, v, sch, body) -> DLet (rc, v, sch, mapExpr rewrite body)
+        | other -> other
+    // TO A FIXPOINT. One sweep only reaches the outermost layer: inlining
+    // binds a callee's parameters to fresh loop-LOCAL lets, so `e1 = p1 - p0`
+    // reads two names that are themselves invariant but not yet hoisted, and
+    // the free-variable test rejects it. Hoisting those first makes `e1`
+    // invariant on the next sweep. Bounded, because each sweep that changes
+    // nothing stops it.
+    let mutable out = decls
+    let mutable go = true
+    let mutable rounds = 0
+    while go && rounds < 12 do
+        vecSet hoisted 0 0
+        out <- out |> List.map pass
+        go <- vecGet hoisted 0 > 0
+        rounds <- rounds + 1
+    out
+
 let optimize (decls : Decl list) : Decl list = decls |> uncurryTupleArgs |> fuseTuples

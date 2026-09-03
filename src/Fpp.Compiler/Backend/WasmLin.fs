@@ -219,6 +219,24 @@ type private St =
       /// the CALLEE's plan — deciding from the argument instead let the two
       /// ends disagree about how many values cross the call.
       FuncParamPlan : Dict<string, string option list>
+      /// per parameter of the same function: does it cross the call as a
+      /// POINTER to a caller-owned slot on the raw struct stack, rather than
+      /// as its flattened leaves? The callee copies the leaves into its own
+      /// registers in its preamble, so the value semantics are identical to
+      /// by-value — it never holds the pointer, nothing can alias through it
+      /// and no escape analysis is needed. Measured on 3M non-inlined calls
+      /// with a 16-leaf struct: 25 ms flattened, 17 ms this way. The by-value
+      /// cost grows with the leaf count (3/6/9/16 leaves: 12/14/18/25 ms)
+      /// while a pointer is flat, because the slot stays in L1.
+      FuncParamByRef : Dict<string, bool list>
+      /// byref-as-stack-offset: per FUNCTION key, the byref params (by var
+      /// key) whose every use is a dispatch shape or a forward to another
+      /// eligible byref param — the callee dispatch grows a tagged-offset
+      /// arm for these. Keyed per function because STAMPED CLONES share
+      /// param VarIds: one flat dict let a canonical clone's "#r" payload
+      /// overwrite its float sibling's "#f64", and the sibling then read
+      /// word-sized garbage out of an f64 slot.
+      BrParamPay : Dict<string, Dict<string, string>>
       /// a function whose ONE parameter is a tuple the body immediately
       /// destructures: its binders, which become the wasm parameters. A
       /// tupled member is an N-ARY method (what .NET compiles it to), so the
@@ -419,6 +437,8 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "fpprt_write_ref" "$fpwr" [ "i32"; "i32"; "i32" ] []
     importFn m "fpprt" "fpprt_wasm_roots_base" "$rootsbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_wasm_roots_register" "$rootsreg" [ "i32" ] []
+    importFn m "fpprt" "fpprt_wasm_sstack_top" "$ssptop" [] [ "i32" ]
+    importFn m "fpprt" "fpprt_wasm_sstack_base" "$sspbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_tid2cid_base" "$t2cbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_wasm_refoffs_base" "$refoffsbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_wasm_witness_base" "$witnessbase" [] [ "i32" ]
@@ -440,6 +460,9 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "fpprt_eph_value" "$fpephval" [ "i32" ] [ "i32" ]
     importFn m "fpprt" "fpprt_drain1" "$fpdrain1" [ "i32" ] [ "i32" ]
     importFn m "fpprt" "fpprt_collect" "$fpcollect" [] []
+    importFn m "fpprt" "fpprt_allocated_bytes" "$fpallocated" [] [ "i32" ]
+    importFn m "fpprt" "fpprt_env_get" "$fpenvget" [ "i32"; "i32" ] [ "i32" ]
+    importFn m "fpprt" "fpprt_env_byte" "$fpenvbyte" [ "i32" ] [ "i32" ]
     // per-object pinning: real under the mmc reactor, aborts under semi —
     // Array.pin's zero-copy contract needs the object to stop moving
     importFn m "fpprt" "fpprt_pin" "$fppin" [ "i32" ] []
@@ -549,8 +572,16 @@ let rec private printConOf (st : St) (e : Expr) : string =
     | ELit (LBool _) -> "bool"
     | ELit (LChar _) -> "char"
     | ELit (LString _) -> "string"
+    // `?` is the ANONYMOUS type, not a type NAME: returning it as one made
+    // this function answer "?" for a call whose stamped result type never got
+    // a concrete name, and "?" is not "float", so `EIf` took the uniform join
+    // and BOTH arms boxed. Every `Real.PositiveInfinity` inside a member did
+    // it — `Ray3d.IntersectTriangle` boxed its result once per call, which is
+    // the 16 bytes an iteration the ray/triangle benchmark still allocated
+    // after the by-value work. Unknown must read as unknown: the join then
+    // takes the OTHER arm's type, which is the concrete one.
     | EVar (_, sch) | EVarI (_, sch, _) ->
-        (match prune sch.Body with TCon (n, []) -> n | _ -> "")
+        (match prune sch.Body with TCon ("?", []) -> "" | TCon (n, []) -> n | _ -> "")
     // the intrinsics whose result type is FIXED, whatever the operand:
     // `print (hash x)` classified as "" and printed the int as a string
     | EApp (EUnknown ("hash" | "$hash" | "compare" | "sign" | "$idhash"), _) -> "int"
@@ -592,6 +623,7 @@ let rec private printConOf (st : St) (e : Expr) : string =
          | (EVar (_, sch) | EVarI (_, sch, _)) as hd ->
              let rec peel t k = if k <= 0 then t else (match prune t with TFun (_, r) -> peel r (k - 1) | _ -> t)
              (match prune (peel sch.Body (List.length args)) with
+              | TCon ("?", []) -> ""
               | TCon (n, []) -> n
               // a generic result ('a -> 'a members like truncate/sqrt):
               // resolve the var through the call's instantiation names; an
@@ -677,6 +709,14 @@ let rec private printConOf (st : St) (e : Expr) : string =
 let rec private refKindOfTy (t : Type) : RefKind =
     match prune t with
     | TVar _ -> RKGen
+    // `unit` is RAW. It carries no information, it is always the constant 0,
+    // and it can never be a pointer — but it was not in `rawScalarName` (that
+    // predicate also NAMES a box type, and unit has no storage kind), so it
+    // came back RKRef and every unit binder was rooted and boxed. `let u = ()`
+    // in expression position cost 16 bytes, which is what a NULLARY call costs
+    // once inlined: the inliner binds the argument, so `Real.PositiveInfinity`,
+    // `V3d.Zero` and every other `()`-taking member allocated per call.
+    | TCon ("unit", _) -> RKRaw
     | TCon (n, _) -> if rawScalarName n then RKRaw else RKRef
     | TFun _ | TTuple _ -> RKRef
     | TApp (h, _) -> (match prune h with TVar _ -> RKGen | _ -> RKRef)
@@ -3531,6 +3571,7 @@ let private baseOp (op : string) : string =
 let private builtinIntrinsic (n : string) : bool =
     n.StartsWith "compare"
     || n = "gcOnCleanup" || n = "gcCollect" || n = "gcHeapRefs"
+    || n = "gcAllocatedBytes" || n = "envGetLen" || n = "envGetByte"
     || n = "gcWeakSupported" || n = "gcWeakNew" || n = "gcWeakGet"
     || n = "gcEphNew" || n = "gcEphKey" || n = "gcEphValue"
 
@@ -3914,6 +3955,13 @@ let mutable private calleeParams : Map<string, string list> = Map.empty
 /// timing
 let mutable private boundsEmitted = 0
 let mutable private boundsElided = 0
+/// The DISTINCT expressions that still carry a check. The emitted COUNT is
+/// not a stable measure once inlining is on: a copied body re-emits the
+/// checks it always had, so the number climbs without the proof pass having
+/// lost anything — `a.dig.[i]` went 8 -> 12 purely by being inlined into more
+/// callers. What the gate wants to know is whether a SHAPE that used to be
+/// proven stopped being proven, and that is this set.
+let private boundsSites = dictNew<string, bool> ()
 
 /// How a length is NAMED, so a creation and a loop guard can be compared:
 /// a binding by its key, a literal by its digits.
@@ -4479,6 +4527,24 @@ type private LowCtx =
       /// witness var-ids in declared order (= this ctor's witnessVars). The
       /// class ERecord it builds stores `ctx.Witness[each]` into trailing slots.
       mutable ClassCtorWits : int list
+      /// the destination register of the struct-returning call most recently
+      /// LOWERED. A struct binder wants the fields the callee wrote there, not
+      /// the object built afterwards for a one-value context — and it cannot
+      /// find that register by scanning the lowered statements: argument setup
+      /// sits in the same list, so a struct argument that is itself a
+      /// struct-returning call reserved its own destination and the scan
+      /// picked whichever came first. The call records the register it made;
+      /// the outermost call is the last to be constructed, so its value wins.
+      mutable SretDst : int option
+      /// byref-as-stack-offset: the CURRENT function's eligible byref params
+      /// (param var key -> payload), from St.BrParamPay at entry — empty for
+      /// lambdas and globals, whose params are never marked
+      BrPays : Dict<string, string>
+      /// byref-as-stack-offset: statements the ENCLOSING known-function call
+      /// runs after the call — the reload of each spilled local and the
+      /// `$ssp` release. Pushed by the `$broff` marker lowering, drained by
+      /// the call arm.
+      mutable BrPost : LStmt list
       /// did any access in this body emit a check? The throw lives ONCE per
       /// function, at the end, and each check branches to it
       mutable OobUsed : bool
@@ -4588,6 +4654,158 @@ let private storLTy (k : string) : (LTy * int) option =
 // the machine type a pre-store element value rides in before it hits its slot:
 // f64/i64 stay wide; a packed narrow int or f32-bits is just an i32 word.
 let private storValTy (sty : LTy) : LTy = match sty with F64 -> F64 | I64 -> I64 | F32 -> F32 | _ -> W
+
+// ---- byref-as-stack-offset ------------------------------------------------
+//
+// A byref is a heap CELL (or a closure VIEW) so that ESCAPES are sound — but
+// the common shape escapes nothing: `&local` handed straight to a call whose
+// callee only reads and writes through the parameter. For a BLITTABLE
+// payload that shape needs no GC object at all: the caller spills the
+// local's registers to an `$ssp` scratch slot around the call, passes the
+// slot's address TAGGED AS A SCALAR (odd word — invisible to the collector,
+// immune to moving), and the callee's access dispatch grows a third arm
+// that does raw loads and stores at the offset. `noalloc` for byref code.
+//
+// Sound because of three restrictions, each load-bearing:
+//  * payload BLITTABLE (all-scalar): `$ssp` is unscanned, and a heap ref
+//    in an unscanned slot is an untraced edge — stale under mmc even when
+//    the pointee survives (the ref-holding version is the POD-frame root
+//    mechanism the C backend already uses; wiring it here is the planned
+//    second stage).
+//  * callee param NON-ESCAPING: its only uses are the two dispatch shapes
+//    Lower emits. A stored offset would dangle into reused stack memory.
+//  * caller local UNCAPTURED and its view used ONLY as such arguments: an
+//    uncaptured local cannot be observed mid-call by anyone but the byref,
+//    so spill-around-the-call is indistinguishable from aliasing.
+
+/// payload classification: "#w" (int-family, slot holds the uniform word),
+/// "#f64"/"#f32"/"#i64" (raw), or a blittable struct's name. None = not
+/// eligible.
+let private brPayloadOf (recs : Dict<string, (string * string) list>) (t : Type) : string option =
+    match prune t with
+    | TCon ("ByRefCell", [ inner ]) ->
+        (match prune inner with
+         | TCon (tn, []) ->
+             (match tn with
+              | "float" | "double" -> Some "#f64"
+              | "float32" | "single" -> Some "#f32"
+              | "int64" | "uint64" -> Some "#i64"
+              | "int" | "int32" | "uint32" | "int16" | "uint16"
+              | "byte" | "sbyte" | "bool" | "char" | "nativeint" -> Some "#w"
+              | _ ->
+                  // a struct, blittable when every field (recursively) has a
+                  // scalar storage kind — the same rule structAbiOf enforces,
+                  // computed here from the DRecord decls because this pass
+                  // runs before the St layouts exist
+                  let rec blit (n : string) (fuel : int) : bool =
+                      fuel > 0
+                      && (match dictTryFind recs n with
+                          | Some fs ->
+                              not (List.isEmpty fs)
+                              && fs |> List.forall (fun (_, k) ->
+                                     (storLTy k).IsSome || blit k (fuel - 1))
+                          | None -> false)
+                  if blit tn 8 then Some tn
+                  // anything else — a class, a record with ref fields, a
+                  // string, a list — is ONE UNIFORM WORD, spilled to a
+                  // ROOTED slot the collector traces and updates. "#r" is
+                  // the universal fallback, and it is also what a CANONICAL
+                  // generic clone's 'a payload rides.
+                  else Some "#r")
+         | _ -> Some "#r")
+    | _ -> None
+
+/// the READ dispatch Lower emits for a byref parameter
+let private brReadShape (pk : string * int) (e : Expr) : bool =
+    match e with
+    | EIf (ETypeTest ("ByRefView", (EVar (v1, _) | EVarI (v1, _, _))),
+           EApp (EField ((EVar (v2, _) | EVarI (v2, _, _)), "Get", "ByRefView"), [ _ ]),
+           EField ((EVar (v3, _) | EVarI (v3, _, _)), "Value", "ByRefCell")) ->
+        (v1.Path, v1.Offset) = pk && (v2.Path, v2.Offset) = pk && (v3.Path, v3.Offset) = pk
+    | _ -> false
+
+/// the WRITE dispatch: answers the two rhs COPIES (Lower emits the rhs into
+/// both arms)
+let private brWriteShape (pk : string * int) (e : Expr) : (Expr * Expr) option =
+    match e with
+    | EIf (ETypeTest ("ByRefView", (EVar (v1, _) | EVarI (v1, _, _))),
+           EApp (EField ((EVar (v2, _) | EVarI (v2, _, _)), "Set", "ByRefView"), [ rhs1 ]),
+           EFieldSet ((EVar (v3, _) | EVarI (v3, _, _)), "Value", "ByRefCell", rhs2)) when
+          (v1.Path, v1.Offset) = pk && (v2.Path, v2.Offset) = pk && (v3.Path, v3.Offset) = pk ->
+        Some (rhs1, rhs2)
+    | _ -> None
+
+/// peel a field CHAIN down to a byref read: `(read p).Min.X` answers
+/// (p, "Min.X") — the dotted spelling structAbiOf names its leaves in
+let private brFieldSpine (e : Expr) : (VarId * string) option =
+    let rec peel (acc : string list) (x : Expr) : (VarId * string) option =
+        match x with
+        | EField (inner, f, _) -> peel (f :: acc) inner
+        | EIf (ETypeTest ("ByRefView", (EVar (v1, _) | EVarI (v1, _, _))),
+               EApp (EField ((EVar (v2, _) | EVarI (v2, _, _)), "Get", "ByRefView"), [ _ ]),
+               EField ((EVar (v3, _) | EVarI (v3, _, _)), "Value", "ByRefCell")) when
+              key v1 = key v2 && key v2 = key v3 && not (List.isEmpty acc) ->
+            Some (v1, String.concat "." acc)
+        | _ -> None
+    peel [] e
+
+/// the param's CURRENT value: a rooted param reads through its shadow-stack
+/// slot (the raw register goes stale across safepoints — the collector moves
+/// a cell and only the slot is updated); an unrooted one reads its register
+let private brParamVal (ctx : LowCtx) (pv : VarId) (pReg : int) : LExpr =
+    match dictTryFind ctx.Slotted (key pv) with
+    | Some sa -> LLoad (W, sa, 0)
+    | None -> LGet (wReg pReg)
+
+/// the param aliased to a fresh register, so re-lowering the shape cannot
+/// re-fire the interception arm
+let private brAliasSub (pk : string) (aliasV : VarId) (e : Expr) : Expr =
+    let rec sub (x : Expr) : Expr =
+        match x with
+        | EVar (w, sc) when key w = pk -> EVar (aliasV, sc)
+        | EVarI (w, sc, _) when key w = pk -> EVar (aliasV, sc)
+        | other -> mapChildren sub other
+    sub e
+
+/// every use of `pk` in the body is one of the two dispatch shapes, or a
+/// FORWARD: the bare param as a direct argument at a position `fwdOk`
+/// blesses (another eligible byref param of equal payload — the value is
+/// already a cell, a view or an offset, all of which the receiver
+/// dispatches on, so forwarding needs no spill). A bare struct-payload
+/// read materialises, which is allowed — the arm handles it.
+let private brParamOk (fwdOk : Expr -> int -> bool) (pk : string * int) (body : Expr) : bool =
+    let rec ok (e : Expr) : bool =
+        if brReadShape pk e then true
+        else
+            match brWriteShape pk e with
+            | Some (r1, r2) -> ok r1 && ok r2
+            | None ->
+                match e with
+                | EApp (((EVar _ | EVarI _) as fe), args) ->
+                    let bad = vecNew<bool> ()
+                    vecAdd bad false
+                    (if not (ok fe) then vecSet bad 0 true)
+                    args
+                    |> List.iteri (fun i a ->
+                        match a with
+                        | (EVar (v, _) | EVarI (v, _, _)) when (v.Path, v.Offset) = pk ->
+                            if not (fwdOk fe i) then vecSet bad 0 true
+                        | _ -> if not (ok a) then vecSet bad 0 true)
+                    not (vecGet bad 0)
+                | EVar (v, _) | EVarI (v, _, _) when (v.Path, v.Offset) = pk -> false
+                | _ ->
+                    let bad = vecNew<bool> ()
+                    vecAdd bad false
+                    mapChildren (fun c -> (if not (ok c) then vecSet bad 0 true); c) e |> ignore
+                    not (vecGet bad 0)
+    ok body
+
+/// The whole pass: callee eligibility, then the caller rewrite. Answers the
+/// rewritten decls and the param-key -> payload map for the callee arms.
+/// v1 payload: the int family only ("#w" — the slot holds the uniform word,
+/// so both dispatch arms agree without conversion); floats and structs join
+/// on typed registers and follow in the next slice.
+
 
 /// the zero of a machine type. An f32 has no constant of its own in the IR —
 /// it is the f64 zero demoted, which folds to `f32.const 0` on the way out.
@@ -5453,11 +5671,41 @@ let private structAbiOf (st : St) (tyName : string) : (string * int * LTy * stri
                          | _ -> ok <- false)
                 | None -> ok <- false
         walk "" layout fs 0
-        if not ok || vecLen acc = 0 || vecLen acc > 4 then None
+        // NO SIZE CAP. A struct is a struct: it passes by value whatever it
+        // holds, and there is no leaf count above which it silently becomes a
+        // heap object again. The cap was 4, so a `Box3d`
+        // (`{ Min : V3d; Max : V3d }`, six doubles) fell off the by-value ABI
+        // and every `ExtendedBy` heap-allocated its 48-byte result — 20M
+        // calls allocating ~1 GB, 10.4x .NET, while the three-leaf `V3d` was
+        // 3.4x. The ratio tracked the SIZE of the returned struct rather than
+        // the arithmetic, which is the signature of a fallback, not of a cost.
+        //
+        // `ok` still gates the walk: a field with no inline layout at all
+        // cannot be passed in registers, and that is a shape question rather
+        // than a size one.
+        if not ok || vecLen acc = 0 then None
         else
             Some (vecToList acc
                   |> List.sortWith (fun (_, a, _, _) (_, b, _, _) -> if a < b then 0 - 1 elif a > b then 1 else 0))
     | _ -> None
+
+/// FPP_BYREF=1 turns the pointer convention on; FPP_BYREF_MIN sets the leaf
+/// count from which it applies. A struct with a by-value ABI is ALL-SCALAR by
+/// construction (`structAbiOf` fails on a field with no storage kind), so the
+/// slot can live on the raw `$ssp` region the collector never scans.
+let private byrefOn : bool =
+    System.Environment.GetEnvironmentVariable "FPP_BYREF" = "1"
+
+let private byrefMin : int =
+    match System.Environment.GetEnvironmentVariable "FPP_BYREF_MIN" with
+    | null | "" -> 6
+    | s ->
+        let mutable ok = true
+        let mutable acc = 0
+        for i in 0 .. strLen s - 1 do
+            let c = s.[i]
+            if c >= '0' && c <= '9' then acc <- acc * 10 + (int c - int '0') else ok <- false
+        if ok && acc > 0 then acc else 6
 
 /// the by-value struct type a type denotes, if any
 let private structTyName (st : St) (t : Type) : string option =
@@ -5815,6 +6063,22 @@ let private chkStoreStmts (reg : int) : LStmt list =
                       [ LTrap ], []) ], []) ]
     else []
 
+/// Can this operand be evaluated UNCONDITIONALLY? `select` computes both
+/// arms, so an arm that could trap or write is not eligible. Integer divide
+/// and remainder trap on zero; the float ones are IEEE and cannot. Loads are
+/// excluded outright — an out-of-bounds one traps, and after the by-value
+/// struct ABI the arms that matter are registers anyway.
+let rec private selectSafe (e : LExpr) : bool =
+    match e with
+    | LConstW _ | LConstL _ | LConstF _ | LGet _ | LGetGlobal _ -> true
+    | LPrim (op, xs) ->
+        (match op with
+         | DivSW | RemSW | DivUW | RemUW
+         | DivSL | RemSL | DivUL | RemUL -> false
+         | _ -> true)
+        && List.forall selectSafe xs
+    | _ -> false
+
 let private shouldSlot (ctx : LowCtx) (v : VarId) (sch : Scheme) : bool =
     gc
     && ((dictTryFind ctx.LSt.CellVars (key v)).IsSome
@@ -6053,6 +6317,30 @@ let rec private structVarPath (e : Expr) : (VarId * string) option =
         (match structVarPath inner with Some (v, p) -> Some (v, p + "." + fn) | None -> None)
     | _ -> None
 
+/// The dotted LEAF path a field chain names inside a by-value struct GLOBAL,
+/// with the leaf's storage kind — `gb.Min.X` on a `Box3d` global is
+/// ("$g<hash>", "Min.X", "float"), which is one per-field global read.
+let private globalStructPath (st : St) (e : Expr) : (string * string * string) option =
+    let rec walk (x : Expr) : (VarId * string) option =
+        match x with
+        | EField ((EVar (v, _) | EVarI (v, _, _)), fn, _) -> Some (v, fn)
+        | EField (inner, fn, _) ->
+            (match walk inner with Some (v, p) -> Some (v, p + "." + fn) | None -> None)
+        | _ -> None
+    match walk e with
+    | Some (v, path) when (dictTryFind st.Globals (key v)).IsSome ->
+        let g = "$g" + string (abs (strHash (key v)))
+        (match dictTryFind globalStructTy g with
+         | Some tn ->
+             (match structAbiOf st tn with
+              | Some ls ->
+                  (match ls |> List.tryPick (fun (fn2, _, _, k) -> if fn2 = path then Some k else None) with
+                   | Some k -> Some (g, path, k)
+                   | None -> None)
+              | None -> None)
+         | None -> None)
+    | _ -> None
+
 /// Resolve a chain of inline-struct field accesses to (base expression,
 /// absolute offset, field type). `box.Lo.PX` is one double at
 /// offsetof(Box,Lo) + offsetof(V2d,PX) — the address C computes for the same
@@ -6202,8 +6490,18 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             match rhs with
             | EVar (sv, _) | EVarI (sv, _, _) ->
                 (match dictTryFind ctx.Slotted (key sv) with
+                 // ... and the SOURCE must not be a cell either. A cell var's
+                 // slot holds the POINTER TO THE CELL, not the value, so
+                 // aliasing a binder to it hands the binder a cell where a
+                 // value belongs — `let mutable got` filled through
+                 // `f (&got)`, then read as `got.N`, returned a field of the
+                 // cell object. Only the new binder was checked, so the bug
+                 // needed the receiver to be address-taken AND the member to
+                 // be inlined, which is why it appeared the day inlining
+                 // became the default.
                  | Some a when not (assignsTo (key v) body) && not (assignsTo (key sv) body)
-                               && (dictTryFind ctx.LSt.CellVars (key v)).IsNone -> Some a
+                               && (dictTryFind ctx.LSt.CellVars (key v)).IsNone
+                               && (dictTryFind ctx.LSt.CellVars (key sv)).IsNone -> Some a
                  | _ -> None)
             | _ -> None
         match aliasOf with
@@ -6259,6 +6557,166 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | [ x ] -> coreToLowE ctx x
             | x :: rest -> LDo (coreToLowS ctx x, go rest)
         go xs
+    // byref-as-stack-offset, callee side: the dispatch on a MARKED param
+    // grows a TAGGED arm — raw load/store at the untagged address. The else
+    // path re-lowers the ORIGINAL shape with the param aliased to a fresh
+    // register, which these arms do not match (the alias's key carries no
+    // BrParamPay entry). Wide scalars JOIN ON A TYPED REGISTER with one
+    // flatBox after the LDo — box-elim pushes through LDo, so an arithmetic
+    // consumer cancels it and the read allocates nothing; joining on the
+    // word register instead re-boxed per read inside the branch, where the
+    // peephole cannot see the pair.
+    //
+    // a FIELD CHAIN over a struct payload: the raw arm is one typed load at
+    // the leaf's offset
+    | EField _ when
+          (match brFieldSpine e with
+           | Some (pv, path) ->
+               (match dictTryFind ctx.BrPays (key pv) with
+                | Some pay ->
+                    not (pay.StartsWith "#")
+                    && (dictTryFind ctx.Regs (key pv)).IsSome
+                    && (match structAbiOf st pay with
+                        | Some fs -> fs |> List.exists (fun (fn2, _, _, _) -> fn2 = path)
+                        | None -> false)
+                | None -> false)
+           | None -> false) ->
+        let (pv, path) = optGet (brFieldSpine e)
+        let pay = optGet (dictTryFind ctx.BrPays (key pv))
+        (match structAbiOf st pay |> Option.bind (List.tryPick (fun (fn2, off, vty, kind) -> if fn2 = path then Some (off, vty, kind) else None)) with
+         | Some (off, _vty, kind) ->
+             let pReg = optGet (dictTryFind ctx.Regs (key pv))
+             let ar = freshTmp ctx
+             let aliasV = { Path = "(broff)"; Offset = ar; Name = "_bra" + string ar }
+             dictSet ctx.Regs (key aliasV) ar
+             // a ROOTED param's alias reads through the SAME slot, or the
+             // else arm would use a register the collector does not update
+             (match dictTryFind ctx.Slotted (key pv) with
+              | Some sa -> dictSet ctx.Slotted (key aliasV) sa
+              | None -> ())
+             let aliased = brAliasSub (key pv) aliasV e
+             let addr = LPrim (SubW, [ brParamVal ctx pv pReg; LConstW 1 ])
+             let tagged = LPrim (AndW, [ brParamVal ctx pv pReg; LConstW 1 ])
+             let (sty, _) = optGet (storLTy kind)
+             let pre = LSet (wReg ar, LGet (wReg pReg))
+             (match kind with
+              | "float" | "double" | "int64" | "uint64" | "float32" | "single" ->
+                  let jt = match kind with "int64" | "uint64" -> I64 | _ -> F64
+                  let rawE =
+                      match kind with
+                      | "float32" | "single" -> LPrim (PromF, [ LLoad (F32, addr, off) ])
+                      | _ -> LLoad (jt, addr, off)
+                  let r = freshTmpT ctx jt
+                  let treg = { Id = r; RTy = jt }
+                  LDo ([ pre
+                         LIf (tagged,
+                              [ LSet (treg, rawE) ],
+                              [ LSet (treg, flatUnbox jt (coreToLowE ctx aliased)) ]) ],
+                       flatBox ctx jt (LGet treg))
+              | _ ->
+                  // int family: storBox is shifts and a tag — both arms ride
+                  // the word register with nothing allocated
+                  let r = freshTmp ctx
+                  LDo ([ pre
+                         LIf (tagged,
+                              [ LSet (wReg r, storBox ctx kind (LLoad (sty, addr, off))) ],
+                              [ LSet (wReg r, coreToLowE ctx aliased) ]) ],
+                       LGet (wReg r)))
+         | None ->
+             // unreachable: the guard checked the leaf exists
+             err st "wasm-linear LowIR: $broff leaf vanished"
+             lowInt 0)
+    | EIf (ETypeTest ("ByRefView", (EVar (pv, _) | EVarI (pv, _, _))), _, _) when
+          (dictTryFind ctx.BrPays (key pv)).IsSome
+          && (dictTryFind ctx.Regs (key pv)).IsSome
+          && (brReadShape (pv.Path, pv.Offset) e || (brWriteShape (pv.Path, pv.Offset) e).IsSome) ->
+        let pay = optGet (dictTryFind ctx.BrPays (key pv))
+        let pReg = optGet (dictTryFind ctx.Regs (key pv))
+        let ar = freshTmp ctx
+        let aliasV = { Path = "(broff)"; Offset = ar; Name = "_bra" + string ar }
+        dictSet ctx.Regs (key aliasV) ar
+        // a ROOTED param's alias reads through the SAME slot, or the else
+        // arm would use a register the collector does not update — a cell
+        // moved by the rhs's own allocation was then written at its old
+        // address
+        (match dictTryFind ctx.Slotted (key pv) with
+         | Some sa -> dictSet ctx.Slotted (key aliasV) sa
+         | None -> ())
+        let aliased = brAliasSub (key pv) aliasV e
+        let addr = LPrim (SubW, [ brParamVal ctx pv pReg; LConstW 1 ])
+        let tagged = LPrim (AndW, [ brParamVal ctx pv pReg; LConstW 1 ])
+        let pre = LSet (wReg ar, LGet (wReg pReg))
+        (match brWriteShape (pv.Path, pv.Offset) e with
+         | Some (_, rhs2) ->
+             let rawStores =
+                 match pay with
+                 | "#w" | "#r" -> [ LStore (W, addr, 0, coreToLowE ctx rhs2) ]
+                 | "#f64" -> [ LStore (F64, addr, 0, flatUnbox F64 (coreToLowE ctx rhs2)) ]
+                 | "#i64" -> [ LStore (I64, addr, 0, flatUnbox I64 (coreToLowE ctx rhs2)) ]
+                 | "#f32" -> [ LStore (F32, addr, 0, flatUnbox F32 (coreToLowE ctx rhs2)) ]
+                 | tn ->
+                     // scatter the rhs leaf by leaf — lowStructBind peels
+                     // the lets a computed literal arrives wrapped in, so
+                     // no object is built on the way
+                     (match structAbiOf st tn with
+                      | Some fields ->
+                          let k = "$broffw$" + string (freshTmp ctx)
+                          let binds = lowStructBind ctx k tn rhs2
+                          let (_, fmap) = optGet (dictTryFind ctx.StructVars k)
+                          dictRemove ctx.StructVars k
+                          binds
+                          @ (fields |> List.map (fun (fn2, off, vty, kind) ->
+                                 let r = match dictTryFind fmap fn2 with Some r -> r | None -> 0
+                                 let (sty, _) = optGet (storLTy kind)
+                                 LStore (sty, addr, off, LGet { Id = r; RTy = vty })))
+                      | None ->
+                          err st ("wasm-linear LowIR: $broff write payload has no layout: " + tn)
+                          [])
+             LDo ([ pre; LIf (tagged, rawStores, [ LEval (coreToLowE ctx aliased) ]) ],
+                  lowInt 0)
+         | None ->
+             (match pay with
+              | "#w" | "#r" ->
+                  let r = freshTmp ctx
+                  LDo ([ pre
+                         LIf (tagged,
+                              [ LSet (wReg r, LLoad (W, addr, 0)) ],
+                              [ LSet (wReg r, coreToLowE ctx aliased) ]) ],
+                       LGet (wReg r))
+              | "#f64" | "#i64" | "#f32" ->
+                  let jt = match pay with "#i64" -> I64 | _ -> F64
+                  let rawE =
+                      match pay with
+                      | "#f32" -> LPrim (PromF, [ LLoad (F32, addr, 0) ])
+                      | "#i64" -> LLoad (I64, addr, 0)
+                      | _ -> LLoad (F64, addr, 0)
+                  let r = freshTmpT ctx jt
+                  let treg = { Id = r; RTy = jt }
+                  LDo ([ pre
+                         LIf (tagged,
+                              [ LSet (treg, rawE) ],
+                              [ LSet (treg, flatUnbox jt (coreToLowE ctx aliased)) ]) ],
+                       flatBox ctx jt (LGet treg))
+              | tn ->
+                  // a WHOLE-struct read: the raw arm rebuilds the object
+                  // from the slot (this shape materialises on every path —
+                  // .NET boxes a struct entering a uniform context too)
+                  (match structAbiOf st tn, podOf st tn with
+                   | Some fields, Some (layout, size, firstRefWord) ->
+                       let items =
+                           fields |> List.map (fun (_, off, vty, kind) ->
+                               let (sty, _) = optGet (storLTy kind)
+                               (off, sty, vty, false, LLoad (sty, addr, off)))
+                       let c = cidRec st tn
+                       let r = freshTmp ctx
+                       LDo ([ pre
+                              LIf (tagged,
+                                   [ LSet (wReg r, lowPodBuildAt ctx (if c >= 0 then "inl:" + string c else "inl@" + tn) c layout size firstRefWord items) ],
+                                   [ LSet (wReg r, coreToLowE ctx aliased) ]) ],
+                            LGet (wReg r))
+                   | _ ->
+                       err st ("wasm-linear LowIR: $broff read payload has no layout: " + tn)
+                       lowInt 0)))
     | EIf (c, a, b) ->
         // a JOIN of two 64-bit scalars keeps the value RAW across the merge.
         // The word temp below is a uniform slot, so both arms boxed their
@@ -6269,13 +6727,31 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | "float" | "double" -> Some F64
             | "int64" | "uint64" -> Some I64
             | _ -> None
+        // FPP_JOIN_DBG=1: the join type this `if` resolved to, and each arm's.
+        // A join that is not the arms' scalar type is the shape that boxes —
+        // `a=[float] b=[?]` is how the anonymous type leaking out of
+        // `printConOf` was found, and printing the arms beside the result is
+        // what separates "one arm is unknown" from "both are".
+        if System.Environment.GetEnvironmentVariable "FPP_JOIN_DBG" = "1" then
+            eprintfn "JOIN [%s] a=[%s] b=[%s] :: %s" (printConOf ctx.LSt e) (printConOf ctx.LSt a) (printConOf ctx.LSt b) (printExpr e)
         (match joinTy with
          | Some t ->
+             let condE = coreToLowE ctx c
+             let aE = flatUnbox t (coreToLowE ctx a)
+             let bE = flatUnbox t (coreToLowE ctx b)
+             // BRANCHLESS when both arms are safe to evaluate: `select` is one
+             // instruction where the branch is a block, and the engines keep
+             // it in registers. `Box3d.ExtendedBy` is six of these and was
+             // sixteen branches; clang's wasm for the same source emits six
+             // selects and runs the benchmark in 70 ms against our 158.
+             if selectSafe aE && selectSafe bE && selectSafe condE then
+                 flatBox ctx t (LPrim (SelV, [ aE; bE; condE ]))
+             else
              let r = freshTmpT ctx t
              let reg = { Id = r; RTy = t }
-             LDo ([ LIf (coreToLowE ctx c,
-                         [ LSet (reg, flatUnbox t (coreToLowE ctx a)) ],
-                         [ LSet (reg, flatUnbox t (coreToLowE ctx b)) ]) ],
+             LDo ([ LIf (condE,
+                         [ LSet (reg, aE) ],
+                         [ LSet (reg, bE) ]) ],
                   flatBox ctx t (LGet reg))
          | None ->
              let r = freshTmp ctx
@@ -6924,14 +7400,37 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LStore (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR, LGet { Id = fv; RTy = vty }) ],
              lowInt 0)
     // a field of a by-value struct GLOBAL is a global read
+    // a SCALAR LEAF of a by-value struct global is a global read. The guard
+    // has to check the field IS a leaf: a NESTED struct field (`s.Center`,
+    // where the leaves are `Center.X` and `Center.Y`) matched here too, found
+    // nothing, reported an error nobody printed and left an `i32.const 0`
+    // where a struct value was expected — the module then failed to parse at
+    // all, "popping from empty stack" (KNOWN-ISSUES #27). Falling through
+    // reaches the arm that copies the nested leaves out.
     | EField (EVar (v, _), fname, _) when
             (dictTryFind ctx.LSt.Globals (key v)).IsSome
-            && (dictTryFind globalStructTy ("$g" + string (abs (strHash (key v))))).IsSome ->
+            && (match dictTryFind globalStructTy ("$g" + string (abs (strHash (key v)))) with
+                | Some tn ->
+                    (match structAbiOf st tn with
+                     | Some ls -> ls |> List.exists (fun (fn2, _, _, _) -> fn2 = fname)
+                     | None -> false)
+                | None -> false) ->
         let g = "$g" + string (abs (strHash (key v)))
         let tn = optGet (dictTryFind globalStructTy g)
         (match optGet (structAbiOf st tn) |> List.tryPick (fun (fn2, _, vty, kind) -> if fn2 = fname then Some (vty, kind) else None) with
          | Some (vty, kind) -> storBox ctx kind (LGetGlobal (g + "$" + fname))
          | None -> err st ("wasm-linear: no field " + fname + " on struct global"); lowInt 0)
+    // a NESTED LEAF of a by-value struct GLOBAL — `gb.Min.X`, where the global
+    // keeps one per-field global named `Min.X`. The arm above only matches
+    // `EField (EVar g, leaf)`, so a chain fell through to the materialising
+    // path and rebuilt the WHOLE struct on the heap to read one double out of
+    // it: 63 bytes and a 6x slowdown per read of `Box3d.Invalid.Min.X`. The
+    // local case has had its register version for a while; this is the same
+    // fix for the global one.
+    | EField (EField (_, _, _), _, _) when
+            (match globalStructPath st e with Some _ -> true | None -> false) ->
+        let (g, path, kind) = optGet (globalStructPath st e)
+        storBox ctx kind (LGetGlobal (g + "$" + path))
     // a NESTED field of a by-value struct is just a deeper register name
     | EField (EField (_, _, _), _, _) when
             (match structVarPath e with
@@ -6950,6 +7449,11 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         (match vecGet ctx.RegTys r with
          | F64 -> lowBoxF ctx (LGet { Id = r; RTy = F64 })
          | I64 -> lowBoxI ctx (LGet { Id = r; RTy = I64 })
+         // an f32 field register is an f32 LOCAL. Read as a word it is a
+         // pointer, and the consumer then unboxes the "pointer" with an
+         // f64.load — invalid wasm, since the local is not an i32. Promote
+         // and box, which is what storBox does for a float32 slot.
+         | F32 -> lowBoxF ctx (LPrim (PromF, [ LGet { Id = r; RTy = F32 } ]))
          | _ -> storBox ctx kind (LGet (wReg r)))
     // reading a WHOLE nested struct field out of registers materialises a copy
     | EField (EVar (v, _), fname, _) when
@@ -6987,6 +7491,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              (match vty with
               | F64 -> lowBoxF ctx (LGet { Id = r; RTy = F64 })
               | I64 -> lowBoxI ctx (LGet { Id = r; RTy = I64 })
+              // see above: F32 had no arm at all, so every `*f` struct in
+              // fpp.base (V3f, M44f, Box3f) emitted a module that failed
+              // validation and the whole family was excluded from its build
+              | F32 -> lowBoxF ctx (LPrim (PromF, [ LGet { Id = r; RTy = F32 } ]))
               | _ -> LGet (wReg r))
          | None -> err st ("wasm-linear: no field " + fname + " on by-value struct"); lowInt 0)
     // a nested chain reaching a POD ARRAY element: one load off the element
@@ -7014,6 +7522,24 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LSet ({ Id = fv; RTy = vty },
                      LLoad (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR)) ],
              storBox ctx kind (LGet { Id = fv; RTy = vty }))
+    | EField (_, _, _) when (structLeafOf st e).IsSome ->
+        // a SCALAR leaf of a by-value struct EXPRESSION that is not already in
+        // registers — `(mk x y).X`, or `(nest v).Max.X` through a nested one.
+        // The receiver used to be lowered as a VALUE, which for a call means
+        // building the object whose fields the callee had just written out and
+        // reading one field back: 32 bytes on the heap per call, for a struct
+        // that never needed to be there. Binding the receiver puts its leaves
+        // in registers, so this is a register read.
+        let (base_, owner, path) = optGet (structLeafOf st e)
+        let k = "$fld$" + string (freshTmp ctx)
+        let stmts = lowStructBind ctx k owner base_
+        let (_, fmap) = optGet (dictTryFind ctx.StructVars k)
+        dictRemove ctx.StructVars k
+        let (_, _, vty, kind) =
+            optGet (optGet (structAbiOf st owner)
+                    |> List.tryFind (fun (fn2, _, _, _) -> fn2 = path))
+        let reg = { Id = (match dictTryFind fmap path with Some rr -> rr | None -> 0); RTy = vty }
+        LDo (stmts, storBox ctx kind (LGet reg))
     // a nested chain over an ordinary object: one load at the summed offset
     | EField (EField (_, _, _), _, _) when
             (match podChain st e with Some (_, _, ty) -> (storLTy ty).IsSome | None -> false) ->
@@ -7102,7 +7628,11 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              else LDo ([ LStore (W, coreToLowE ctx r, off, coreToLowE ctx v) ], lowInt 0))
     | EField (r, fname, owner) ->
         (match recFieldIdxE st owner fname with
-         | Some i -> LLoad (W, coreToLowE ctx r, HDR + 4 * i)
+         | Some i ->
+             if System.Environment.GetEnvironmentVariable "FPP_FIELD_DUMP" = fname then
+                 eprintfn "FIELD %s owner=%s idx=%d in %s [recFields=%s]" fname owner i curFnDbg
+                          (match dictTryFind st.RecFields owner with Some o -> String.concat "," o | None -> "-")
+             LLoad (W, coreToLowE ctx r, HDR + 4 * i)
          | None ->
              let cands =
                  match dictTryFind st.FieldOwnerOf fname with
@@ -7953,6 +8483,24 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             gn = "gcWeakNew" || gn = "gcWeakGet" || gn = "gcEphKey" || gn = "gcEphValue" ->
         coreToLowE ctx x
     | EApp (EUnknown "gcEphNew", [ k; v ]) -> LDo ([ LEval (coreToLowE ctx k) ], coreToLowE ctx v)
+    // the runtime's lifetime allocation counter. A struct that stays out of
+    // the heap is a claim you can only CHECK with a number — "no collection
+    // happened" does not mean "nothing allocated", because the heap grows
+    // rather than collecting when it can.
+    // the environment, through the runtime's getenv. The name is a string
+    // object: its length is at HDR and its UTF-16 data at ARRHDR.
+    | EApp (EUnknown "envGetLen", [ nameE ]) ->
+        if gc then
+            let nr = freshTmp ctx
+            LDo ([ LSet (wReg nr, coreToLowE ctx nameE) ],
+                 LCall ("$fpenvget",
+                        [ LPrim (AddW, [ LGet (wReg nr); LConstW ARRHDR ])
+                          LLoad (W, LGet (wReg nr), HDR) ]))
+        else lowInt (-1)
+    | EApp (EUnknown "envGetByte", [ i ]) ->
+        if gc then LCall ("$fpenvbyte", [ coreToLowE ctx i ]) else lowInt 0
+    | EApp (EUnknown "gcAllocatedBytes", [ _ ]) ->
+        if gc then LCall ("$fpallocated", []) else lowInt 0
     | EApp (EUnknown "gcCollect", [ _ ]) ->
         // zero the shadow-stack REGION above $sp first: every popped slot
         // keeps its last value and the whole registered range is scanned,
@@ -8004,6 +8552,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         coreToLowE ctx (EApp (EUnknown "gcOnCleanup", [ o; f ]))
     | EApp ((EVar (v, _) | EVarI (v, _, _)), [ u1 ]) when v.Name = "gcCollect" ->
         coreToLowE ctx (EApp (EUnknown "gcCollect", [ u1 ]))
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ u1 ]) when v.Name = "gcAllocatedBytes" ->
+        coreToLowE ctx (EApp (EUnknown "gcAllocatedBytes", [ u1 ]))
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a1 ]) when v.Name = "envGetLen" ->
+        coreToLowE ctx (EApp (EUnknown "envGetLen", [ a1 ]))
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a1 ]) when v.Name = "envGetByte" ->
+        coreToLowE ctx (EApp (EUnknown "envGetByte", [ a1 ]))
     | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a ]) when
             v.Name = "gcWeakNew" || v.Name = "gcWeakGet" || v.Name = "gcEphKey"
             || v.Name = "gcEphValue" || v.Name = "gcWeakSupported" ->
@@ -8024,10 +8578,166 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 | _ -> RKRaw, W, coreToLowE ctx a)
         let call = lowJsi ctx fnm rk ops
         if List.isEmpty unitEvals then call else LDo (unitEvals, call)
+    // `$broff:<payload>` (the byref-as-stack-offset marker from
+    // brOffPrepass): reserve an `$ssp` slot, spill the local's value into
+    // it, and answer the slot's address TAGGED as a scalar — odd, so the
+    // collector neither traces nor moves it. The reload and the release ride
+    // ctx.BrPost to run after the enclosing call returns.
+    //
+    // Spill and reload go through the local's own representation: a typed
+    // scalar register raw, a register-split struct leaf by leaf. The
+    // fallbacks (a boxed scalar, an object-backed struct) stay correct but
+    // re-box on the way back — rare shapes, and the price is what it was
+    // before the pass existed.
+    | EApp (EUnknown s, [ (EVar (tv, _) | EVarI (tv, _, _)) ]) when s.StartsWith "$broff:" ->
+        let pay = substr s 7 (strLen s - 7)
+        let reserve (size : int) (slot : int) : LStmt list =
+            [ LSetGlobal ("$ssp", LPrim (SubW, [ LGetGlobal "$ssp"; LConstW size ]))
+              LIf (LPrim (LtUW, [ LGetGlobal "$ssp"; LGetGlobal "$ssplim" ]), [ LTrap ], [])
+              LSet (wReg slot, LGetGlobal "$ssp") ]
+        let release (size : int) : LStmt =
+            LSetGlobal ("$ssp", LPrim (AddW, [ LGetGlobal "$ssp"; LConstW size ]))
+        let taggedOf (slot : int) : LExpr = LPrim (AddW, [ LGet (wReg slot); LConstW 1 ])
+        (match pay with
+         | "#w" ->
+             (match dictTryFind ctx.Regs (key tv) with
+              | Some tvReg ->
+                  let slot = freshTmp ctx
+                  ctx.BrPost <-
+                      ctx.BrPost
+                      @ [ LSet (wReg tvReg, LLoad (W, LGet (wReg slot), 0)); release 8 ]
+                  LDo (reserve 8 slot @ [ LStore (W, LGet (wReg slot), 0, LGet (wReg tvReg)) ],
+                       taggedOf slot)
+              | None ->
+                  err st "wasm-linear LowIR: $broff local has no register"
+                  lowInt 0)
+         | "#r" ->
+             // a REFERENCE (or generic) payload: one uniform word in a slot
+             // on the SCANNED shadow stack — `$roots + $sp` — so the
+             // collector traces it and REWRITES it when the pointee moves.
+             // This is what makes a byref of a ref-holding struct (a heap
+             // object here) sound on the stack: the slot is a root, exactly
+             // the fpprt_frame_pod idea one level up.
+             //
+             // A mutable REF local is SLOTTED already — its value lives in
+             // a persistent root slot kept current by every write-through —
+             // so there is nothing to spill and nothing to reload: the
+             // callee aliases the local's own slot. Exact aliasing, for
+             // free.
+             (match dictTryFind ctx.Slotted (key tv) with
+              | Some slotAddr -> LPrim (AddW, [ slotAddr; LConstW 1 ])
+              | None ->
+             match dictTryFind ctx.Regs (key tv) with
+              | Some tvReg ->
+                  let slot = freshTmp ctx
+                  ctx.BrPost <-
+                      ctx.BrPost
+                      @ [ LSet (wReg tvReg, LLoad (W, LGet (wReg slot), 0))
+                          LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ])) ]
+                  LDo ([ LSet (wReg slot, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
+                         LStore (W, LGet (wReg slot), 0, LGet (wReg tvReg))
+                         LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ],
+                       taggedOf slot)
+              | None ->
+                  err st "wasm-linear LowIR: $broff local has no register"
+                  lowInt 0)
+         | "#f64" | "#i64" | "#f32" ->
+             let sty = match pay with "#i64" -> I64 | "#f32" -> F32 | _ -> F64
+             (match dictTryFind ctx.Regs (key tv) with
+              | Some tvReg ->
+                  let slot = freshTmp ctx
+                  (match dictTryFind ctx.VarScalar (key tv) with
+                   | Some vt when vt = sty ->
+                       // the local rides a typed register: raw both ways
+                       let treg = { Id = tvReg; RTy = sty }
+                       ctx.BrPost <-
+                           ctx.BrPost
+                           @ [ LSet (treg, LLoad (sty, LGet (wReg slot), 0)); release 8 ]
+                       LDo (reserve 8 slot @ [ LStore (sty, LGet (wReg slot), 0, LGet treg) ],
+                            taggedOf slot)
+                   | _ ->
+                       // boxed representation: unbox to store (a load, no
+                       // alloc), RE-BOX on reload (the rare shape that pays)
+                       let jt = match sty with F32 -> F32 | x -> x
+                       ctx.BrPost <-
+                           ctx.BrPost
+                           @ [ LSet (wReg tvReg,
+                                     (match jt with
+                                      | F32 -> lowBoxF ctx (LPrim (PromF, [ LLoad (F32, LGet (wReg slot), 0) ]))
+                                      | I64 -> lowBoxI ctx (LLoad (I64, LGet (wReg slot), 0))
+                                      | _ -> lowBoxF ctx (LLoad (F64, LGet (wReg slot), 0))))
+                               release 8 ]
+                       LDo (reserve 8 slot
+                            @ [ LStore (sty, LGet (wReg slot), 0, flatUnbox sty (LGet (wReg tvReg))) ],
+                            taggedOf slot))
+              | None ->
+                  err st "wasm-linear LowIR: $broff local has no register"
+                  lowInt 0)
+         | tn ->
+             (match structAbiOf st tn, podOf st tn with
+              | Some fields, Some (layout, size, firstRefWord) ->
+                  let rsize = if size % 8 = 0 then size else size + (8 - size % 8)
+                  let slot = freshTmp ctx
+                  (match dictTryFind ctx.StructVars (key tv) with
+                   | Some (_, fmap) ->
+                       // register-split local: leaves straight in and out
+                       let spill =
+                           fields |> List.map (fun (fn2, off, vty, kind) ->
+                               let r = match dictTryFind fmap fn2 with Some r -> r | None -> 0
+                               let (sty, _) = optGet (storLTy kind)
+                               LStore (sty, LGet (wReg slot), off, LGet { Id = r; RTy = vty }))
+                       let reload =
+                           fields |> List.map (fun (fn2, off, vty, kind) ->
+                               let r = match dictTryFind fmap fn2 with Some r -> r | None -> 0
+                               let (sty, _) = optGet (storLTy kind)
+                               LSet ({ Id = r; RTy = vty }, LLoad (sty, LGet (wReg slot), off)))
+                       ctx.BrPost <- ctx.BrPost @ reload @ [ release rsize ]
+                       LDo (reserve rsize slot @ spill, taggedOf slot)
+                   | None ->
+                       (match dictTryFind ctx.Regs (key tv) with
+                        | Some tvReg ->
+                            // object-backed local: read leaves without
+                            // materialising, REBUILD the object on reload
+                            let k = "$broffs$" + string (freshTmp ctx)
+                            let binds = lowStructBind ctx k tn (EVar (tv, mono (TCon (tn, []))))
+                            let (_, fmap) = optGet (dictTryFind ctx.StructVars k)
+                            dictRemove ctx.StructVars k
+                            let spill =
+                                fields |> List.map (fun (fn2, off, vty, kind) ->
+                                    let r = match dictTryFind fmap fn2 with Some r -> r | None -> 0
+                                    let (sty, _) = optGet (storLTy kind)
+                                    LStore (sty, LGet (wReg slot), off, LGet { Id = r; RTy = vty }))
+                            let items =
+                                fields |> List.map (fun (_, off, vty, kind) ->
+                                    let (sty, _) = optGet (storLTy kind)
+                                    (off, sty, vty, false, LLoad (sty, LGet (wReg slot), off)))
+                            let c = cidRec st tn
+                            let rebuilt = lowPodBuildAt ctx (if c >= 0 then "inl:" + string c else "inl@" + tn) c layout size firstRefWord items
+                            ctx.BrPost <-
+                                ctx.BrPost @ [ LSet (wReg tvReg, rebuilt); release rsize ]
+                            LDo (reserve rsize slot @ binds @ spill, taggedOf slot)
+                        | None ->
+                            err st "wasm-linear LowIR: $broff local has no register"
+                            lowInt 0))
+              | _ ->
+                  err st ("wasm-linear LowIR: $broff payload has no layout: " + tn)
+                  lowInt 0))
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Externs v.Name).IsSome ->
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
     | EApp (((EVar (v, vsch) | EVarI (v, vsch, _)) as hd), args0)
         when (dictTryFind st.Funcs (key v)) = Some (List.length args0) ->
+        // byref-as-stack-offset: any `$broff` marker among the arguments
+        // pushes its reload+release here; they run after THIS call returns.
+        // Saved and scoped so a nested call drains only its own.
+        let brSaved = ctx.BrPost
+        ctx.BrPost <- []
+        let brWrap (r : LExpr) : LExpr =
+            let mine = ctx.BrPost
+            ctx.BrPost <- brSaved
+            if List.isEmpty mine then r
+            else
+                let rr = freshTmp ctx
+                LDo ([ LSet (wReg rr, r) ] @ mine, LGet (wReg rr))
         // A RAW scalar passed where the parameter's type is a REFERENCE has to
         // be boxed — inference widened it without unifying, so the argument
         // kept its own scalar type and the callee would receive a bare word
@@ -8076,18 +8786,43 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | _ -> None
         (match dictTryFind st.FuncSig (key v) with
          | Some (paramTys, retTy) ->
-             let tupPre, argVals =
+             let brBytesOut, tupPre, argVals =
                  match tupleRead with
                  | Some (n, one) ->
                      let tr = freshTmp ctx
-                     let vals =
-                         paramTys |> List.mapi (fun i ty ->
-                             let w = LLoad (W, LGet (wReg tr), HDR + 4 * i)
-                             let lowered = match ty with W -> w | _ -> flatUnbox ty w
-                             (if ty = W then RKRef else RKRaw), None, ty, lowered)
-                     [ LSet (wReg tr, coreToLowE ctx one) ], vals
+                     // one slot per ELEMENT, and an element that expands
+                     // contributes its fields off that slot — the signature
+                     // is longer than the tuple when a struct element is
+                     // passed by value, so walking paramTys positionally
+                     // would read past the tuple
+                     let plan =
+                         match dictTryFind st.FuncParamPlan (key v) with
+                         | Some pl when List.length pl = n -> pl
+                         | _ -> List.replicate n None
+                     let vals = vecNew<RefKind * LExpr option * LTy * LExpr> ()
+                     let mutable rest = paramTys
+                     plan |> List.iteri (fun i sTy ->
+                         let slot = LLoad (W, LGet (wReg tr), HDR + 4 * i)
+                         match sTy with
+                         | Some tn ->
+                             // the element contributes its FIELDS and not
+                             // itself: the slot is the object, each field a
+                             // load off it
+                             let fields = optGet (structAbiOf st tn)
+                             for _, off, vty, kind in fields do
+                                 let (sty, _) = optGet (storLTy kind)
+                                 vecAdd vals (RKRaw, None, vty, LLoad (sty, slot, off))
+                             rest <- (if List.length rest >= List.length fields then List.skip (List.length fields) rest else [])
+                         | None ->
+                             (match rest with
+                              | ty :: more ->
+                                  let lowered = match ty with W -> slot | _ -> flatUnbox ty slot
+                                  vecAdd vals ((if ty = W then RKRef else RKRaw), None, ty, lowered)
+                                  rest <- more
+                              | [] -> ()))
+                     0, [ LSet (wReg tr, coreToLowE ctx one) ], vecToList vals
                  | None when List.length paramTys = List.length args ->
-                     [], List.map2 (fun ty a ->
+                     0, [], List.map2 (fun ty a ->
                              let lowered = match ty with W -> coreToLowE ctx a | _ -> flatUnbox ty (coreToLowE ctx a)
                              let kind = refKindOfExprC st a
                              let wit = if kind = RKGen then slotWitness ctx a else None
@@ -8102,11 +8837,44 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                          match dictTryFind st.FuncParamPlan (key v) with
                          | Some pl when List.length pl = List.length args -> pl
                          | _ -> args |> List.map (fun _ -> None)
+                     let brPlan =
+                         match dictTryFind st.FuncParamByRef (key v) with
+                         | Some bl when List.length bl = List.length args -> bl
+                         | _ -> args |> List.map (fun _ -> false)
                      let pre = vecNew<LStmt> ()
                      let vals = vecNew<RefKind * LExpr option * LTy * LExpr> ()
                      let mutable rest = paramTys
-                     for a, sTy in List.zip args plan do
+                     // bytes reserved on the raw struct stack for BYREF
+                     // arguments, given back as the last statement before the
+                     // call: nothing is evaluated between that and the call,
+                     // and the callee copies its leaves before it allocates
+                     // anything of its own, so the slot cannot be clobbered
+                     // while it is still live. Giving it back EARLIER would
+                     // let a later argument's own call land on this slot.
+                     let mutable brBytes = 0
+                     for (a, sTy), isBr in List.zip (List.zip args plan) brPlan do
                          match sTy with
+                         | Some tn when isBr ->
+                             let fields = optGet (structAbiOf st tn)
+                             let (_, size, _) = optGet (podOf st tn)
+                             // the leaves first, by the same binder every other
+                             // struct argument uses (it peels lets, seqs and a
+                             // struct-returning call without building an object)
+                             let k = "$brarg$" + string (freshTmp ctx)
+                             for st2 in lowStructBind ctx k tn a do vecAdd pre st2
+                             let (_, fmap) = optGet (dictTryFind ctx.StructVars k)
+                             dictRemove ctx.StructVars k
+                             let slot = freshTmp ctx
+                             vecAdd pre (LSetGlobal ("$ssp", LPrim (SubW, [ LGetGlobal "$ssp"; LConstW size ])))
+                             vecAdd pre (LIf (LPrim (LtUW, [ LGetGlobal "$ssp"; LGetGlobal "$ssplim" ]), [ LTrap ], []))
+                             vecAdd pre (LSet (wReg slot, LGetGlobal "$ssp"))
+                             for fn, off, vty, kind in fields do
+                                 let r = match dictTryFind fmap fn with Some r -> r | None -> 0
+                                 let (sty, _) = optGet (storLTy kind)
+                                 vecAdd pre (LStore (sty, LGet (wReg slot), off, LGet { Id = r; RTy = vty }))
+                             brBytes <- brBytes + size
+                             vecAdd vals (RKRaw, None, W, LGet (wReg slot))
+                             rest <- (match rest with _ :: more -> more | [] -> [])
                          | Some tn ->
                              let fields = optGet (structAbiOf st tn)
                              (match a with
@@ -8124,11 +8892,24 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                                       let r = match dictTryFind fmap fn with Some r -> r | None -> 0
                                       vecAdd vals (RKRaw, None, vty, LGet { Id = r; RTy = vty })
                               | _ ->
-                                  let objR = freshTmp ctx
-                                  vecAdd pre (LSet (wReg objR, coreToLowE ctx a))
-                                  for _, off, vty, kind in fields do
-                                      let (sty, _) = optGet (storLTy kind)
-                                      vecAdd vals (RKRaw, None, vty, LLoad (sty, LGet (wReg objR), off)))
+                                  // everything else goes through the binder the
+                                  // callee's own result uses. A literal with
+                                  // COMPUTED fields is not an ERecord here — it
+                                  // arrives wrapped in the lets that pre-evaluate
+                                  // those fields — so the arm above never fired
+                                  // for `f { X = g x; Y = h y }` and every such
+                                  // argument built a heap object that the call
+                                  // then read straight back out. lowStructBind
+                                  // peels the lets, the seqs and a struct-
+                                  // returning call, and only materialises an
+                                  // object for an expression that really is one.
+                                  let k = "$arg$" + string (freshTmp ctx)
+                                  for s in lowStructBind ctx k tn a do vecAdd pre s
+                                  let (_, fmap) = optGet (dictTryFind ctx.StructVars k)
+                                  dictRemove ctx.StructVars k
+                                  for fn, _, vty, _ in fields do
+                                      let r = match dictTryFind fmap fn with Some r -> r | None -> 0
+                                      vecAdd vals (RKRaw, None, vty, LGet { Id = r; RTy = vty }))
                              rest <- (if List.length rest >= List.length fields then List.skip (List.length fields) rest else [])
                          | None ->
                              (match rest with
@@ -8139,9 +8920,13 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                                   vecAdd vals (kind, wit, ty, lowered)
                                   rest <- more
                               | [] -> ())
-                     vecToList pre, vecToList vals
+                     brBytes, vecToList pre, vecToList vals
              let setup0, argGets = lowRootedArgsK ctx argVals
-             let setup = tupPre @ setup0
+             let setup =
+                 tupPre @ setup0
+                 @ (if brBytesOut > 0 then
+                        [ LSetGlobal ("$ssp", LPrim (AddW, [ LGetGlobal "$ssp"; LConstW brBytesOut ])) ]
+                    else [])
              let loweredArgs = witnessArgs @ argGets
              let callE =
                  if isSelfTail then LTailCall (fn v, loweredArgs)
@@ -8158,8 +8943,14 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                      let (layout, size, firstRefWord) = optGet (podOf st rn)
                      let fields = optGet (structAbiOf st rn)
                      let dst = freshTmp ctx
+                     ctx.SretDst <- Some dst
                      let stmts =
                          [ LSetGlobal ("$ssp", LPrim (SubW, [ LGetGlobal "$ssp"; LConstW size ]))
+                           // running off the low end would write over whatever
+                           // follows, silently — the failure this region was
+                           // moved to escape. One unsigned compare per call.
+                           LIf (LPrim (LtUW, [ LGetGlobal "$ssp"; LGetGlobal "$ssplim" ]),
+                                [ LTrap ], [])
                            LSet (wReg dst, LGetGlobal "$ssp")
                            LEval (LCall (fn v, loweredArgs @ [ LGet (wReg dst) ]))
                            LSetGlobal ("$ssp", LPrim (AddW, [ LGetGlobal "$ssp"; LConstW size ])) ]
@@ -8180,7 +8971,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                  // the fresh box out from under the store. box-elim pushes through
                  // the LDo, so an arithmetic use still reduces to the raw call.
                  | _ -> let r = freshTmpT ctx retTy in LDo ([ LSet ({ Id = r; RTy = retTy }, LCall (fn v, loweredArgs)) ], flatBox ctx retTy (LGet { Id = r; RTy = retTy }))
-             (if List.isEmpty setup then callE else LDo (setup, callE))
+             brWrap (if List.isEmpty setup then callE else LDo (setup, callE))
          | None ->
              let setup, argGets =
                  lowRootedArgsK ctx (args |> List.map (fun a ->
@@ -8190,7 +8981,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              let callE =
                  if isSelfTail then LTailCall (fn v, witnessArgs @ argGets)
                  else LCall (fn v, witnessArgs @ argGets)
-             (if List.isEmpty setup then callE else LDo (setup, callE)))
+             brWrap (if List.isEmpty setup then callE else LDo (setup, callE)))
     | ELam (_, _) ->
         (match refMapTryFind st.LamName e with
          | Some name -> lowClosure ctx name
@@ -8496,6 +9287,17 @@ and private evalRooted (ctx : LowCtx) (a : Expr) (b : Expr) : int * int * LStmt 
 and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     match e with
     | ESeq xs -> List.collect (coreToLowS ctx) xs
+    // byref-as-stack-offset: a dispatch shape on a MARKED param in STATEMENT
+    // position must go through the expression path's interception — the
+    // statement EIf arm below lowers the ORIGINAL cell code, which against a
+    // tagged offset stores through an odd address into nowhere. Found as a
+    // byref write that silently VANISHED whenever any statement followed it
+    // (final-expression writes took the expression path and worked).
+    | EIf (ETypeTest ("ByRefView", (EVar (pv, _) | EVarI (pv, _, _))), _, _) when
+          (dictTryFind ctx.BrPays (key pv)).IsSome
+          && (dictTryFind ctx.Regs (key pv)).IsSome
+          && (brReadShape (pv.Path, pv.Offset) e || (brWriteShape (pv.Path, pv.Offset) e).IsSome) ->
+        [ LEval (coreToLowE ctx e) ]
     // a `let rec f = fun … and g = fun …` group in STATEMENT position needs the
     // same cell treatment as in expression position (coreToLowE): bind every
     // member to a cell FIRST so a member's closure can capture its siblings,
@@ -8545,8 +9347,18 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
             match rhs with
             | EVar (sv, _) | EVarI (sv, _, _) ->
                 (match dictTryFind ctx.Slotted (key sv) with
+                 // ... and the SOURCE must not be a cell either. A cell var's
+                 // slot holds the POINTER TO THE CELL, not the value, so
+                 // aliasing a binder to it hands the binder a cell where a
+                 // value belongs — `let mutable got` filled through
+                 // `f (&got)`, then read as `got.N`, returned a field of the
+                 // cell object. Only the new binder was checked, so the bug
+                 // needed the receiver to be address-taken AND the member to
+                 // be inlined, which is why it appeared the day inlining
+                 // became the default.
                  | Some a when not (assignsTo (key v) body) && not (assignsTo (key sv) body)
-                               && (dictTryFind ctx.LSt.CellVars (key v)).IsNone -> Some a
+                               && (dictTryFind ctx.LSt.CellVars (key v)).IsNone
+                               && (dictTryFind ctx.LSt.CellVars (key sv)).IsNone -> Some a
                  | _ -> None)
             | _ -> None
         match aliasOf with
@@ -8623,6 +9435,23 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
                         LSet (wReg id, LGet (wReg t))
                         LIf (slotGenRaw wit, [], [ LStore (W, LGet (wReg slotReg), 0, LGet (wReg t)) ]) ]
                   | None -> [ LSet (wReg id, coreToLowE ctx rhs) ])
+         // a module-level mutable STRUCT: its fields live in per-field globals
+         // and there is NO global under the binding's own name, so the general
+         // arm below emitted `global.set` for a name that was never declared —
+         // the emitter looked it up, got null, and the COMPILER crashed with a
+         // NullReferenceException (KNOWN-ISSUES #25). Assign the fields.
+         | None when (dictTryFind ctx.LSt.Globals (key v)).IsSome
+                     && (dictTryFind globalStructTy (gl v)).IsSome ->
+             let tn = optGet (dictTryFind globalStructTy (gl v))
+             let k = "$gset$" + string (freshTmp ctx)
+             let stmts = lowStructBind ctx k tn rhs
+             let (_, fmap) = optGet (dictTryFind ctx.StructVars k)
+             dictRemove ctx.StructVars k
+             stmts
+             @ (optGet (structAbiOf ctx.LSt tn)
+                |> List.map (fun (fn, _, vty, _) ->
+                        let r = match dictTryFind fmap fn with Some rr -> rr | None -> 0
+                        LSetGlobal (gl v + "$" + fn, LGet { Id = r; RTy = vty })))
          | None when (dictTryFind ctx.LSt.Globals (key v)).IsSome ->
              (match dictTryFind globalScalarTy (gl v) with
               | Some ty -> [ LSetGlobal (gl v, flatUnbox ty (coreToLowE ctx rhs)) ]
@@ -9381,15 +10210,26 @@ and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
     // the WHOLE value of a by-value struct: build the object here. This is
     // the only place a struct costs an allocation, and it is the same place
     // .NET boxes one — crossing into code that wants a uniform value.
-    | Some (tn, fmap) when tn <> "" && (podOf st tn).IsSome ->
+    // ... and only when every field IS a scalar slot. A field that is itself
+    // a struct has no `storLTy`, and rebuilding read it as one anyway: the
+    // compiler died with "optGet: None" rather than compiling the program.
+    // Nested structs are exactly what a Box/Range is (`{ Min : V; Max : V }`),
+    // so every `fun` inside one of their members crashed the build. Declining
+    // here falls through to the general path, which is slower and correct.
+    // Rebuilt from the FLATTENED leaves, not the top-level fields. A field
+    // that is itself a struct has no scalar `storLTy`, and reading it as one
+    // killed the compiler with "optGet: None" — so every `fun` inside a
+    // member of a nested struct (a Box is `{ Min : V; Max : V }`) crashed the
+    // build. `structAbiOf` already walks into inner structs and is what
+    // `fmap` is keyed by, dotted names and absolute offsets included.
+    | Some (tn, fmap) when tn <> "" && (podOf st tn).IsSome && (structAbiOf st tn).IsSome ->
         let (layout, size, firstRefWord) = optGet (podOf st tn)
         let items =
-            dictPairs layout
-            |> List.map (fun (fn, v) ->
-                let (off, kind) = v
+            optGet (structAbiOf st tn)
+            |> List.map (fun (fn, off, vty, kind) ->
                 let (sty, _) = optGet (storLTy kind)
                 let r = match dictTryFind fmap fn with Some r -> r | None -> 0
-                (off, sty, storValTy sty, false, LGet { Id = r; RTy = storValTy sty }))
+                (off, sty, vty, false, LGet { Id = r; RTy = vty }))
         (let c = cidRec st tn in lowPodBuildAt ctx (if c >= 0 then "inl:" + string c else "inl@" + tn) c layout size firstRefWord items)
     | _ ->
     match dictTryFind ctx.Slotted k with
@@ -9438,6 +10278,32 @@ and private lowSlotInit (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) :
 // bind a local `let`: a monomorphic scalar rides unboxed in a typed local
 // (recorded in VarScalar, read/captured through a re-box), everything else a
 // tagged word — wrapped in a cell when captured-and-mutable.
+/// A field access that names a SCALAR LEAF of a by-value struct expression:
+/// the base expression, the struct type it has, and the dotted leaf path.
+/// `(nest v).Max.X` is one access to the leaf "Max.X" of a B2, not two
+/// accesses through an intermediate object — reading it as two makes the
+/// nested struct a heap value. A base that is a VARIABLE or a GLOBAL has its
+/// own arms (its leaves are already registers or globals), so those are left
+/// alone here.
+and private structLeafOf (st : St) (e : Expr) : (Expr * string * string) option =
+    let rec peel (x : Expr) (acc : string list) : (Expr * string * string) option =
+        match x with
+        | EField (inner, fn, ow) ->
+            (match inner with
+             | EField (_, _, _) -> peel inner (fn :: acc)
+             | EVar _ | EVarI _ -> None
+             | _ when ow <> "" -> Some (inner, ow, String.concat "." (fn :: acc))
+             | _ -> None)
+        | _ -> None
+    match peel e [] with
+    | Some (base_, owner, path) ->
+        (match structAbiOf st owner with
+         | Some leaves ->
+             if leaves |> List.exists (fun (fn2, _, _, k2) -> fn2 = path && (storLTy k2).IsSome)
+             then Some (base_, owner, path) else None
+         | None -> None)
+    | None -> None
+
 /// a dotted leaf path, split into its segments
 and private splitDots (s : string) : string list =
     let acc = vecNew<string> ()
@@ -9459,12 +10325,76 @@ and private litLeaf (flds : (string * Expr) list) (path : string list) : Expr op
          | Some (ERecord (_, inner)) -> litLeaf inner rest
          | _ -> None)
 
-/// every leaf this literal must fill is reachable as a literal. A nested field
-/// given as a VALUE rather than spelled out is not, and takes the object path.
-and private litLeavesOk (flds : (string * Expr) list) (fields : (string * int * LTy * string) list) : bool =
+/// the literal a struct expression really is, with the `let`s that pre-evaluate
+/// its fields peeled off — SYNTACTICALLY, so this can guard the literal path
+/// before anything is emitted. A nested literal whose own fields are computed
+/// (`{ Min = { X = if .. then .. else ..; .. } }`) reaches here as ELet-wrapped
+/// and read as "a value, not a literal", which sent every such construction
+/// through the heap.
+and private peelLit (e : Expr) : Expr =
+    match e with
+    | ELet (false, _, _, _, body) -> peelLit body
+    | ESeq xs when not (List.isEmpty xs) -> peelLit (List.item (List.length xs - 1) xs)
+    | ERecord (rn, fs) -> ERecord (rn, fs |> List.map (fun (n, fe) -> n, peelLit fe))
+    | _ -> e
+
+/// the same peel, EMITTING the bindings it strips. Only run once the shape
+/// above has confirmed the literal path applies, so nothing is emitted twice.
+and private peelLitEmit (ctx : LowCtx) (pre : Vec<LStmt>) (e : Expr) : Expr =
+    match e with
+    | ELet (false, lv, lsch, lrhs, body) ->
+        vecAdd pre (lowLetBind ctx lv lsch lrhs)
+        peelLitEmit ctx pre body
+    | ESeq xs when not (List.isEmpty xs) ->
+        let n = List.length xs
+        List.iteri (fun i y -> if i < n - 1 then for s in coreToLowS ctx y do vecAdd pre s) xs
+        peelLitEmit ctx pre (List.item (n - 1) xs)
+    | ERecord (rn, fs) -> ERecord (rn, fs |> List.map (fun (n, fe) -> n, peelLitEmit ctx pre fe))
+    | _ -> e
+
+/// every leaf this literal must fill is reachable — as a nested literal, or as
+/// a by-value struct VARIABLE already living in field registers. The second is
+/// the shape Core actually produces: `{ B | Min = { X = a; Y = b }; ... }` is
+/// lifted to `let _rf0 = { X = a; Y = b } in { B | Min = _rf0; ... }`, so the
+/// literal walk met a variable, gave up, and every nested-struct construction
+/// went through the heap — the whole cost of a Box3d returned from a member.
+and private litLeafOk (ctx : LowCtx) (flds : (string * Expr) list) (path : string list) : bool =
+    match path with
+    | [] -> false
+    | [ p ] -> flds |> List.exists (fun (n, _) -> n = p)
+    | p :: rest ->
+        (match flds |> List.tryPick (fun (n, e) -> if n = p then Some e else None) with
+         | Some (ERecord (_, inner)) -> litLeafOk ctx inner rest
+         | Some (EVar (sv, _)) | Some (EVarI (sv, _, _)) ->
+             (match dictTryFind ctx.StructVars (key sv) with
+              | Some (_, fmap) -> (dictTryFind fmap (String.concat "." rest)).IsSome
+              | None -> false)
+         | _ -> false)
+
+/// the raw value for one leaf, under the same two shapes
+and private litLeafRaw (ctx : LowCtx) (flds : (string * Expr) list) (path : string list) (vty : LTy) (kind : string) : LExpr option =
+    match path with
+    | [] -> None
+    | [ p ] ->
+        (match flds |> List.tryPick (fun (n, e) -> if n = p then Some e else None) with
+         | Some e2 -> Some (storUnbox kind (coreToLowE ctx e2))
+         | None -> None)
+    | p :: rest ->
+        (match flds |> List.tryPick (fun (n, e) -> if n = p then Some e else None) with
+         | Some (ERecord (_, inner)) -> litLeafRaw ctx inner rest vty kind
+         | Some (EVar (sv, _)) | Some (EVarI (sv, _, _)) ->
+             (match dictTryFind ctx.StructVars (key sv) with
+              | Some (_, fmap) ->
+                  (match dictTryFind fmap (String.concat "." rest) with
+                   | Some r -> Some (LGet { Id = r; RTy = vty })
+                   | None -> None)
+              | None -> None)
+         | _ -> None)
+
+and private litLeavesOk (ctx : LowCtx) (flds : (string * Expr) list) (fields : (string * int * LTy * string) list) : bool =
     fields |> List.forall (fun (fn, _, _, _) ->
         let path = splitDots fn
-        List.length path = 1 || (litLeaf flds path).IsSome)
+        List.length path = 1 || litLeafOk ctx flds path)
 
 /// bind a BY-VALUE struct into field registers, and fill them from the rhs
 /// without ever building an object when the rhs is a literal or another
@@ -9496,33 +10426,109 @@ and private lowStructBind (ctx : LowCtx) (k : string) (tn : string) (rhs : Expr)
         split xs
     // a leaf's value is reached by walking the literal's NESTED literals:
     // `{ Lo = { PX = 1.0 } }` fills the register named "Lo.PX"
-    | ERecord (rn, fs) when (rn = tn || (structAbiOf st rn).IsSome) && litLeavesOk fs fields ->
-        fields |> List.map (fun (fn, _, vty, kind) ->
-            let raw =
-                match litLeaf fs (splitDots fn) with
-                | Some e2 -> storUnbox kind (coreToLowE ctx e2)
-                | None -> zeroOfTy vty
-            LSet (regOfField fn vty, raw))
+    | ERecord (rn, _) when
+            (rn = tn || (structAbiOf st rn).IsSome)
+            && (match peelLit rhs with ERecord (_, fs2) -> litLeavesOk ctx fs2 fields | _ -> false) ->
+        let pre = vecNew<LStmt> ()
+        let fs = match peelLitEmit ctx pre rhs with ERecord (_, fs2) -> fs2 | _ -> []
+        vecToList pre
+        @ (fields |> List.map (fun (fn, _, vty, kind) ->
+                let raw =
+                    match litLeafRaw ctx fs (splitDots fn) vty kind with
+                    | Some e2 -> e2
+                    | None -> zeroOfTy vty
+                LSet (regOfField fn vty, raw)))
+    // a by-value struct GLOBAL keeps its fields in per-field globals — read
+    // those. A single FIELD of one was already a global read; the whole value
+    // was not, so passing one by value rebuilt the object on the heap and the
+    // caller read it straight back, once per call. That is what the loop over
+    // a module-level `Box3d.Invalid` paid.
+    | (EVar (sv, _) | EVarI (sv, _, _)) when
+            (dictTryFind ctx.LSt.Globals (key sv)).IsSome
+            && (dictTryFind globalStructTy ("$g" + string (abs (strHash (key sv))))).IsSome ->
+        let g = "$g" + string (abs (strHash (key sv)))
+        fields |> List.map (fun (fn, _, vty, _) ->
+            LSet (regOfField fn vty, LGetGlobal (g + "$" + fn)))
+    // an ELEMENT of a POD array. The element is raw bytes inside the array, so
+    // its leaves load straight into the field registers — the generic EIndex
+    // path builds an OBJECT for it, which is right for a one-value context and
+    // pure waste here. `let p = pts.[i]` and `f pts.[i]` each cost 32 bytes on
+    // the heap per iteration before this, which is what made a struct loop
+    // allocate 20M times and run 4.7x the same loop written in C.
+    | EIndex (ek, arr, ix) when ek = tn && (podArrOf st ek).IsSome ->
+        let (_, stride) = optGet (podArrOf st ek)
+        let ar = freshTmp ctx
+        let ir = freshTmp ctx
+        let elemBase = LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ])
+        [ LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, coreToLowE ctx ix) ]
+        @ boundsGuard ctx rhs ar ir
+        @ (fields |> List.map (fun (fn, off, vty, kind) ->
+                let (sty, _) = optGet (storLTy kind)
+                LSet (regOfField fn vty, LLoad (sty, elemBase, ARRHDR + off - HDR))))
     | (EVar (sv, _) | EVarI (sv, _, _)) when (dictTryFind ctx.StructVars (key sv)).IsSome ->
         let (_, srcMap) = optGet (dictTryFind ctx.StructVars (key sv))
         fields |> List.map (fun (fn, _, vty, _) ->
             let sr = match dictTryFind srcMap fn with Some r -> r | None -> 0
             LSet (regOfField fn vty, LGet { Id = sr; RTy = vty }))
+    // a NESTED STRUCT FIELD of a by-value struct variable — `let d = r.Direction`,
+    // where `r` is a Ray3d held in six registers and `d` is the three of them
+    // named `Direction.*`. Re-associate those registers; do not build anything.
+    //
+    // Without this arm the read fell through to the materialising arm in
+    // `coreToLowE` ("reading a WHOLE nested struct field out of registers
+    // materialises a copy"), which is the right answer only when the context
+    // genuinely wants one value. A binding does not: `Ray3d.IntersectTriangle`
+    // allocated a V3d for every one of `e1, e2, pv, tv, qv` — 110 bytes an
+    // iteration, 220 MB over the ray/triangle benchmark, and 4.96x .NET while
+    // the same arithmetic over flat V3d structs was 0.9x. Every nested-struct
+    // type in fpp.base paid it: Box3d (two V3d), Trafo3d (two M44d).
+    //
+    // Arguments come through here too: the by-value argument path lowers
+    // anything that is not a literal or a plain struct var with
+    // `lowStructBind`, so `r.Direction.Cross e2` stops materialising as well.
+    | EField (_, _, _) when
+            (match structVarPath rhs with
+             | Some (v, path) ->
+                 (match dictTryFind ctx.StructVars (key v) with
+                  | Some (_, m) ->
+                      // the path must name a nested STRUCT, not a leaf: a leaf
+                      // is already a register read and belongs to the arm above
+                      (dictTryFind m path).IsNone
+                      && (dictPairs m |> List.exists (fun (n, _) -> n.StartsWith (path + ".")))
+                  | None -> false)
+             | None -> false) ->
+        let (v, path) = optGet (structVarPath rhs)
+        let (_, srcMap) = optGet (dictTryFind ctx.StructVars (key v))
+        fields |> List.map (fun (fn, _, vty, _) ->
+            let sr = match dictTryFind srcMap (path + "." + fn) with Some r -> r | None -> 0
+            LSet (regOfField fn vty, LGet { Id = sr; RTy = vty }))
     | _ ->
-        // a struct-returning CALL wrote its fields into a scratch slot: read
-        // them straight into these registers and drop the object it built for
-        // a one-value context. The call may sit under argument-rooting
-        // statements, so peel the LDo layers looking for the destination.
-        let rec scratchCall (e : LExpr) (acc : LStmt list) : (LStmt list * LReg) option =
+        // a struct-returning CALL wrote its fields into the destination it was
+        // handed: read them straight into these registers and drop the object
+        // it built for a one-value context. The destination is the one the
+        // CALL recorded (ctx.SretDst) — see the field's note for why scanning
+        // the lowered statements for it cannot be right.
+        // Collect the LDo layers up to and INCLUDING the one that reserves the
+        // destination, and no further. Flattening every layer would sweep in
+        // the statements of the object the call built for a one-value context
+        // — the very allocation this path exists to drop, kept while its
+        // pointer was discarded.
+        let rec flatDo (e : LExpr) (dst : int) (acc : LStmt list) : LStmt list option =
             match e with
             | LDo (stmts, tail) ->
-                (match stmts |> List.tryPick (fun st2 -> match st2 with LSet (r, LGetGlobal "$ssp") -> Some r | _ -> None) with
-                 | Some r -> Some (acc @ stmts, r)
-                 | None -> scratchCall tail (acc @ stmts))
+                if stmts |> List.exists (fun st2 -> match st2 with LSet (r, _) -> r.Id = dst | _ -> false)
+                then Some (acc @ stmts)
+                else flatDo tail dst (acc @ stmts)
             | _ -> None
-        match coreToLowE ctx rhs with
-        | lowered when (scratchCall lowered []).IsSome ->
-            let (stmts, dstR) = optGet (scratchCall lowered [])
+        let outer = ctx.SretDst
+        ctx.SretDst <- None
+        let lowered0 = coreToLowE ctx rhs
+        let mine = ctx.SretDst
+        ctx.SretDst <- outer
+        match lowered0 with
+        | lowered when mine.IsSome && (flatDo lowered (optGet mine) []).IsSome ->
+            let stmts = optGet (flatDo lowered (optGet mine) [])
+            let dstR = wReg (optGet mine)
             stmts
             @ (fields |> List.map (fun (fn, off, vty, kind) ->
                     let (sty, _) = optGet (storLTy kind)
@@ -9823,6 +10829,12 @@ and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
 and private boundsOn : bool =
     System.Environment.GetEnvironmentVariable "FPP_NO_BOUNDS" <> "1"
 
+/// FPP_NO_PROOF=1: emit EVERY check, trusting nothing the proof pass marked.
+/// A diagnostic, not a mode — it separates "the analysis proved something
+/// false" from "the emitted code is wrong for another reason".
+and private noProof : bool =
+    System.Environment.GetEnvironmentVariable "FPP_NO_PROOF" = "1"
+
 /// The bounds check: one UNSIGNED compare against the length word, which
 /// rejects a negative index in the same test. The array must already be in
 /// a register — every access site binds it before computing the address, so
@@ -9830,15 +10842,16 @@ and private boundsOn : bool =
 /// Would this access carry a check? Asked BEFORE the address shape is
 /// chosen, so it must not move the counters — boundsGuard does that.
 and private boundsGuardPeek (ctx : LowCtx) (node : Expr) : LStmt list =
-    if not boundsOn || (refMapTryFind safeIdx node).IsSome then [] else [ LTrap ]
+    if not boundsOn || ((not noProof) && (refMapTryFind safeIdx node).IsSome) then [] else [ LTrap ]
 
 and private boundsGuard (ctx : LowCtx) (node : Expr) (baseR : int) (idxR : int) : LStmt list =
     if not boundsOn then []
-    elif (refMapTryFind safeIdx node).IsSome then
+    elif (not noProof) && (refMapTryFind safeIdx node).IsSome then
         boundsElided <- boundsElided + 1
         []
     else
         boundsEmitted <- boundsEmitted + 1
+        dictSet boundsSites (printExpr node) true
         if System.Environment.GetEnvironmentVariable "FPP_BOUNDS_DUMP" = "1" then
             eprintfn "OOBSITE %s" (printExpr node)
         ctx.OobUsed <- true
@@ -9943,6 +10956,7 @@ and private lowTypeTest (ctx : LowCtx) (tn : string) (v : LExpr) : LExpr =
 
 let private lowOpIns (op : LOp) : string =
     match op with
+    | SelV -> "select"
     | AddW -> "i32.add"
     | SubW -> "i32.sub"
     | MulW -> "i32.mul"
@@ -10677,6 +11691,13 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
     | LCallVoidS (sym, args) ->
         for a in args do emitLowE f a
         callf f sym
+    // a CONSTANT-TRUE if with no else is a statement GROUP, not a branch:
+    // `lowStructBind` answers a list where one statement is wanted, and
+    // `LIf (LConstW 1, many, [])` is how that list travels. Emitting a real
+    // wasm block for it cost every by-value struct binding a branch — ten of
+    // them per iteration in the box-extend loop.
+    | LIf (LConstW 1, t, []) ->
+        for s in t do emitLowS f s
     | LIf (c, t, el) ->
         emitLowE f c; ifE f
         for s in t do emitLowS f s
@@ -10758,9 +11779,9 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | EIfaceCall (_, _, r, xs) -> preRecGroups ctx r; List.iter (preRecGroups ctx) xs
     | _ -> ()
 
-let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (structPlan : string option list) (retStruct : string option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
+let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<string, string>) (isInit : bool) (sig_ : (LTy list * LTy) option) (structPlan : string option list) (byrefPlan : bool list) (retStruct : string option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
     curFnDbg <- dbgName
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SretDst = None; BrPays = brPays; BrPost = []; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
     // var, recorded in ctx.Witness so a generic aggregate can read the element
     // type's witness. Regular params follow.
@@ -10780,14 +11801,40 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     // expand ONLY when the declared signature says so: a vtable-reachable
     // member keeps the uniform one-pointer-per-parameter shape, and emitting
     // fields into it would read parameters the type does not have
-    let planWidth = paramPlan0 |> List.sumBy (fun (_, sfs) -> match sfs with Some fs -> List.length fs | None -> 1)
+    // a BYREF parameter is ONE value wide (its pointer), not its leaves. This
+    // width is checked against the registered signature, and counting leaves
+    // for a byref parameter made the two disagree — the fallback then dropped
+    // EVERY struct parameter back to one word while the signature still said
+    // four, so the locals and the wasm parameter types drifted apart.
+    let planWidth =
+        paramPlan0
+        |> List.mapi (fun i (_, sfs) ->
+            let isBr =
+                List.length byrefPlan = List.length paramPlan0
+                && (match List.tryItem i byrefPlan with Some b -> b | None -> false)
+            match sfs with
+            | Some _ when isBr -> 1
+            | Some fs -> List.length fs
+            | None -> 1)
+        |> List.sum
     let paramPlan =
         match sig_ with
         | Some (paramTys, _) when List.length paramTys = planWidth -> paramPlan0
         | _ -> ps |> List.map (fun pv -> pv, None)
+    // a BYREF parameter arrives as ONE pointer; its leaves are copied into
+    // registers by the preamble below. They cannot be allocated here: wasm
+    // wants every parameter before any local, and these are locals.
+    let byrefBinds = vecNew<VarId * (string * int * LTy * string) list * int> ()
     let pnames =
-        paramPlan |> List.collect (fun (pv, sfs) ->
+        paramPlan |> List.mapi (fun i (pv, sfs) ->
+            let isBr =
+                List.length byrefPlan = List.length paramPlan
+                && (match List.tryItem i byrefPlan with Some b -> b | None -> false)
             match sfs with
+            | Some fields when isBr ->
+                let pr = freshReg ctx (key pv + "$ptr")
+                vecAdd byrefBinds (pv, fields, pr)
+                [ regNm (wReg pr) ]
             | Some fields ->
                 let fmap = dictNew<string, int> ()
                 let names =
@@ -10798,11 +11845,36 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
                 dictSet ctx.StructVars (key pv) ((match structTyName st (List.item (List.findIndex (fun (p2, _) -> key p2 = key pv) paramPlan) paramTypes) with Some tn -> tn | None -> ""), fmap)
                 names
             | None -> [ regNm (wReg (freshReg ctx (key pv))) ])
+        |> List.concat
     // the sret DESTINATION is a real parameter, so it must own a register:
     // without one the register numbering and the wasm local indices drift
     // apart and the first temp lands on a slot nobody declared
     let sretReg = match retStruct with Some _ when not isInit -> Some (freshReg ctx "$sret") | _ -> None
     let pnames = wnames @ pnames @ (match sretReg with Some r -> [ regNm (wReg r) ] | None -> [])
+    // THE COPY, in the preamble: one load per leaf out of the caller's slot.
+    // After this the callee owns its value exactly as the flattened ABI gave
+    // it — the pointer is dead, so nothing can alias through it, a store into
+    // the caller's struct cannot be observed, and every existing field-read
+    // path keeps working unchanged because StructVars still maps to registers.
+    let byrefPreamble =
+        vecToList byrefBinds
+        |> List.collect (fun (pv, fields, pr) ->
+            let fmap = dictNew<string, int> ()
+            let stmts =
+                fields |> List.map (fun (fn, off, vty, kind) ->
+                    let r = freshTmpT ctx vty
+                    dictSet fmap fn r
+                    let (sty, _) = optGet (storLTy kind)
+                    LSet ({ Id = r; RTy = vty }, LLoad (sty, LGet (wReg pr), off)))
+            let tn =
+                match List.tryFindIndex (fun (p2, _) -> key p2 = key pv) paramPlan with
+                | Some idx ->
+                    (match List.tryItem idx paramTypes with
+                     | Some pt -> (match structTyName st pt with Some n -> n | None -> "")
+                     | None -> "")
+                | None -> ""
+            dictSet ctx.StructVars (key pv) (tn, fmap)
+            stmts)
     // this ctor's class-param witnesses (for the class ERecord it builds).
     ctx.ClassCtorWits <- witnessVars
     // a method of a Canon generic class reads its class-param witnesses off
@@ -10838,8 +11910,19 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
             // owns its typed field registers, an ordinary scalar one gets its
             // register retyped here
             let mutable rest = paramTys
+            // a BYREF struct parameter consumes ONE abi slot (its pointer),
+            // not its leaves — walking it as leaves shifted every following
+            // parameter's type by N-1 and retyped locals that were already
+            // correct (the validator caught it as an f64 local used as a
+            // store address)
+            let brIdx = ref 0
             for pv, sfs in paramPlan do
+                let isBr =
+                    List.length byrefPlan = List.length paramPlan
+                    && (match List.tryItem brIdx.Value byrefPlan with Some b -> b | None -> false)
+                brIdx.Value <- brIdx.Value + 1
                 match sfs with
+                | Some _ when isBr -> rest <- (match rest with _ :: more -> more | [] -> [])
                 | Some fields -> rest <- List.skip (min (List.length fields) (List.length rest)) rest
                 | None ->
                     (match rest with
@@ -10921,7 +12004,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     // transfer until the shadow stack ran off the end of memory
     let preamble =
         (if tailSpReg >= 0 && List.isEmpty rootParams then [ LSet (wReg tailSpReg, LGetGlobal "$sp") ] else [])
-        @ selfPreamble @ constPreamble
+        @ byrefPreamble @ selfPreamble @ constPreamble
     let bodyLow0 = if List.isEmpty preamble then bodyLow1 else LDo (preamble, bodyLow1)
     // a SCALAR result leaves the body unboxed and is parked in a typed
     // register across the scope exit. Parking it as a word meant boxing the
@@ -11131,7 +12214,7 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     // which construct in it lowered to a trap
     if System.Environment.GetEnvironmentVariable "FPP_LAM_DUMP" = lamName then
         eprintfn "LAM %s = %s" lamName (printExpr body)
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SretDst = None; BrPays = dictNew (); BrPost = []; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
     // GC: root the env AND a ref-typed argument on the shadow stack for the body's
@@ -11452,10 +12535,285 @@ let private inlinePrimWrappers (decls : Decl list) : Decl list =
             | DLet (r, v, sch, b) -> DLet (r, v, sch, go b)
             | other -> other)
 
+let private brOffPrepass (decls0 : Decl list) : Decl list * Dict<string, Dict<string, string>> =
+    let recs = dictNew<string, (string * string) list> ()
+    for d in decls0 do
+        match d with
+        | DRecord (n, _, fs, _) -> dictSet recs n fs
+        | _ -> ()
+    // 1. eligible callees, to a FIXPOINT: forwarding makes eligibility
+    // mutually recursive (`bumpTwice` forwards to `bump`), so start from
+    // every byref-payload param as a candidate and drop the ones whose body
+    // walk fails under the CURRENT set, until nothing changes. Monotone
+    // shrinking, so it terminates.
+    let candidates = dictNew<string, (int * VarId * string) list> ()
+    let bodies = dictNew<string, Expr> ()
+    for d in decls0 do
+        match d with
+        | DLet (_, v, _, ELam (ps, body)) ->
+            let entries =
+                ps
+                |> List.mapi (fun i (pv, psch) ->
+                    match brPayloadOf recs psch.Body with
+                    | Some pay -> Some (i, pv, pay)
+                    | None -> None)
+                |> List.choose (fun x -> x)
+            if not (List.isEmpty entries) then
+                dictSet candidates (key v) entries
+                dictSet bodies (key v) body
+        | _ -> ()
+    let elig = dictNew<string, (int * string) list> ()
+    for k, es in dictPairs candidates do
+        dictSet elig k (es |> List.map (fun (i, _, pay) -> (i, pay)))
+    let mutable eligChanged = true
+    while eligChanged do
+        eligChanged <- false
+        for k, es in dictPairs candidates do
+            match dictTryFind elig k with
+            | Some cur when not (List.isEmpty cur) ->
+                let body = optGet (dictTryFind bodies k)
+                let fwdOk (fe : Expr) (i : int) : bool =
+                    match fe with
+                    | EVar (g, _) | EVarI (g, _, _) ->
+                        (match dictTryFind elig (key g) with
+                         | Some ges -> ges |> List.exists (fun (j, _) -> j = i)
+                         | None -> false)
+                    | _ -> false
+                let keep =
+                    es
+                    |> List.filter (fun (i, pv, _) ->
+                        cur |> List.exists (fun (j, _) -> j = i)
+                        && brParamOk fwdOk (pv.Path, pv.Offset) body)
+                    |> List.map (fun (i, _, pay) -> (i, pay))
+                if List.length keep <> List.length cur then
+                    eligChanged <- true
+                    if List.isEmpty keep then dictRemove elig k
+                    else dictSet elig k keep
+            | _ -> ()
+    // forwarded payloads must MATCH: byref<T> unifies the two ends, so a
+    // mismatch cannot type — but a mismatch here would be silent memory
+    // corruption, so it is verified rather than assumed
+    let mutable payChanged = true
+    while payChanged do
+        payChanged <- false
+        for k, _ in dictPairs elig do
+            let body = optGet (dictTryFind bodies k)
+            let es = optGet (dictTryFind candidates k)
+            let cur = optGet (dictTryFind elig k)
+            let mine = es |> List.filter (fun (i, _, _) -> cur |> List.exists (fun (j, _) -> j = i))
+            for (_, pv, pay) in mine do
+                let rec chk (e : Expr) : unit =
+                    (match e with
+                     | EApp (((EVar (g, _) | EVarI (g, _, _))), args) ->
+                         args
+                         |> List.iteri (fun i a ->
+                             match a with
+                             | (EVar (av, _) | EVarI (av, _, _)) when key av = key pv ->
+                                 (match dictTryFind elig (key g) with
+                                  | Some ges ->
+                                      (match ges |> List.tryPick (fun (j, gp) -> if j = i then Some gp else None) with
+                                       | Some gp when gp <> pay ->
+                                           // demote the RECEIVER'S param —
+                                           // the sound direction either way
+                                           dictSet elig (key g) (ges |> List.filter (fun (j, _) -> j <> i))
+                                           payChanged <- true
+                                       | _ -> ())
+                                  | None -> ())
+                             | _ -> ())
+                     | _ -> ())
+                    mapChildren (fun c -> chk c; c) e |> ignore
+                chk body
+    let paramPay = dictNew<string, Dict<string, string>> ()
+    for k, es in dictPairs candidates do
+        match dictTryFind elig k with
+        | Some cur ->
+            let d2 = dictNew<string, string> ()
+            for (i, pv, pay) in es do
+                if cur |> List.exists (fun (j, _) -> j = i) then dictSet d2 (key pv) pay
+            if vecLen (vecOfList (dictPairs d2)) > 0 then dictSet paramPay k d2
+        | None -> ()
+    // 2. rewrite callers: a hoisted view over a LOCAL whose every use is an
+    // argument at an eligible position becomes a `$broff` marker, and the
+    // view binding is dropped — BEFORE cellScan runs, so the local is never
+    // cell-ified for the view's sake
+    let occurs (k : string) (e : Expr) : int =
+        let n = vecNew<int> ()
+        vecAdd n 0
+        let rec go (x : Expr) : unit =
+            (match x with
+             | EVar (v, _) | EVarI (v, _, _) when key v = k -> vecSet n 0 (vecGet n 0 + 1)
+             | _ -> ())
+            mapChildren (fun c -> go c; c) x |> ignore
+        go e
+        vecGet n 0
+    let capturedElsewhere (tvKey : string) (e : Expr) : bool =
+        let hit = vecNew<bool> ()
+        vecAdd hit false
+        let rec go (inLam : bool) (x : Expr) : unit =
+            (match x with
+             | (EVar (v, _) | EVarI (v, _, _)) when inLam && key v = tvKey -> vecSet hit 0 true
+             | _ -> ())
+            match x with
+            | ELam (_, b) -> go true b
+            | _ -> mapChildren (fun c -> go inLam c; c) x |> ignore
+        go false e
+        vecGet hit 0
+    let rewriteBody (fnKey : string) (top : Expr) : Expr =
+        let rec rw (locals : Dict<string, bool>) (e : Expr) : Expr =
+            match e with
+            | ELet (r, vw, vsch,
+                    (ERecord ("ByRefView",
+                              [ ("Get", ELam ([ _ ], ((EVar (tv, _) | EVarI (tv, _, _)) as getBody)))
+                                ("Set", ELam ([ (nv, _) ], EAssign (tv2, (EVar (nv2, _) | EVarI (nv2, _, _))))) ]) as viewRec),
+                    body) when
+                  key tv = key tv2 && key nv = key nv2
+                  && (dictTryFind locals (key tv)).IsSome
+                  && not (capturedElsewhere (key tv) body)
+                  // the VIEW under a lambda would become a capture of the
+                  // local after substitution — the exact cell-ification the
+                  // rewrite exists to avoid
+                  && not (capturedElsewhere (key vw) body) ->
+                // dispatch ON THE KNOWN VIEW beta-reduces to the local
+                // itself: an INLINED byref callee leaves its dispatch shapes
+                // in the caller operating on the view var — through the
+                // ALIAS the inliner bound for the parameter (`let b = _brl1`)
+                // — where each Get materialised the payload (31 B per access
+                // on a V3). The view IS `{Get=λ.tv; Set=λv.tv<-v}`, so the
+                // read is tv and the write is an assignment — sound whether
+                // or not the view survives for other uses.
+                let aliases = dictNew<string, bool> ()
+                dictSet aliases (key vw) true
+                let mutable grew = true
+                while grew do
+                    grew <- false
+                    let rec scan (x : Expr) : unit =
+                        (match x with
+                         | ELet (_, av, _, (EVar (src, _) | EVarI (src, _, _)), _) when
+                               (dictTryFind aliases (key src)).IsSome
+                               && (dictTryFind aliases (key av)).IsNone ->
+                             dictSet aliases (key av) true
+                             grew <- true
+                         | _ -> ())
+                        mapChildren (fun c -> scan c; c) x |> ignore
+                    scan body
+                let isAlias (k : string) = (dictTryFind aliases k).IsSome
+                let readAny (x : Expr) =
+                    match x with
+                    | EIf (ETypeTest ("ByRefView", (EVar (v1, _) | EVarI (v1, _, _))), _, _) when isAlias (key v1) ->
+                        brReadShape (v1.Path, v1.Offset) x
+                    | _ -> false
+                let writeAny (x : Expr) =
+                    match x with
+                    | EIf (ETypeTest ("ByRefView", (EVar (v1, _) | EVarI (v1, _, _))), _, _) when isAlias (key v1) ->
+                        brWriteShape (v1.Path, v1.Offset) x
+                    | _ -> None
+                let rec reduce (x : Expr) : Expr =
+                    if readAny x then getBody
+                    else
+                        match writeAny x with
+                        | Some (_, rhs2) -> EAssign (tv, reduce rhs2)
+                        | None -> mapChildren reduce x
+                let body = reduce body
+                // an alias binding whose binder no longer occurs is dead —
+                // left in place it keeps the view alive and captured
+                let rec dropDead (x : Expr) : Expr =
+                    match x with
+                    | ELet (_, av, _, (EVar (src, _) | EVarI (src, _, _)), inner) when
+                          isAlias (key av) && isAlias (key src) ->
+                        let inner2 = dropDead inner
+                        if occurs (key av) inner2 = 0 then inner2
+                        else
+                            match x with
+                            | ELet (r2, _, sc2, rhs2, _) -> ELet (r2, av, sc2, rhs2, inner2)
+                            | _ -> x
+                    | other -> mapChildren dropDead other
+                let body = dropDead body
+                // every REMAINING use of the view must be a direct argument
+                // at an eligible position of a DIFFERENT function (a self
+                // tail call never returns, so there is no frame to reload
+                // into)
+                let total = occurs (key vw) body
+                let convertible = vecNew<int> ()
+                vecAdd convertible 0
+                let rec count (x : Expr) : unit =
+                    (match x with
+                     | EApp ((EVar (f, _) | EVarI (f, _, _)), args) when key f <> fnKey ->
+                         (match dictTryFind elig (key f) with
+                          | Some entries ->
+                              args
+                              |> List.iteri (fun i a ->
+                                  match a with
+                                  | EVar (av, _) | EVarI (av, _, _) when
+                                        key av = key vw
+                                        && entries |> List.exists (fun (j, _) -> j = i) ->
+                                      vecSet convertible 0 (vecGet convertible 0 + 1)
+                                  | _ -> ())
+                          | None -> ())
+                     | _ -> ())
+                    mapChildren (fun c -> count c; c) x |> ignore
+                count body
+                // total = 0 is the PURE-REDUCTION case (every dispatch
+                // reduced, an inlined callee) — the view must be dropped
+                // then too, or its lambdas keep capturing the local and
+                // cellScan puts it in a heap cell after all
+                if vecGet convertible 0 = total then
+                    let rec sub (x : Expr) : Expr =
+                        match x with
+                        | EApp ((EVar (f, _) | EVarI (f, _, _)) as fe, args) when
+                              key f <> fnKey && (dictTryFind elig (key f)).IsSome ->
+                            let entries = optGet (dictTryFind elig (key f))
+                            EApp (fe,
+                                  args
+                                  |> List.mapi (fun i a ->
+                                      match a with
+                                      | EVar (av, avsch) when
+                                            key av = key vw
+                                            && entries |> List.exists (fun (j, _) -> j = i) ->
+                                          let pay = entries |> List.pick (fun (j, pp) -> if j = i then Some pp else None)
+                                          EApp (EUnknown ("$broff:" + pay), [ EVar (tv, avsch) ])
+                                      | EVarI (av, avsch, ii) when
+                                            key av = key vw
+                                            && entries |> List.exists (fun (j, _) -> j = i) ->
+                                          let pay = entries |> List.pick (fun (j, pp) -> if j = i then Some pp else None)
+                                          EApp (EUnknown ("$broff:" + pay), [ EVarI (tv, avsch, ii) ])
+                                      | other -> sub other))
+                        | other -> mapChildren sub other
+                    // drop the view binding entirely; its lambdas never
+                    // existed, so the local stays a register
+                    rw locals (sub body)
+                else ELet (r, vw, vsch, viewRec, rw locals body)
+            | ELet (r, v, sc, rhs, b) ->
+                let rhs2 = rw locals rhs
+                dictSet locals (key v) true
+                ELet (r, v, sc, rhs2, rw locals b)
+            | other -> mapChildren (rw locals) other
+        rw (dictNew<string, bool> ()) top
+    let out =
+        decls0
+        |> List.map (fun d ->
+            match d with
+            | DLet (r, v, sch, ELam (ps, body)) ->
+                let b2 = rewriteBody (key v) body
+                if System.Environment.GetEnvironmentVariable "FPP_BROFF_DBG" = "1" && not (System.Object.ReferenceEquals (b2, body)) then
+                    eprintfn "BROFF %s = %s" v.Name (printExpr b2)
+                DLet (r, v, sch, ELam (ps, b2))
+            | DLet (r, v, sch, body) ->
+                let b2 = rewriteBody (key v) body
+                if System.Environment.GetEnvironmentVariable "FPP_BROFF_DBG" = "1" && not (System.Object.ReferenceEquals (b2, body)) then
+                    eprintfn "BROFF %s = %s" v.Name (printExpr b2)
+                DLet (r, v, sch, b2)
+            | other -> other)
+    out, paramPay
+
 let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
-    let decls0 = inlinePrimWrappers decls1
+    let decls0pre = inlinePrimWrappers decls1
+    // byref-as-stack-offset: MUST run before cellScan (inside the St
+    // construction below) — dropping a view before the scan is what keeps
+    // its local out of a cell
+    let decls0, brParamPay = brOffPrepass decls0pre
     boundsEmitted <- 0
     boundsElided <- 0
+    for k, _ in dictPairs boundsSites do dictRemove boundsSites k
     globalArrLen <- if boundsOn then buildArrLen decls0 else Map.empty
     globalIntLit <-
         if not boundsOn then Map.empty
@@ -11562,7 +12920,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew (); CasePod = dictNew (); UnionFlat = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
-          FuncRetStruct = dictNew (); FuncParamPlan = dictNew (); TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
+          FuncRetStruct = dictNew (); FuncParamPlan = dictNew (); FuncParamByRef = dictNew (); BrParamPay = brParamPay; TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           FieldOwnerOf = dictNew ()
           GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
@@ -11653,6 +13011,17 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         match d with
         | DRecord (n, _, fs, true) -> dictSet st.RecFieldTys n fs
         | _ -> ()
+    // a struct-CLASS that carries a vtable stays on the heap path: the inline
+    // value form has no header for a dispatch slot, and treating one as a
+    // value type left the adaptive suite with "no vtable entry". Interfaces
+    // and a base class are both disqualifying; a plain `[<Struct>]` class
+    // with neither is an ordinary value type.
+    let vtableClasses = dictNew<string, bool> ()
+    for d in decls0 do
+        match d with
+        | DClass (n, bse, _, impls) when not (List.isEmpty impls) || bse.IsSome ->
+            dictSet vtableClasses n true
+        | _ -> ()
     // inline value-type layout: a record with >=2 fields and >=1 scalar field,
     // not a class. Scalars pack raw from HDR (each its storage width); ref/word
     // fields follow (4 bytes each). The word index where refs begin is the
@@ -11666,8 +13035,27 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         // POD form whose FK_TAGGED tracer scans the ref suffix uniformly — that
         // chased an even int. Such records fall to the heap path, where lowObjR
         // builds precise witness-driven refoffs. Concrete records are unaffected.
-        | DRecord (n, _, fs, _) when
-                List.length fs >= 2 && (dictTryFind classNames n).IsNone
+        // "not a class" EXCEPT a `[<Struct>]` one. `[<Struct>] type V3(x, y, z)`
+        // is a value type written the other way F# offers, and its storage is
+        // the constructor's parameters — the ctor body already builds an
+        // ERecord of exactly those fields. Excluding it left the whole
+        // by-value ABI unreachable for that spelling: every construction
+        // allocated (64 bytes an iteration where the record spelling
+        // allocates none), which was the whole of its ~10x (KNOWN-ISSUES #11).
+        | DRecord (n, ps, fs, isStruct) when
+                List.length fs >= 2
+                && ((dictTryFind classNames n).IsNone
+                    // a struct-CLASS joins on stricter terms than a record:
+                    // no type parameters, no vtable, and every field a SCALAR.
+                    // A ref-carrying one reaches the runtime as an interned
+                    // shape rather than a class instance, and an interface
+                    // dispatch on it then finds no vtable row ("no vtable
+                    // entry (tid …)" in the adaptive suite). The spelling this
+                    // exists for — `[<Struct>] type V3(x, y, z : float)` — is
+                    // all scalars.
+                    || (isStruct && (dictTryFind vtableClasses n).IsNone
+                        && List.isEmpty ps
+                        && fs |> List.forall (fun (_, ty) -> (storLTy ty).IsSome)))
                 && not (fs |> List.exists (fun (_, ty) -> ty.StartsWith "'" && not (ty.Contains "[") && not (ty.Contains "<"))) ->
             // a nested struct counts as a VALUE field: `{ Lo : V2d; Hi : V2d }`
             // has no scalar of its own and must still lay out inline
@@ -11768,20 +13156,62 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     let classDecls = decls0 |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
     let interfaceDecls = decls0 |> List.choose (fun d -> match d with DInterface (n, ms) -> Some (n, ms) | _ -> None)
     let bareIface = bareIfaceOf
-    let baseOf (n : string) = classDecls |> List.tryPick (fun (cn, b, _, _) -> if cn = n then b else None)
+    // Indexed by NAME, keeping every declaration under it in order: the
+    // walks below are `tryPick` over the whole list, and two declarations
+    // can share a name (a stamped clone beside its origin), where the
+    // first that answers wins. A dict of the first alone would drop the
+    // second's answer.
+    //
+    // This is what `slotImpl` costs without it: a scan of every class
+    // declaration per chain step, run once per (class, vtable slot) pair,
+    // so O(classes^2 x slots) — 1.34 s of a 21 s fpp.base build, 19% of
+    // the whole emission phase.
+    let classByName = dictNew<string, (string * string option * (string * VarId) list * (string * (string * VarId) list) list) list> ()
+    for (cn, b, own, impls) in classDecls do
+        match dictTryFind classByName cn with
+        | Some ds -> dictSet classByName cn (ds @ [ cn, b, own, impls ])
+        | None -> dictSet classByName cn [ cn, b, own, impls ]
+    let declsNamed (n : string) =
+        match dictTryFind classByName n with
+        | Some ds -> ds
+        | None -> []
+    let baseOf (n : string) = declsNamed n |> List.tryPick (fun (_, b, _, _) -> b)
+    let chainMemo = dictNew<string, string list> ()
     let rec chainOf (n : string) : string list =
-        match baseOf n with Some b when b <> n -> n :: chainOf b | _ -> [ n ]
+        match dictTryFind chainMemo n with
+        | Some c -> c
+        | None ->
+            // seeded BEFORE the recursive step: a cyclic `inherit` would
+            // otherwise not terminate, and the type table merges names by
+            // bare name, which is exactly how a type became its own base
+            dictSet chainMemo n [ n ]
+            let c =
+                match baseOf n with
+                | Some b when b <> n -> n :: chainOf b
+                | _ -> [ n ]
+            dictSet chainMemo n c
+            c
+    // every class, filed under each of its ancestors, in declaration order
+    let subMemo = dictNew<string, Vec<string>> ()
+    for (cn, _, _, _) in classDecls do
+        for a in chainOf cn do
+            match dictTryFind subMemo a with
+            | Some v -> vecAdd v cn
+            | None ->
+                let v = vecNew<string> ()
+                vecAdd v cn
+                dictSet subMemo a v
     let subclassesOf (n : string) =
-        let derived = classDecls |> List.filter (fun (cn, _, _, _) -> List.contains n (chainOf cn)) |> List.map (fun (cn, _, _, _) -> cn)
-        if List.isEmpty derived then [ n ] else derived
+        match dictTryFind subMemo n with
+        | Some v -> vecToList v
+        | None -> [ n ]
     let slotImpl (cn : string) (owner : string) (mn : string) : VarId option =
         let fromIface =
             chainOf cn
             |> List.tryPick (fun c ->
-                classDecls
-                |> List.tryPick (fun (n2, _, _, impls) ->
-                    if n2 <> c then None
-                    else impls |> List.tryPick (fun (i, ms) -> if bareIface i = owner then ms |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None) else None)))
+                declsNamed c
+                |> List.tryPick (fun (_, _, _, impls) ->
+                    impls |> List.tryPick (fun (i, ms) -> if bareIface i = owner then ms |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None) else None)))
         match fromIface with
         | Some v -> Some v
         | None ->
@@ -11792,10 +13222,9 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             if List.contains owner (chainOf cn) then
                 chainOf cn
                 |> List.tryPick (fun c ->
-                    classDecls
-                    |> List.tryPick (fun (n2, _, own, _) ->
-                        if n2 <> c then None
-                        else own |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None)))
+                    declsNamed c
+                    |> List.tryPick (fun (_, _, own, _) ->
+                        own |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None)))
             else None
     let declaredMemberSlots =
         decls0
@@ -11955,9 +13384,43 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 // parameter into the instance's field, and that path still
                 // wants the whole value.
                 let plainFn = true
+                // which of those by-value parameters cross as a POINTER
+                let byrefs =
+                    if not byrefOn then plan |> List.map (fun _ -> false)
+                    else
+                        plan |> List.map (fun tn ->
+                            match tn with
+                            | Some n ->
+                                (match structAbiOf st n with
+                                 | Some fs -> List.length fs >= byrefMin
+                                 | None -> false)
+                            | None -> false)
+                // ... and the signature that follows from it: one i32 in place
+                // of that parameter's leaves
+                let sig_ =
+                    if byrefs |> List.exists (fun b -> b) then
+                        let ats = argTys s.Body (List.length ps)
+                        let ptys =
+                            List.map2 (fun (t, tn) br ->
+                                if br then [ W ]
+                                else
+                                    match tn with
+                                    | Some n ->
+                                        (match structAbiOf st n with
+                                         | Some fs -> fs |> List.map (fun (_, _, vty, _) -> vty)
+                                         | None -> [ abiTy t ])
+                                    | None -> [ abiTy t ])
+                                (List.zip ats plan) byrefs
+                            |> List.concat
+                        (ptys, snd sig_)
+                    else sig_
+                if System.Environment.GetEnvironmentVariable "FPP_BYREF_DBG" = "1"
+                   && byrefs |> List.exists (fun b -> b) then
+                    eprintfn "BYREF %s (%s) sig=%d plan=%d" (fn v) v.Name (List.length (fst sig_)) (List.length plan)
                 if plainFn || plan |> List.forall (fun x -> x.IsNone) then
                     dictSet st.FuncSig (key v) sig_
                     dictSet st.FuncParamPlan (key v) plan
+                    dictSet st.FuncParamByRef (key v) byrefs
                     // a struct RESULT comes back in registers too
                     (if plainFn then
                         let rec resultOf t n = if n <= 0 then t else (match prune t with TFun (_, r) -> resultOf r (n - 1) | _ -> t)
@@ -11972,6 +13435,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                     let ret = abiTy (resultOf s.Body (List.length ps))
                     if not (List.forall (fun t -> t = W) noStruct && ret = W) then
                         dictSet st.FuncSig (key v) (noStruct, ret)
+                        dictRemove st.FuncParamByRef (key v)
                         dictSet st.FuncParamPlan (key v) (plan |> List.map (fun _ -> None))
             | _ -> ()
             // the tupled member's signature is its ELEMENTS, whatever
@@ -11979,8 +13443,45 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             (match dictTryFind st.TupleParam (key v) with
              | Some binds ->
                  let rec resultOf t n = if n <= 0 then t else (match prune t with TFun (_, r) -> resultOf r (n - 1) | _ -> t)
-                 let ret = abiTy (resultOf s.Body (List.length ps))
-                 dictSet st.FuncSig (key v) (binds |> List.map (fun (_, bs) -> abiTy bs.Body), ret)
+                 let resT = resultOf s.Body (List.length ps)
+                 let ret = abiTy resT
+                 // A TUPLED STRUCT PARAMETER EXPANDS TOO. `abiTy` alone gives
+                 // a struct element a POINTER, so `add (a, b)` boxed both
+                 // arguments and its result while the curried twin passed
+                 // registers: 20M calls allocated 1.6 GB and ran 574 ms
+                 // against the curried 329. The design says structs are never
+                 // boxed on the GC heap in monomorphic code
+                 // (PLAN-STACK/REPRESENTATION); this is the tupled half of
+                 // that promise. A DISPATCH-reachable member keeps the
+                 // uniform shape, exactly as the curried path does.
+                 if (dictTryFind vtImpls (key v)).IsNone then
+                     let plan = binds |> List.map (fun (_, bs) -> structTyName st bs.Body)
+                     let ptys =
+                         List.map2 (fun (b : VarId * Scheme) tn ->
+                             let (_, bs) = b
+                             match tn with
+                             | Some n ->
+                                 (match structAbiOf st n with
+                                  | Some fs -> fs |> List.map (fun (_, _, vty, _) -> vty)
+                                  | None -> [ abiTy bs.Body ])
+                             | None -> [ abiTy bs.Body ]) binds plan
+                         |> List.concat
+                     dictSet st.FuncSig (key v) (ptys, ret)
+                     // this signature is FLATTENED; a byref decision taken by
+                     // the plain path above would leave the callee reading a
+                     // pointer where the type says leaves
+                     dictRemove st.FuncParamByRef (key v)
+                     dictSet st.FuncParamPlan (key v)
+                         (List.map2 (fun (b : VarId * Scheme) tn ->
+                             let (_, bs) = b
+                             match tn with
+                             | Some n when (structAbiOf st n).IsSome -> Some n
+                             | _ -> None) binds plan)
+                     (match structTyName st resT with
+                      | Some rn -> dictSet st.FuncRetStruct (key v) rn
+                      | None -> ())
+                 else
+                     dictSet st.FuncSig (key v) (binds |> List.map (fun (_, bs) -> abiTy bs.Body), ret)
              | None -> ())
             // a generic top-level fn takes a hidden witness pointer per quantified
             // type var (in Quantified order); a direct caller prepends them. The
@@ -12254,6 +13755,8 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
              | None, Some ty -> globalTypedMut m (gl v) (wtyName ty)
              | None, None -> globalI32Mut m (gl v) 0)
             let nm = "$linit" + string initN
+            if System.Environment.GetEnvironmentVariable "FPP_INIT_DUMP" = "1" then
+                eprintfn "INIT %d = %s (%s:%d)" initN v.Name v.Path v.Offset
             initN <- initN + 1
             vecAdd inits nm
             declFn m nm "$lt_v2v"
@@ -12385,10 +13888,20 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     st.ConstNext <- st.ConstNext + 4 * (nCid * st.NSlots)
     globalI32Mut m "$hp" (st.ConstNext + 65536)
     // the STRUCT-RETURN stack: a raw region the collector never scans, bumped
-    // down for the destination a by-value struct result is written into. 64 KB
-    // reserved above the constant pool; strictly LIFO, so nesting and
-    // recursion share it safely.
+    // down for the destination a by-value struct result is written into.
+    // Strictly LIFO, so nesting and recursion share it safely.
+    //
+    // Under GC this address is REPLACED at startup by a region the runtime
+    // owns ($ssptop/$sspbase). It cannot be a constant in the mutator's own
+    // address space: the merged reactor's static arrays live there too, and
+    // this one landed inside g_wasm_roots — so every struct return wrote its
+    // fields over shadow-stack root slots and the collector traced a double's
+    // bit pattern as a pointer. The initialiser here is the NON-GC layout,
+    // where the 64 KB above the constant pool really is the mutator's own.
     globalI32Mut m "$ssp" (st.ConstNext + 65536)
+    // low end of that region; a bump below it would corrupt whatever follows,
+    // so the struct-return sites compare against it rather than run on
+    globalI32Mut m "$ssplim" (st.ConstNext)
     // raised by a comparison walk that met an unordered (NaN) float pair; read
     // by the ordering operators, which are a PARTIAL order over structures
     globalI32Mut m "$unord" 0
@@ -12424,7 +13937,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // (markers live in decls0 — the reachability filter keeps only DLets)
     for d in decls0 do
         match d with
-        | DExport (v, nm) when nm <> "$jsimport" && (dictTryFind st.Funcs (key v)).IsSome ->
+        | DExport (v, nm) when nm <> "$jsimport" && nm <> "$inline" && (dictTryFind st.Funcs (key v)).IsSome ->
             exportFn m nm (fn v)
         | _ -> ()
     // runtime bodies
@@ -12685,7 +14198,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 match dictTryFind st.TupleParam (key v), body with
                 | Some binds, EMatch (_, [ (_, None, inner) ]) -> binds, inner
                 | _ -> ps, body
-            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncParamPlan (key v) with Some pl -> pl | None -> []) (dictTryFind st.FuncRetStruct (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps2 |> List.map fst) (ps2 |> List.map (fun (_, s) -> s.Body)) body2 (fun _ -> ())
+            emitFuncLow st m (fn v) (match dictTryFind st.BrParamPay (key v) with Some d -> d | None -> dictNew ()) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncParamPlan (key v) with Some pl -> pl | None -> []) (match dictTryFind st.FuncParamByRef (key v) with Some bl -> bl | None -> []) (dictTryFind st.FuncRetStruct (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps2 |> List.map fst) (ps2 |> List.map (fun (_, s) -> s.Body)) body2 (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -12703,7 +14216,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 | Some ty -> Some ([], ty)
                 | None -> None
             if v.Name = "_it" then dictSet st.StmtInits (gl v) true
-            emitFuncLow st m (gl v) true initSig [] structG [] [] [] [] [] rhs (fun f ->
+            emitFuncLow st m (gl v) (dictNew ()) true initSig [] [] structG [] [] [] [] [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the
                 // dedicated $gstash global, then store into the root slot
                 match structG, (if gc then dictTryFind st.GlobalSlot (key v) else None) with
@@ -12745,6 +14258,11 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         // range (scratch slot 0 + one per constant) up front — the slots read 0
         // (skipped by the scanner) until filled below
         callf rf "$rootsbase"; gs rf "$roots"
+        // the struct-return stack moves into runtime-owned memory — see the
+        // note at its global: the compile-time address overlaps the reactor's
+        // static arrays once the two modules share one linear memory
+        callf rf "$ssptop"; gs rf "$ssp"
+        callf rf "$sspbase"; gs rf "$ssplim"
         // register the fixed slots (scratch/globals/constants) AND the shadow
         // stack that follows; the shadow pointer starts just past the fixed slots.
         // Must equal FPPRT_WASM_NROOTS in fpprt-wasm-shim.c — the shadow stack has
@@ -12923,6 +14441,7 @@ let private withStats (r : byte[] * string list) : byte[] * string list =
             boundsEmitted boundsElided
             (if boundsEmitted + boundsElided = 0 then 0
              else 100 * boundsElided / (boundsEmitted + boundsElided))
+        eprintfn "BOUNDSITES: %d" (List.length (dictPairs boundsSites))
     r
 let emitLinear (decls0 : Decl list) : byte[] * string list = withStats (emitLinearImpl decls0)
 let emitLinearLow (decls0 : Decl list) : byte[] * string list = withStats (emitLinearImpl decls0)

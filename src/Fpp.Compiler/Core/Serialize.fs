@@ -24,10 +24,17 @@ let rec private wr (sb : Vec<string>) (x : Sx) =
     | A a -> vecAdd sb a
     | S s ->
         vecAdd sb "\""
+        // the same one-allocation-per-CHARACTER shape the reader had: a
+        // string needing no escape is written whole
+        let mutable esc = false
         for c in s do
-            if c = '"' || c = '\\' then vecAdd sb ("\\" + string c)
-            elif c = '\n' then vecAdd sb "\\n"
-            else vecAdd sb (string c)
+            if c = '"' || c = '\\' || c = '\n' then esc <- true
+        if not esc then vecAdd sb s
+        else
+            for c in s do
+                if c = '"' || c = '\\' then vecAdd sb ("\\" + string c)
+                elif c = '\n' then vecAdd sb "\\n"
+                else vecAdd sb (string c)
         vecAdd sb "\""
     | L xs ->
         vecAdd sb "("
@@ -60,18 +67,35 @@ let parse (text : string) : Sx =
             L (vecToList items)
         elif charAt text i = '"' then
             i <- i + 1
-            let sb = vecNew<string> ()
+            // A literal with no escape in it IS a slice of the input. Built
+            // a character at a time it allocated one string PER CHARACTER
+            // and concatenated the lot: 429 ms of the 502 ms a prelude
+            // snapshot took to read back, and every .fppir paid it too.
+            // The escaped case is rare, and still walks.
+            let start = i
+            let mutable esc = false
             while i < n && charAt text i <> '"' do
-                if charAt text i = '\\' && i + 1 < n then
-                    (match charAt text (i + 1) with
-                     | 'n' -> vecAdd sb "\n"
-                     | c -> vecAdd sb (string c))
+                if charAt text i = '\\' then
+                    esc <- true
                     i <- i + 2
-                else
-                    vecAdd sb (string (charAt text i))
-                    i <- i + 1
+                else i <- i + 1
+            let raw = substr text start (i - start)
             i <- i + 1
-            S (String.concat "" (vecToList sb))
+            if not esc then S raw
+            else
+                let sb = vecNew<string> ()
+                let m = strLen raw
+                let mutable j = 0
+                while j < m do
+                    if charAt raw j = '\\' && j + 1 < m then
+                        (match charAt raw (j + 1) with
+                         | 'n' -> vecAdd sb "\n"
+                         | c -> vecAdd sb (string c))
+                        j <- j + 2
+                    else
+                        vecAdd sb (string (charAt raw j))
+                        j <- j + 1
+                S (String.concat "" (vecToList sb))
         else
             let start = i
             while i < n && charAt text i <> ' ' && charAt text i <> ')' && charAt text i <> '(' && charAt text i <> '\n' && charAt text i <> '\r' && charAt text i <> '\t' do i <- i + 1
@@ -80,9 +104,19 @@ let parse (text : string) : Sx =
 
 // ---- encoding -------------------------------------------------------------
 
+// While a PRELUDE snapshot is being written every variable it mentions is
+// collected, so the snapshot can carry each one's level and rigidity —
+// `encTy` names a variable by ID alone, which is all a package needs
+// (it re-numbers on the way in) and not enough for a cache that must
+// reproduce the compiler's state exactly.
+let mutable private varSink = dictNew<int, Var> ()
+let mutable private collectVars = false
+
 let rec private encTy (t : Type) : Sx =
     match prune t with
-    | TVar v -> L [ A "v"; A (string v.Id) ]
+    | TVar v ->
+        (if collectVars then dictSet varSink v.Id v)
+        L [ A "v"; A (string v.Id) ]
     | TCon (n, args) -> L (A "c" :: S n :: List.map encTy args)
     | TFun (a, b) -> L [ A "f"; encTy a; encTy b ]
     | TTuple ts -> L (A "t" :: List.map encTy ts)
@@ -202,20 +236,25 @@ let private encDef (full : string, d : Resolve.Definition) : Sx =
         | Resolve.DefField -> "f" | Resolve.DefModule -> "m" | _ -> "x"
     L [ S full; S d.Name; A kind; S d.Path; A (string d.Offset); A (string d.Length) ]
 
-/// A library: exports for the resolver, schemes for inference, decls for
-/// emission and (later) instantiation.
-let encodeLib (exports : (string * Resolve.Definition) list)
-              (schemes : (string * Scheme) list)
-              (decls : Decl list) : string =
-    toText (L [ A "fppir1"
-                L (A "x" :: List.map encDef exports)
-                L (A "s" :: (schemes |> List.map (fun (k, s) -> L [ S k; encScheme s ])))
-                L (A "d" :: List.map encDecl decls) ])
-
 // ---- decoding -------------------------------------------------------------
 
 let private freshVars = dictNew<string, Var> ()
+/// A PRELUDE snapshot restores variables under their ORIGINAL ids. A package
+/// cannot: two libraries would collide, which is why that path re-numbers
+/// and then rewrites the markers that name an id inside a string. The cache
+/// is a snapshot of ONE compiler run, so keeping the ids is both possible
+/// and necessary — a renumbered `$class:Num:One:#4` names nothing.
+let mutable private preludeMode = false
+let private preludeVars = dictNew<string, Var> ()
 let private varById (id : string) : Var =
+    if preludeMode then
+        match dictTryFind preludeVars id with
+        | Some v -> v
+        | None ->
+            let v : Var = { Id = int id; Level = 0; Link = None; Rigid = false }
+            dictSet preludeVars id v
+            v
+    else
     match dictTryFind freshVars id with
     | Some v -> v
     | None ->
@@ -383,10 +422,695 @@ let private decDef (x : Sx) : (string * Resolve.Definition) option =
         Some (full, d)
     | _ -> None
 
-let decodeLib (text : string) : (string * Resolve.Definition) list * (string * Scheme) list * Decl list =
+/// Rewrite `#<id>` markers in a decoded body to the ids `varById` handed out.
+///
+/// A class or operator marker spells its type variable by ID, inside a NAME
+/// (`*@#1`, `$class:Num:One:#1`) — text, not a Type node, so decoding rewrote
+/// the schemes and left the markers naming the PRODUCER's ids. At the consumer
+/// those ids belong to nothing, the stamper's substitution had no entry, and a
+/// packaged `let sq (x : 'a) : 'a when Num<'a> = x * x` kept `*@#1`: `sq 3`
+/// answered 0 and `sq 1.5` answered 1.5, while the same two files built as one
+/// project were right (KNOWN-ISSUES #4).
+let private remapMarkers (n : string) : string =
+    if not (n.Contains "#") then n
+    else
+        let out = vecNew<string> ()
+        let mutable i = 0
+        while i < n.Length do
+            if n.[i] = '#' then
+                let start = i
+                i <- i + 1
+                while i < n.Length && isDigit n.[i] do i <- i + 1
+                let old = n.Substring (start + 1, i - start - 1)
+                vecAdd out
+                    (if old = "" then "#"
+                     else
+                         match dictTryFind freshVars old with
+                         | Some (v : Var) -> "#" + string v.Id
+                         | None -> "#" + old)
+            else
+                vecAdd out (n.Substring (i, 1))
+                i <- i + 1
+        String.concat "" (vecToList out)
+
+let rec private remapDeclMarkers (e : Expr) : Expr =
+    let r = remapDeclMarkers
+    match e with
+    | EUnknown n -> EUnknown (remapMarkers n)
+    | EPrim (op, xs) -> EPrim (remapMarkers op, List.map r xs)
+    | ELam (ps, b) -> ELam (ps, r b)
+    | EApp (g, args) -> EApp (r g, List.map r args)
+    | ELet (rc, v, sc, rhs, b) -> ELet (rc, v, sc, r rhs, r b)
+    | EIf (a, b, c) -> EIf (r a, r b, r c)
+    | EMatch (sx, cs) -> EMatch (r sx, cs |> List.map (fun (p, g, b) -> p, Option.map r g, r b))
+    | ETuple xs -> ETuple (List.map r xs)
+    | EListLit xs -> EListLit (List.map r xs)
+    | ESeq xs -> ESeq (List.map r xs)
+    | ECtor (nm, sc, xs) -> ECtor (nm, sc, List.map r xs)
+    | ERecord (nm, fs) -> ERecord (nm, fs |> List.map (fun (k, v) -> k, r v))
+    | ERecordExt (nm, b, fs) -> ERecordExt (nm, r b, fs |> List.map (fun (k, v) -> k, r v))
+    | EField (b, fn, o) -> EField (r b, fn, o)
+    | EIfaceCall (i, m, recv, args) -> EIfaceCall (i, m, r recv, List.map r args)
+    | ECast (t, b, d) -> ECast (t, r b, d)
+    | ETypeTest (t, b) -> ETypeTest (t, r b)
+    | EFieldSet (b, fn, o, v) -> EFieldSet (r b, fn, o, r v)
+    | EWhile (c, b) -> EWhile (r c, r b)
+    | EAssign (v, b) -> EAssign (v, r b)
+    | EArray (nm, xs) -> EArray (nm, List.map r xs)
+    | EIndex (nm, a, i) -> EIndex (nm, r a, r i)
+    | EIndexSet (nm, a, i, v) -> EIndexSet (nm, r a, r i, r v)
+    | EArrayLen (nm, a) -> EArrayLen (nm, r a)
+    | EArrayCreate (nm, a, b) -> EArrayCreate (nm, r a, r b)
+    | EArrayPin (nm, a) -> EArrayPin (nm, r a)
+    | EArrayUnpin (nm, a) -> EArrayUnpin (nm, r a)
+    | EArrayBytes (nm, a) -> EArrayBytes (nm, r a)
+    | ETry (b, cs) -> ETry (r b, cs |> List.map (fun (p, g, x) -> p, Option.map r g, r x))
+    | other -> other
+
+
+
+// ---- the prelude snapshot -------------------------------------------------
+//
+// The prelude is parsed, resolved, inferred and lowered on EVERY invocation,
+// and it is the same work every time: 1.34 s of a hello-world's 2.89 s, 47%
+// of the whole build. This is that state, written once and read back.
+//
+// Three things make it safe to restore rather than recompute, and each is a
+// rule to keep:
+//
+//  * VARIABLE IDS ARE PRESERVED, including the id SUPPLY the run ended on.
+//    Class and operator markers name a variable by id inside a string
+//    (`$class:Num:One:#4`), so a renumbered snapshot names nothing — and a
+//    supply that restarts lower hands a PROJECT variable an id the prelude
+//    already used, which is the same bug one step later. Restoring the
+//    counter is what makes the emitted wasm byte-identical either way.
+//  * FIELDS ARE TAGGED, not positional. Two fields of the same type sitting
+//    next to each other (`ShowTypes`/`StrTypes`, `OrdDerive`/`ShowDerive`)
+//    would swap silently under a positional format, and the round-trip
+//    check below cannot see a symmetric swap.
+//  * IT IS VERIFIED BEFORE IT IS WRITTEN. `decExpr` answers `ELit LUnit`
+//    for anything it does not recognise, so a gap in the codec does not
+//    fail — it silently replaces code with unit. Re-encoding what was
+//    decoded and comparing the TEXT catches exactly that, and the snapshot
+//    is discarded rather than written when it does not match.
+
+type PreludeSnapshot =
+    { PIdSupply : int
+      /// hash of the prelude SOURCE this was made from — the reader checks it
+      PSrcHash : string
+      PImports : Dict<string, Resolve.Definition>
+      PMembers : Dict<string, Resolve.Definition>
+      PSchemes : Dict<string, Scheme>
+      PAliases : Dict<string, Var list * Type>
+      PFields : Dict<string, Infer.FieldInfo>
+      PIfaces : Dict<string, (string * int) list>
+      PBases : Dict<string, Var list * Type>
+      PImpls : Dict<string, string list>
+      PImplTys : Dict<string, (Var list * Type) list>
+      PStructTypes : Dict<string, bool>
+      PCtors : Dict<string, (int * Scheme) list>
+      PClasses : Classes.Tables
+      PInferred : Infer.InferResult
+      PBind : Resolve.BindResult }
+
+let private aI (i : int) : Sx = A (string i)
+let private aB (b : bool) : Sx = A (if b then "1" else "0")
+let private dB (x : Sx) : bool = match x with A "1" -> true | _ -> false
+let private dI (x : Sx) : int = match x with A a -> int a | _ -> 0
+let private dS (x : Sx) : string = match x with S t -> t | A t -> t | _ -> ""
+let private dL (x : Sx) : Sx list = match x with L xs -> xs | _ -> []
+
+/// Sorted by key: a snapshot must not depend on hash order, both so the
+/// round-trip check compares like with like and so the file is reproducible.
+let private encMap (enc : 'v -> Sx) (d : Dict<string, 'v>) : Sx =
+    L (dictPairs d
+       |> List.sortWith (fun (a, _) (b, _) -> compare a b)
+       |> List.map (fun (k, v) -> L [ S k; enc v ]))
+
+let private decMap (dec : Sx -> 'v) (x : Sx) : Dict<string, 'v> =
+    let d = dictNew<string, 'v> ()
+    for it in dL x do
+        match it with
+        | L [ S k; v ] -> dictSet d k (dec v)
+        | _ -> ()
+    d
+
+let private encVarP (v : Var) : Sx =
+    (if collectVars then dictSet varSink v.Id v)
+    A (string v.Id)
+
+let private decVarP (x : Sx) : Var = varById (dS x)
+let private encVarsP (vs : Var list) : Sx = L (List.map encVarP vs)
+let private decVarsP (x : Sx) : Var list = dL x |> List.map decVarP
+
+let private encKind (k : Resolve.DefKind) : Sx =
+    A (match k with
+       | Resolve.DefLet -> "l" | Resolve.DefParam -> "p" | Resolve.DefType -> "t"
+       | Resolve.DefCase -> "c" | Resolve.DefField -> "f" | Resolve.DefModule -> "m"
+       | Resolve.DefSelf -> "s" | Resolve.DefMember -> "b")
+
+let private decKind (x : Sx) : Resolve.DefKind =
+    match dS x with
+    | "l" -> Resolve.DefLet | "p" -> Resolve.DefParam | "t" -> Resolve.DefType
+    | "c" -> Resolve.DefCase | "f" -> Resolve.DefField | "m" -> Resolve.DefModule
+    | "s" -> Resolve.DefSelf | _ -> Resolve.DefMember
+
+/// Access IS carried, unlike the package encoding: a package surface is
+/// public by construction, the prelude's is not, and a private definition
+/// restored as public changes what a project may name.
+let private encDefP (d : Resolve.Definition) : Sx =
+    L [ S d.Name; encKind d.Kind; S d.Path; aI d.Offset; aI d.Length; aI d.Access ]
+
+let private decDefP (x : Sx) : Resolve.Definition =
+    match x with
+    | L [ S n; k; S p; o; l; ac ] ->
+        { Name = n; Kind = decKind k; Path = p; Offset = dI o; Length = dI l; Access = dI ac }
+    | _ -> { Name = "?"; Kind = Resolve.DefLet; Path = "?"; Offset = 0; Length = 0; Access = 0 }
+
+let private encVarsTy (vs : Var list, t : Type) : Sx = L [ encVarsP vs; encTy t ]
+let private decVarsTy (x : Sx) : Var list * Type =
+    match x with
+    | L [ vs; t ] -> decVarsP vs, decTy t
+    | _ -> [], TCon ("unit", [])
+
+let private encFieldInfo (f : Infer.FieldInfo) : Sx =
+    L [ S f.TypeName; encVarsP f.Params; encVarsP f.Quantified; encTy f.FieldType
+        (match f.DefKey with Some (p, o) -> L [ S p; aI o ] | None -> L [])
+        aB f.IsStatic; aI f.Optionals
+        L (f.ParamNames |> List.map S)
+        L (f.Constraints |> List.map encConstraint)
+        aI f.Access ]
+
+let private decFieldInfo (x : Sx) : Infer.FieldInfo =
+    match x with
+    | L [ S tn; ps; qs; ft; dk; st; op; pn; cs; ac ] ->
+        { TypeName = tn; Params = decVarsP ps; Quantified = decVarsP qs
+          FieldType = decTy ft
+          DefKey = (match dk with L [ S p; o ] -> Some (p, dI o) | _ -> None)
+          IsStatic = dB st; Optionals = dI op
+          ParamNames = dL pn |> List.map dS
+          Constraints = dL cs |> List.choose decConstraint
+          Access = dI ac }
+    | _ ->
+        { TypeName = "?"; Params = []; Quantified = []; FieldType = TCon ("unit", [])
+          DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []
+          Constraints = []; Access = 0 }
+
+let private encInstMember (m : Classes.InstMember) : Sx =
+    L [ S m.MPath; aI m.MOffset; S m.MName; aB m.MTakesUnit; aB m.MTupled
+        L (m.MInst |> List.map S) ]
+
+let private decInstMember (x : Sx) : Classes.InstMember =
+    match x with
+    | L [ S p; o; S n; tu; tp; inst ] ->
+        { MPath = p; MOffset = dI o; MName = n; MTakesUnit = dB tu; MTupled = dB tp
+          MInst = dL inst |> List.map dS }
+    | _ -> { MPath = "?"; MOffset = 0; MName = "?"; MTakesUnit = false; MTupled = false; MInst = [] }
+
+let private encInstanceDef (i : Classes.InstanceDef) : Sx =
+    L [ S i.Class; encVarsP i.Params; L (List.map encTy i.Head)
+        L (i.Assoc |> List.map (fun (n, t) -> L [ S n; encTy t ]))
+        L (List.map encConstraint i.Context)
+        L (i.Members |> List.map (fun (n, m) -> L [ S n; encInstMember m ]))
+        aB i.Builtin; S i.Path; aI i.Offset ]
+
+let private decInstanceDef (x : Sx) : Classes.InstanceDef =
+    match x with
+    | L [ S c; ps; hd; asc; ctx; ms; b; S p; o ] ->
+        { Class = c; Params = decVarsP ps; Head = dL hd |> List.map decTy
+          Assoc = dL asc |> List.choose (fun a -> match a with L [ S n; t ] -> Some (n, decTy t) | _ -> None)
+          Context = dL ctx |> List.choose decConstraint
+          Members = dL ms |> List.choose (fun a -> match a with L [ S n; m ] -> Some (n, decInstMember m) | _ -> None)
+          Builtin = dB b; Path = p; Offset = dI o }
+    | _ ->
+        { Class = "?"; Params = []; Head = []; Assoc = []; Context = []; Members = []
+          Builtin = false; Path = "?"; Offset = 0 }
+
+let private encClassDef (c : Classes.ClassDef) : Sx =
+    L [ S c.Name; encVarsP c.Params; L (c.ParamKinds |> List.map aI)
+        L (c.DotMembers |> List.map S); L (c.Assoc |> List.map S)
+        L (List.map encConstraint c.Supers)
+        L (c.Members |> List.map (fun (n, sc) -> L [ S n; encScheme sc ]))
+        S c.Path; aI c.Offset ]
+
+let private decClassDef (x : Sx) : Classes.ClassDef =
+    match x with
+    | L [ S n; ps; pk; dm; asc; sup; ms; S p; o ] ->
+        { Name = n; Params = decVarsP ps; ParamKinds = dL pk |> List.map dI
+          DotMembers = dL dm |> List.map dS; Assoc = dL asc |> List.map dS
+          Supers = dL sup |> List.choose decConstraint
+          Members = dL ms |> List.choose (fun a -> match a with L [ S mn; sc ] -> Some (mn, decScheme sc) | _ -> None)
+          Path = p; Offset = dI o }
+    | _ ->
+        { Name = "?"; Params = []; ParamKinds = []; DotMembers = []; Assoc = []
+          Supers = []; Members = []; Path = "?"; Offset = 0 }
+
+/// Instance ORDER within a class is preserved: selection ranks candidates by
+/// registration index, so a reordered table picks a different instance.
+let private encTables (t : Classes.Tables) : Sx =
+    L [ L [ A "classes"; encMap encClassDef t.Classes ]
+        L [ A "instances"
+            L (dictPairs t.Instances
+               |> List.sortWith (fun (a, _) (b, _) -> compare a b)
+               |> List.map (fun (k, v) -> L [ S k; L (vecToList v |> List.map encInstanceDef) ])) ]
+        L [ A "memberowner"; encMap S t.MemberOwner ]
+        L [ A "typepaths"
+            L (dictPairs t.TypePaths
+               |> List.sortWith (fun (a, _) (b, _) -> compare a b)
+               |> List.map (fun (k, v) -> L [ S k; L (vecToList v |> List.map S) ])) ] ]
+
+let private field (tag : string) (xs : Sx list) : Sx =
+    match xs |> List.tryPick (fun x -> match x with L (A t :: rest) when t = tag -> Some rest | _ -> None) with
+    | Some [ one ] -> one
+    | Some rest -> L rest
+    | None -> L []
+
+let private decTables (x : Sx) : Classes.Tables =
+    let xs = dL x
+    let t = Classes.newTables ()
+    for k, v in dictPairs (decMap decClassDef (field "classes" xs)) do dictSet t.Classes k v
+    for it in dL (field "instances" xs) do
+        match it with
+        | L [ S k; L vs ] ->
+            let nv = vecNew<Classes.InstanceDef> ()
+            for v in vs do vecAdd nv (decInstanceDef v)
+            dictSet t.Instances k nv
+        | _ -> ()
+    for k, v in dictPairs (decMap dS (field "memberowner" xs)) do dictSet t.MemberOwner k v
+    for it in dL (field "typepaths" xs) do
+        match it with
+        | L [ S k; L vs ] ->
+            let nv = vecNew<string> ()
+            for v in vs do vecAdd nv (dS v)
+            dictSet t.TypePaths k nv
+        | _ -> ()
+    t
+
+// InferResult is plain data — offsets and marker strings, no type graph —
+// so each field is a list of tuples and the only hazard is confusing two
+// of the same shape. Hence the tags.
+let private eIS (xs : (int * string) list) : Sx =
+    L (xs |> List.map (fun (i, s) -> L [ aI i; S s ]))
+let private dIS (x : Sx) : (int * string) list =
+    dL x |> List.choose (fun a -> match a with L [ i; s ] -> Some (dI i, dS s) | _ -> None)
+
+let private eDerive (xs : (string * string * int * bool * int list * (string * string list) list) list) : Sx =
+    L (xs |> List.map (fun (k, n, o, u, ps, es) ->
+        L [ S k; S n; aI o; aB u; L (ps |> List.map aI)
+            L (es |> List.map (fun (cn, cs) -> L [ S cn; L (cs |> List.map S) ])) ]))
+
+let private dDerive (x : Sx) : (string * string * int * bool * int list * (string * string list) list) list =
+    dL x |> List.choose (fun a ->
+        match a with
+        | L [ S k; S n; o; u; ps; es ] ->
+            Some (k, n, dI o, dB u, dL ps |> List.map dI,
+                  dL es |> List.choose (fun e -> match e with L [ S cn; cs ] -> Some (cn, dL cs |> List.map dS) | _ -> None))
+        | _ -> None)
+
+// Two of the snapshot's lists are most of its bytes — every expression's
+// type, and every resolved use in the prelude. As s-expressions each entry
+// is three or more NODES, and the cost of reading one back is the node
+// allocation, not the bytes. Packed into a single atom they are one slice
+// and a linear scan.
+//
+// Length prefixes rather than a separator: a type string can contain
+// anything, including whatever character looked safe to delimit with.
+let private packInt (sb : Vec<string>) (i : int) : unit =
+    vecAdd sb (string i)
+    vecAdd sb " "
+
+let private packStr (sb : Vec<string>) (t : string) : unit =
+    vecAdd sb (string (strLen t))
+    vecAdd sb ":"
+    vecAdd sb t
+
+/// A cursor over a packed atom: every reader here is a left-to-right scan.
+type private Cur = { Text : string; Len : int; mutable At : int }
+
+let private curNew (t : string) : Cur = { Text = t; Len = strLen t; At = 0 }
+
+let private takeInt (c : Cur) : int =
+    let mutable v = 0
+    let mutable neg = false
+    if c.At < c.Len && charAt c.Text c.At = '-' then
+        neg <- true
+        c.At <- c.At + 1
+    while c.At < c.Len && charAt c.Text c.At <> ' ' && charAt c.Text c.At <> ':' do
+        v <- v * 10 + (int (charAt c.Text c.At) - 48)
+        c.At <- c.At + 1
+    c.At <- c.At + 1
+    if neg then -v else v
+
+let private takeStr (c : Cur) : string =
+    let n = takeInt c
+    let r = substr c.Text c.At n
+    c.At <- c.At + n
+    r
+
+let private encExprTypes (xs : (int * int * string) list) : Sx =
+    let sb = vecNew<string> ()
+    for a, b, t in xs do
+        packInt sb a
+        packInt sb b
+        packStr sb t
+    S (String.concat "" (vecToList sb))
+
+let private decExprTypes (x : Sx) : (int * int * string) list =
+    let c = curNew (dS x)
+    let out = vecNew<int * int * string> ()
+    while c.At < c.Len do
+        let a = takeInt c
+        let b = takeInt c
+        vecAdd out (a, b, takeStr c)
+    vecToList out
+
+let private encResolutions (rs : Resolve.Resolution list) : Sx =
+    let sb = vecNew<string> ()
+    for r in rs do
+        packInt sb r.UseOffset
+        packInt sb r.UseLength
+        packInt sb r.Def.Offset
+        packInt sb r.Def.Length
+        packInt sb r.Def.Access
+        packStr sb (match encKind r.Def.Kind with A k -> k | _ -> "b")
+        packStr sb r.Def.Name
+        packStr sb r.Def.Path
+    S (String.concat "" (vecToList sb))
+
+let private decResolutions (x : Sx) : Resolve.Resolution list =
+    let c = curNew (dS x)
+    let out = vecNew<Resolve.Resolution> ()
+    while c.At < c.Len do
+        let uo = takeInt c
+        let ul = takeInt c
+        let dof = takeInt c
+        let dl = takeInt c
+        let ac = takeInt c
+        let k = decKind (A (takeStr c))
+        let nm = takeStr c
+        let pa = takeStr c
+        vecAdd out { UseOffset = uo; UseLength = ul
+                     Def = { Name = nm; Kind = k; Path = pa; Offset = dof; Length = dl; Access = ac } }
+    vecToList out
+
+let private encInferResult (r : Infer.InferResult) : Sx =
+    L [ L [ A "diagnostics"; eIS r.Diagnostics ]
+        L [ A "freshidents"; L (r.FreshIdents |> List.map aI) ]
+        L [ A "deftypes"; L (r.DefTypes |> List.map (fun (a, b, c) -> L [ aI a; aI b; S c ])) ]
+        L [ A "opkinds"; eIS r.OpKinds ]
+        L [ A "arrkinds"; eIS r.ArrKinds ]
+        L [ A "instsites"; L (r.InstSites |> List.map (fun (i, ss) -> L [ aI i; L (ss |> List.map S) ])) ]
+        L [ A "ordderive"; eDerive r.OrdDerive ]
+        L [ A "showderive"; eDerive r.ShowDerive ]
+        L [ A "showtypes"; eIS r.ShowTypes ]
+        L [ A "strtypes"; eIS r.StrTypes ]
+        L [ A "arbderive"; eDerive r.ArbDerive ]
+        L [ A "membersites"; eIS r.MemberSites ]
+        L [ A "ctorsites"; L (r.CtorSites |> List.map (fun (a, b) -> L [ aI a; aI b ])) ]
+        L [ A "classuses"; L (r.ClassUses |> List.map (fun (i, m) -> L [ aI i; encInstMember m ])) ]
+        L [ A "classpending"; eIS r.ClassPending ]
+        L [ A "existpack"
+            L (r.ExistPack |> List.map (fun (i, es) ->
+                L [ aI i; L (es |> List.map (fun (a, b, c, ds) -> L [ S a; aI b; S c; L (ds |> List.map S) ])) ])) ]
+        L [ A "existcases"; L (r.ExistCases |> List.map (fun (s, i) -> L [ S s; aI i ])) ]
+        L [ A "existmatch"; eIS r.ExistMatch ]
+        L [ A "dictuses"; L (r.DictUses |> List.map (fun (i, (a, b)) -> L [ aI i; aI a; aI b ])) ]
+        L [ A "optypes"; eIS r.OpTypes ]
+        L [ A "exprtypes"; encExprTypes r.ExprTypes ]
+        L [ A "fieldowners"; eIS r.FieldOwners ]
+        L [ A "compbuilders"; eIS r.CompBuilders ]
+        L [ A "compstatements"; L (r.CompStatements |> List.map aI) ] ]
+
+let private decInferResult (x : Sx) : Infer.InferResult =
+    let xs = dL x
+    { Diagnostics = dIS (field "diagnostics" xs)
+      FreshIdents = dL (field "freshidents" xs) |> List.map dI
+      DefTypes = dL (field "deftypes" xs) |> List.choose (fun a -> match a with L [ p; q; c ] -> Some (dI p, dI q, dS c) | _ -> None)
+      OpKinds = dIS (field "opkinds" xs)
+      ArrKinds = dIS (field "arrkinds" xs)
+      InstSites = dL (field "instsites" xs) |> List.choose (fun a -> match a with L [ i; ss ] -> Some (dI i, dL ss |> List.map dS) | _ -> None)
+      OrdDerive = dDerive (field "ordderive" xs)
+      ShowDerive = dDerive (field "showderive" xs)
+      ShowTypes = dIS (field "showtypes" xs)
+      StrTypes = dIS (field "strtypes" xs)
+      ArbDerive = dDerive (field "arbderive" xs)
+      MemberSites = dIS (field "membersites" xs)
+      CtorSites = dL (field "ctorsites" xs) |> List.choose (fun a -> match a with L [ p; q ] -> Some (dI p, dI q) | _ -> None)
+      ClassUses = dL (field "classuses" xs) |> List.choose (fun a -> match a with L [ i; m ] -> Some (dI i, decInstMember m) | _ -> None)
+      ClassPending = dIS (field "classpending" xs)
+      ExistPack =
+        dL (field "existpack" xs)
+        |> List.choose (fun a ->
+            match a with
+            | L [ i; es ] ->
+                Some (dI i,
+                      dL es |> List.choose (fun e ->
+                          match e with
+                          | L [ S p; q; S c; ds ] -> Some (p, dI q, c, dL ds |> List.map dS)
+                          | _ -> None))
+            | _ -> None)
+      ExistCases = dL (field "existcases" xs) |> List.choose (fun a -> match a with L [ s; i ] -> Some (dS s, dI i) | _ -> None)
+      ExistMatch = dIS (field "existmatch" xs)
+      DictUses = dL (field "dictuses" xs) |> List.choose (fun a -> match a with L [ i; p; q ] -> Some (dI i, (dI p, dI q)) | _ -> None)
+      OpTypes = dIS (field "optypes" xs)
+      ExprTypes = decExprTypes (field "exprtypes" xs)
+      FieldOwners = dIS (field "fieldowners" xs)
+      CompBuilders = dIS (field "compbuilders" xs)
+      CompStatements = dL (field "compstatements" xs) |> List.map dI }
+
+let private encBindResult (b : Resolve.BindResult) : Sx =
+    L [ L [ A "defs"; L (b.Definitions |> List.map encDefP) ]
+        L [ A "missing"; eIS b.Missing ]
+        L [ A "accesserrors"; eIS b.AccessErrors ]
+        L [ A "resolutions"; encResolutions b.Resolutions ]
+        L [ A "exports"; L (b.Exports |> List.map (fun (k, d) -> L [ S k; encDefP d ])) ]
+        L [ A "members"; L (b.Members |> List.map (fun (k, d) -> L [ S k; encDefP d ])) ] ]
+
+let private decBindResult (x : Sx) : Resolve.BindResult =
+    let xs = dL x
+    let kd (y : Sx) = match y with L [ S k; d ] -> Some (k, decDefP d) | _ -> None
+    { Definitions = dL (field "defs" xs) |> List.map decDefP
+      Missing = dIS (field "missing" xs)
+      AccessErrors = dIS (field "accesserrors" xs)
+      Resolutions = decResolutions (field "resolutions" xs)
+      Exports = dL (field "exports" xs) |> List.choose kd
+      Members = dL (field "members" xs) |> List.choose kd }
+
+let private preludeTag = "fppprelude1"
+
+let private encodeSnapshotSx (s : PreludeSnapshot) : Sx =
+    L [ A preludeTag
+        L [ A "idsupply"; aI s.PIdSupply ]
+        L [ A "srchash"; S s.PSrcHash ]
+        L [ A "imports"; encMap encDefP s.PImports ]
+        L [ A "members"; encMap encDefP s.PMembers ]
+        L [ A "schemes"; encMap encScheme s.PSchemes ]
+        L [ A "aliases"; encMap encVarsTy s.PAliases ]
+        L [ A "fields"; encMap encFieldInfo s.PFields ]
+        L [ A "ifaces"; encMap (fun ms -> L (ms |> List.map (fun (n, a) -> L [ S n; aI a ]))) s.PIfaces ]
+        L [ A "bases"; encMap encVarsTy s.PBases ]
+        L [ A "impls"; encMap (fun ss -> L (ss |> List.map S)) s.PImpls ]
+        L [ A "impltys"; encMap (fun ts -> L (ts |> List.map encVarsTy)) s.PImplTys ]
+        L [ A "structtypes"; encMap aB s.PStructTypes ]
+        L [ A "ctors"; encMap (fun cs -> L (cs |> List.map (fun (n, sc) -> L [ aI n; encScheme sc ]))) s.PCtors ]
+        L [ A "classes"; encTables s.PClasses ]
+        L [ A "inferred"; encInferResult s.PInferred ]
+        L [ A "bind"; encBindResult s.PBind ]
+        // LAST: every encoder above feeds the sink, so the variable table is
+        // only complete once they have all run
+        L [ A "vars"
+            L (dictPairs varSink
+               |> List.sortWith (fun (a, _) (b, _) -> compare a b)
+               |> List.map (fun (_, v) -> L [ aI v.Id; aI v.Level; aB v.Rigid ])) ] ]
+
+let private decodeSnapshotSx (x : Sx) : PreludeSnapshot option =
+    match x with
+    | L (A t :: xs) when t = preludeTag ->
+        let snap =
+            { PIdSupply = dI (field "idsupply" xs)
+              PSrcHash = dS (field "srchash" xs)
+              PImports = decMap decDefP (field "imports" xs)
+              PMembers = decMap decDefP (field "members" xs)
+              PSchemes = decMap decScheme (field "schemes" xs)
+              PAliases = decMap decVarsTy (field "aliases" xs)
+              PFields = decMap decFieldInfo (field "fields" xs)
+              PIfaces =
+                decMap (fun m -> dL m |> List.choose (fun a -> match a with L [ n; ar ] -> Some (dS n, dI ar) | _ -> None))
+                       (field "ifaces" xs)
+              PBases = decMap decVarsTy (field "bases" xs)
+              PImpls = decMap (fun m -> dL m |> List.map dS) (field "impls" xs)
+              PImplTys = decMap (fun m -> dL m |> List.map decVarsTy) (field "impltys" xs)
+              PStructTypes = decMap dB (field "structtypes" xs)
+              PCtors =
+                decMap (fun m -> dL m |> List.choose (fun a -> match a with L [ n; sc ] -> Some (dI n, decScheme sc) | _ -> None))
+                       (field "ctors" xs)
+              PClasses = decTables (field "classes" xs)
+              PInferred = decInferResult (field "inferred" xs)
+              PBind = decBindResult (field "bind" xs) }
+        // levels and rigidity, applied once every variable exists
+        for it in dL (field "vars" xs) do
+            match it with
+            | L [ i; lv; rg ] ->
+                let v = varById (dS i)
+                v.Level <- dI lv
+                v.Rigid <- dB rg
+            | _ -> ()
+        Some snap
+    | _ -> None
+
+/// Write a snapshot — and PROVE it reads back first. `decExpr` answers unit
+/// for a node it does not know, so a codec gap is silent; re-encoding what
+/// was decoded and comparing the text is what turns that into a refusal.
+/// Answers None when the snapshot does not survive the trip.
+let encodePrelude (s : PreludeSnapshot) : string option =
+    varSink <- dictNew<int, Var> ()
+    collectVars <- true
+    let text = toText (encodeSnapshotSx s)
+    collectVars <- false
+    let savedMode = preludeMode
+    let savedVars = dictPairs preludeVars
+    preludeMode <- true
+    for k, _ in savedVars do dictRemove preludeVars k
+    let again =
+        match decodeSnapshotSx (parse text) with
+        | Some back ->
+            varSink <- dictNew<int, Var> ()
+            collectVars <- true
+            let t2 = toText (encodeSnapshotSx back)
+            collectVars <- false
+            Some t2
+        | None -> None
+    for k, _ in dictPairs preludeVars do dictRemove preludeVars k
+    for k, v in savedVars do dictSet preludeVars k v
+    preludeMode <- savedMode
+    match again with
+    | Some t2 when t2 = text -> Some text
+    | _ -> None
+
+let decodePrelude (text : string) : PreludeSnapshot option =
+    let saved = preludeMode
+    preludeMode <- true
+    for k, _ in dictPairs preludeVars do dictRemove preludeVars k
+    let r = decodeSnapshotSx (parse text)
+    preludeMode <- saved
+    r
+
+/// What a library carries. Exports and schemes and decls are what it always
+/// carried; the TABLES are what it did not, and their absence is why a
+/// library was only usable for plain functions.
+///
+/// A class declared in a library (`class Real<'a>` in fpp.base) put its
+/// instances in the producer's class table and nowhere else, so the
+/// consumer met `$class:Real:Pi:float` — a marker naming an instance member
+/// — with no instance to resolve it against, and the backend stubbed the
+/// enclosing function. `--strict` named it; an ordinary build trapped at
+/// whichever global initializer touched it first. The same hole took type
+/// MEMBERS with it: `fields` is where `.Dot` on a library type is found.
+type LibContents =
+    { LExports : (string * Resolve.Definition) list
+      LSchemes : (string * Scheme) list
+      LDecls : Decl list
+      LFields : Dict<string, Infer.FieldInfo>
+      LClasses : Classes.Tables
+      LIfaces : Dict<string, (string * int) list>
+      LBases : Dict<string, Var list * Type>
+      LImpls : Dict<string, string list>
+      LImplTys : Dict<string, (Var list * Type) list>
+      LStructTypes : Dict<string, bool>
+      LCtors : Dict<string, (int * Scheme) list>
+      LAliases : Dict<string, Var list * Type> }
+
+let emptyLib () : LibContents =
+    { LExports = []; LSchemes = []; LDecls = []
+      LFields = dictNew<string, Infer.FieldInfo> ()
+      LClasses = Classes.newTables ()
+      LIfaces = dictNew<string, (string * int) list> ()
+      LBases = dictNew<string, Var list * Type> ()
+      LImpls = dictNew<string, string list> ()
+      LImplTys = dictNew<string, (Var list * Type) list> ()
+      LStructTypes = dictNew<string, bool> ()
+      LCtors = dictNew<string, (int * Scheme) list> ()
+      LAliases = dictNew<string, Var list * Type> () }
+
+/// A library: exports for the resolver, schemes and TABLES for inference,
+/// decls for emission and (later) instantiation.
+let encodeLib (c : LibContents) : string =
+    toText (L [ A "fppir2"
+                L (A "x" :: List.map encDef c.LExports)
+                L (A "s" :: (c.LSchemes |> List.map (fun (k, sc) -> L [ S k; encScheme sc ])))
+                L (A "d" :: List.map encDecl c.LDecls)
+                L [ A "fields"; encMap encFieldInfo c.LFields ]
+                L [ A "classes"; encTables c.LClasses ]
+                L [ A "ifaces"; encMap (fun ms -> L (ms |> List.map (fun (n, ar) -> L [ S n; aI ar ]))) c.LIfaces ]
+                L [ A "bases"; encMap encVarsTy c.LBases ]
+                L [ A "impls"; encMap (fun ss -> L (ss |> List.map S)) c.LImpls ]
+                L [ A "impltys"; encMap (fun ts -> L (ts |> List.map encVarsTy)) c.LImplTys ]
+                L [ A "structtypes"; encMap aB c.LStructTypes ]
+                L [ A "ctors"; encMap (fun cs -> L (cs |> List.map (fun (n, sc) -> L [ aI n; encScheme sc ]))) c.LCtors ]
+                L [ A "aliases"; encMap encVarsTy c.LAliases ] ])
+
+/// Reads both shapes. `fppir1` — exports, schemes, decls and nothing else —
+/// is what every library built before the tables existed; it still loads,
+/// and still cannot resolve a class or a member declared inside it.
+let decodeLib (text : string) : LibContents =
+    // a TABLE section is `(tag value)` — one child, unwrapped
+    let named (xs : Sx list) (tag : string) : Sx =
+        match xs |> List.tryPick (fun x -> match x with L (A t :: rest) when t = tag -> Some rest | _ -> None) with
+        | Some [ one ] -> one
+        | Some rest -> L rest
+        | None -> L []
+    // a LIST section is `(tag item item ...)` and is VARIADIC, so it must
+    // never unwrap: a library with exactly one export, scheme or decl would
+    // otherwise hand back that item's children in its place — which is how
+    // a one-function package stopped resolving its own name
+    let section (xs : Sx list) (tag : string) : Sx list =
+        match xs |> List.tryPick (fun x -> match x with L (A t :: rest) when t = tag -> Some rest | _ -> None) with
+        | Some rest -> rest
+        | None -> []
+    let decls (xs : Sx list) =
+        section xs "d"
+        |> List.choose decDecl
+        |> List.map (fun d ->
+            match d with
+            | DLet (rc, v, sc, b) -> DLet (rc, v, sc, remapDeclMarkers b)
+            | other -> other)
+    let exportsOf (xs : Sx list) = section xs "x" |> List.choose decDef
+    let schemesOf (xs : Sx list) =
+        section xs "s"
+        |> List.choose (fun sx -> match sx with L [ S k; sch ] -> Some (k, decScheme sch) | _ -> None)
+    // spelled out rather than `{ emptyLib () with ... }`: copy-and-update
+    // over a CALL is not in the self-hosting subset — it reached Lower as an
+    // unresolved `BraceExpr` and the fixpoint stopped with "not lowerable:
+    // computation/sequence body", naming no line
     match parse text with
-    | L [ A "fppir1"; L (A "x" :: exports); L (A "s" :: schemes); L (A "d" :: decls) ] ->
-        exports |> List.choose decDef,
-        schemes |> List.choose (fun s -> match s with L [ S k; sch ] -> Some (k, decScheme sch) | _ -> None),
-        decls |> List.choose decDecl
-    | _ -> [], [], []
+    | L (A "fppir2" :: xs) ->
+        { LExports = exportsOf xs
+          LSchemes = schemesOf xs
+          LDecls = decls xs
+          LFields = decMap decFieldInfo (named xs "fields")
+          LClasses = decTables (named xs "classes")
+          LIfaces =
+            decMap (fun m -> dL m |> List.choose (fun e -> match e with L [ n; ar ] -> Some (dS n, dI ar) | _ -> None))
+                   (named xs "ifaces")
+          LBases = decMap decVarsTy (named xs "bases")
+          LImpls = decMap (fun m -> dL m |> List.map dS) (named xs "impls")
+          LImplTys = decMap (fun m -> dL m |> List.map decVarsTy) (named xs "impltys")
+          LStructTypes = decMap dB (named xs "structtypes")
+          LCtors =
+            decMap (fun m -> dL m |> List.choose (fun e -> match e with L [ n; sc ] -> Some (dI n, decScheme sc) | _ -> None))
+                   (named xs "ctors")
+          LAliases = decMap decVarsTy (named xs "aliases") }
+    | L (A "fppir1" :: xs) ->
+        { LExports = exportsOf xs
+          LSchemes = schemesOf xs
+          LDecls = decls xs
+          LFields = dictNew<string, Infer.FieldInfo> ()
+          LClasses = Classes.newTables ()
+          LIfaces = dictNew<string, (string * int) list> ()
+          LBases = dictNew<string, Var list * Type> ()
+          LImpls = dictNew<string, string list> ()
+          LImplTys = dictNew<string, (Var list * Type) list> ()
+          LStructTypes = dictNew<string, bool> ()
+          LCtors = dictNew<string, (int * Scheme) list> ()
+          LAliases = dictNew<string, Var list * Type> () }
+    | _ -> emptyLib ()

@@ -76,6 +76,21 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     let opens = vecNew<string> ()
     /// set by an `[<AutoOpen>]` attribute, consumed by the module it precedes
     let mutable pendingAutoOpen = false
+    /// set by a `[<RequireQualifiedAccess>]` attribute, consumed by the type
+    /// declaration it precedes
+    let mutable pendingRqa = false
+    /// the cases of every `[<RequireQualifiedAccess>]` type, keyed by the
+    /// DEFINITION they bind (path and offset), not by name: another type may
+    /// legitimately declare a case of the same name, and a bare use that
+    /// resolves to THAT one is fine.
+    ///
+    /// The cases stay bound bare, deliberately. Binding them qualified-only —
+    /// the obvious fix, and what enum members do — breaks qualified MATCHING,
+    /// because the qualified-case path resolves through the bare binding as
+    /// well; `match c with Colour.Red -> .. | Colour.Green -> ..` then took
+    /// the first arm for every value. So the name binds and the USE is
+    /// refused instead.
+    let rqaCaseKeys = dictNew<string, bool> ()
     // "TypeName.MemberName" -> def, and bare name -> every def with that
     // name (a use is disambiguated by the receiver type during inference)
     let memberDefs = dictNew<string, Definition> ()
@@ -237,7 +252,17 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | Some d -> Some d
             | None -> findQualified t.Text
         match picked with
-        | Some d -> record t d
+        | Some d ->
+            // `[<RequireQualifiedAccess>]` means exactly this: the name
+            // resolves, and naming it bare is refused. Left accepted, two
+            // such types declaring one case name bound the bare name to
+            // whichever was declared LAST — silently, and at the wrong type.
+            if d.Kind = DefCase
+               && (dictTryFind rqaCaseKeys (d.Path + ":" + string d.Offset)).IsSome then
+                vecAdd accessErrs
+                    (t.Offset,
+                     "'" + t.Text + "' is a case of a [<RequireQualifiedAccess>] type; write it qualified")
+            record t d
         | None ->
             // a lowercase bare name is a VALUE use; remember the miss and
             // judge it after the walk, when every export is known. The
@@ -493,6 +518,14 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      else
                          match lookupValue env t.Text with
                          | Some d when d.Kind = DefCase ->
+                             // same rule as in expression position, and only
+                             // for the genuinely BARE form: the qualified path
+                             // above resolves through this same binding, which
+                             // is why the cases stay bound bare at all
+                             if (dictTryFind rqaCaseKeys (d.Path + ":" + string d.Offset)).IsSome then
+                                 vecAdd accessErrs
+                                     (t.Offset,
+                                      "'" + t.Text + "' is a case of a [<RequireQualifiedAccess>] type; write it qualified")
                              record t d
                              env
                          | _ ->
@@ -1108,6 +1141,10 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | Some "private" -> dictSet privateOf d.Offset modulePath
             | Some "internal" -> dictSet internalOf d.Offset true
             | _ -> ()
+        // consumed HERE, whatever this declaration turns out to be, so the
+        // flag cannot leak onto a later type
+        let isRqa = pendingRqa
+        pendingRqa <- false
         let exportAcc (d : Definition) : unit =
             if declAccess = Some "private" then exportOwnOnly d else exportDef d
         match nameTok with
@@ -1137,6 +1174,8 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                          if isEnumMember then defineAs DefCase (typeName + "." + t.Text) t
                          else define DefCase t
                      markAccess d
+                     if isRqa && not isEnumMember then
+                         dictSet rqaCaseKeys (d.Path + ":" + string d.Offset) true
                      if not isEnumMember then
                          outer <- Map.add t.Text d outer
                      dictSet typeCases (typeName + "." + t.Text) d
@@ -1349,7 +1388,22 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 (match nameToks with
                  | t :: _ ->
                      let d = define DefModule t
-                     outer <- Map.add t.Text d outer
+                     // A MODULE DOES NOT SHADOW A VALUE of the same name.
+                     // F# keeps the two in different namespaces and a
+                     // value-position use finds the VALUE — which is why
+                     // `V3d.length` is an error there rather than a call:
+                     // `V3d` is the let-bound function, and a function has no
+                     // member `length`.
+                     //
+                     // Overwriting it here made the F# constructor-function
+                     // idiom (`let V3d (x,y,z)` beside `module V3d`) resolve
+                     // its own calls to the TYPE, so `V3d (3.0, 4.0, 0.0)`
+                     // built a zero record and every length came out 0 — with
+                     // no diagnostic. The generator in fpp.base writes exactly
+                     // that shape.
+                     (match Map.tryFind t.Text outer with
+                      | Some prev when prev.Kind = DefLet -> ()
+                      | _ -> outer <- Map.add t.Text d outer)
                      if atExportLevel then exportDef d
                  | [] -> ())
                 let saved = modulePath
@@ -1369,6 +1423,21 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 modulePath <- saved
                 if auto then
                     vecAdd opens full
+                    // RECORD it, so another file's `open Base` can bring a
+                    // nested `[<AutoOpen>] module Ops` into scope too. The
+                    // marker rides the exports table under a prefix, the way
+                    // `"type " + full` already does, because module-level
+                    // state would be shared by two workspaces type-checking
+                    // at once. Without it, `open Base` injected only Base's
+                    // DIRECT members and `dot` was unbound in the consumer
+                    // (KNOWN-ISSUES #9).
+                    let autoMark =
+                        { Name = segment; Kind = DefModule; Path = path
+                          Offset = 0; Length = 0; Access = 0 }
+                    dictSet ownExports ("autoopen " + full) autoMark
+                    // and into the EXPORTS the next file imports — ownExports
+                    // is this file's own view and never leaves it
+                    vecAdd exports ("autoopen " + full, autoMark)
                     // and into scope unqualified, the way `open` does
                     let prefix = full + "."
                     let injectAuto (e : Env) (tbl : Dict<string, Definition>) : Env =
@@ -1406,6 +1475,17 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     // shadowing earlier lets and earlier opens; later lets
                     // shadow these in turn.
                     let prefix = dotted + "."
+                    // the AUTO-OPENED submodules of what is being opened: their
+                    // members come into scope unqualified as well, which is the
+                    // whole point of the attribute
+                    let autoPrefixes = vecNew<string> ()
+                    let collectAuto (tbl : Dict<string, Definition>) =
+                        for k, _ in dictPairs tbl do
+                            if k.StartsWith "autoopen " then
+                                let m = substr k 9 (strLen k - 9)
+                                if m.StartsWith prefix then vecAdd autoPrefixes (m + ".")
+                    collectAuto imports
+                    collectAuto ownExports
                     let inject (e : Env) (tbl : Dict<string, Definition>) : Env =
                         let mutable acc = e
                         for full, d in dictPairs tbl do
@@ -1413,6 +1493,10 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                                 let rest = substr full (strLen prefix) (strLen full - strLen prefix)
                                 if not (rest.Contains ".") then
                                     acc <- Map.add rest d acc
+                            for ap in vecToList autoPrefixes do
+                                if full.StartsWith ap then
+                                    let rest = substr full (strLen ap) (strLen full - strLen ap)
+                                    if not (rest.Contains ".") then acc <- Map.add rest d acc
                         acc
                     inject (inject env imports) ownExports
             | AttributeList ->
@@ -1423,6 +1507,8 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 // name falls through to whatever else answers to it.
                 if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "AutoOpen") then
                     pendingAutoOpen <- true
+                if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "RequireQualifiedAccess") then
+                    pendingRqa <- true
                 env
             | TyParams -> env
             | _ -> local (fun () -> walkExpr env g) |> ignore; env

@@ -144,12 +144,53 @@ type ProjectResults =
       Aliases : Fpp.Prelude.Dict<string, Analysis.Types.Var list * Analysis.Types.Type>
       /// the prelude's own inference result — it is source like any other
       /// file, and its bodies use the classes it declares
+      /// carried so `fpp lib` can ship what the LIBRARY declared: these are
+      /// project-wide tables a consumer cannot rediscover from decls alone
+      Impls : Fpp.Prelude.Dict<string, string list>
+      ImplTys : Fpp.Prelude.Dict<string, (Analysis.Types.Var list * Analysis.Types.Type) list>
+      StructTypes : Fpp.Prelude.Dict<string, bool>
+      Ctors : Fpp.Prelude.Dict<string, (int * Analysis.Types.Scheme) list>
       BuiltinInfer : Analysis.Infer.InferResult }
 
 /// The prelude is a process-wide CONSTANT: parse, resolve and infer it once,
 /// then seed every project with COPIES of its tables. Without this every
 /// Workspace re-inferred ~1400 prelude lines, which the test suite (one
 /// Workspace per test) paid hundreds of times over.
+/// The prelude snapshot, as TEXT. The compiler library neither reads nor
+/// writes it — the host hands in whatever it found and takes back whatever
+/// was produced.
+///
+/// File IO does not belong here: `Workspace.fs` is COMPILED BY THIS
+/// COMPILER, and a host API the self-hosted build does not implement
+/// becomes a stub that takes its whole enclosing function with it. Reading
+/// the cache from here trapped the self-host at module init — the fixpoint
+/// caught it, nothing else did.
+module PreludeCache =
+    /// what the host loaded; "" for none
+    let mutable input : string = ""
+    /// what a MISS produced and the host should store; "" for nothing
+    let mutable output : string = ""
+    /// whether the host will actually STORE what a miss produces. OFF by
+    /// default, and not a micro-optimisation: building a snapshot nobody
+    /// reads costs a 2.4 MB string (three times over, for the round-trip
+    /// check) and everything it is built from. Under the WASM-HOSTED
+    /// compiler, which can store nothing, that ran the self-host out of
+    /// memory against wasm32's 2 GB — the fixpoint failed with "we have the
+    /// space but mmap didn't work" and no diagnostic anywhere else.
+    let mutable wanted : bool = false
+
+    /// FNV-1a over the prelude text, carried INSIDE the snapshot and checked
+    /// on the way in. The host keys its file by the compiler binary, which
+    /// cannot see a prelude edited underneath it.
+    let srcHash (t : string) : string =
+        let mutable a = 166136261
+        let mutable b = 97
+        for i in 0 .. strLen t - 1 do
+            let c = int (charAt t i)
+            a <- ((a ^^^ c) * 16777619) &&& 0x3FFFFFFF
+            b <- ((b * 31) + c) &&& 0x3FFFFFFF
+        string a + "x" + string b
+
 module private BuiltinCache =
     type Cached =
         { Parse : Parser.ParseResult
@@ -209,12 +250,54 @@ module private BuiltinCache =
             // the prelude preprocesses like any other source: `#if NATIVE`
             // is how it gives the fpprt leg real monitors while the
             // single-threaded oracle keeps the no-op truth
-            let bp = Parser.parse (fst (Fpp.Project.preprocess defines Builtin.source))
+            let src = fst (Fpp.Project.preprocess defines Builtin.source)
+            // the tree is always built: it is what LOWERING walks, and
+            // lowering is not cached (see below)
+            let bp = Parser.parse src
+            // the guard is HERE, not inside tryLoad: the self-hosted
+            // compiler may stub an unsupported host API, and a stub takes
+            // the whole enclosing function with it — so a disabled cache
+            // must not CALL into the disk path at all, only skip it
+            let wantHash = PreludeCache.srcHash src
+            match (if PreludeCache.input = "" then None
+                   else
+                       match Fpp.Core.Serialize.decodePrelude PreludeCache.input with
+                       // the host keys its file by the COMPILER binary, which
+                       // cannot notice a prelude edited underneath it — so the
+                       // snapshot carries its source's hash and is refused here
+                       | Some sn when sn.PSrcHash = wantHash -> Some sn
+                       | _ -> None) with
+            | Some snap ->
+                // the id supply is restored to where the run that wrote this
+                // left it, so a project variable minted next gets the id it
+                // would have got anyway
+                Analysis.Types.reserveIds snap.PIdSupply
+                { Parse = bp; Bind = snap.PBind; Inferred = snap.PInferred
+                  Imports = snap.PImports; Schemes = snap.PSchemes
+                  Aliases = snap.PAliases; Fields = snap.PFields
+                  Ifaces = snap.PIfaces; Bases = snap.PBases; Impls = snap.PImpls
+                  ImplTys = snap.PImplTys; StructTypes = snap.PStructTypes
+                  Ctors = snap.PCtors; Classes = snap.PClasses
+                  Members = snap.PMembers }
+            | None ->
             let bb = Analysis.Resolve.resolve Builtin.path imports bp.Root
             for full, d in bb.Exports do dictSet imports full d
             for k, d in bb.Members do dictSet members k d
             let binf =
                 Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases impls implTys structTypes ctors classes
+            // AFTER inference, so the mark covers every variable the prelude
+            // minted — including ones no table still mentions
+            (if not PreludeCache.wanted then () else
+             match Fpp.Core.Serialize.encodePrelude
+                       { PIdSupply = Analysis.Types.idSupplyMark ()
+                         PSrcHash = wantHash
+                         PImports = imports; PMembers = members; PSchemes = schemes
+                         PAliases = aliases; PFields = fields; PIfaces = ifaces
+                         PBases = bases; PImpls = impls; PImplTys = implTys
+                         PStructTypes = structTypes; PCtors = ctors; PClasses = classes
+                         PInferred = binf; PBind = bb } with
+             | Some t -> PreludeCache.output <- t
+             | None -> ())
             { Parse = bp; Bind = bb; Inferred = binf; Imports = imports
               Schemes = schemes; Aliases = aliases; Fields = fields
               Ifaces = ifaces; Bases = bases; Impls = impls; ImplTys = implTys
@@ -242,6 +325,12 @@ module private WasmLinGate =
 
 type Workspace() =
     let db = Db()
+    /// What a computation expression asked its builder for and did not get,
+    /// per file. Collected during the REWRITE — the only pass that knows
+    /// which control constructs a CE used — and merged into the file's
+    /// diagnostics, because the rewrite's own tokens are synthetic and the
+    /// missing-member check deliberately ignores those.
+    let ceDiagsByPath = dictNew<string, Fpp.Prelude.Vec<int * string>> ()
     // the ORACLE's view by default — the LSP and the tests see #if WASM
     // code; the CLI overrides per build target
     let mutable defines : string list = [ "WASM" ]
@@ -428,10 +517,73 @@ type Workspace() =
             let binf = cached.Inferred
             // linked libraries: exports feed the resolver, schemes feed inference
             for _, text in this.Libraries do
-                let exps, schs, _ = Fpp.Core.Serialize.decodeLib text
+                let lc = Fpp.Core.Serialize.decodeLib text
+                let exps = lc.LExports
+                let schs = lc.LSchemes
+                let lds = lc.LDecls
                 for full, d in exps do dictSet imports full d
                 for k, sch in schs do dictSet schemes k sch
+                // The TABLES a library declares. Without these a class or a
+                // type MEMBER declared inside the library is invisible: its
+                // instances live nowhere, so `$class:Real:Pi:float` resolves
+                // to nothing and the backend stubs whatever mentions it.
+                //
+                // The project's own entries WIN — these are merged first and
+                // only where the key is free, so a project may still declare
+                // its own type of the same name, exactly as it could when the
+                // library was referenced by source.
+                for k, v in dictPairs lc.LFields do
+                    if (dictTryFind fields k).IsNone then dictSet fields k v
+                for k, v in dictPairs lc.LIfaces do
+                    if (dictTryFind ifaces k).IsNone then dictSet ifaces k v
+                for k, v in dictPairs lc.LBases do
+                    if (dictTryFind bases k).IsNone then dictSet bases k v
+                for k, v in dictPairs lc.LImpls do
+                    if (dictTryFind impls k).IsNone then dictSet impls k v
+                for k, v in dictPairs lc.LImplTys do
+                    if (dictTryFind implTys k).IsNone then dictSet implTys k v
+                for k, v in dictPairs lc.LStructTypes do
+                    if (dictTryFind structTypes k).IsNone then dictSet structTypes k v
+                for k, v in dictPairs lc.LCtors do
+                    if (dictTryFind ctors k).IsNone then dictSet ctors k v
+                for k, v in dictPairs lc.LAliases do
+                    if (dictTryFind aliases k).IsNone then dictSet aliases k v
+                for k, v in dictPairs lc.LClasses.Classes do
+                    if (dictTryFind classes.Classes k).IsNone then dictSet classes.Classes k v
+                for k, v in dictPairs lc.LClasses.MemberOwner do
+                    if (dictTryFind classes.MemberOwner k).IsNone then dictSet classes.MemberOwner k v
+                for k, v in dictPairs lc.LClasses.TypePaths do
+                    if (dictTryFind classes.TypePaths k).IsNone then dictSet classes.TypePaths k v
+                // instances REGISTER rather than overwrite: a class may be
+                // extended by both the library and the project, and selection
+                // ranks the whole candidate list
+                for _, v in dictPairs lc.LClasses.Instances do
+                    for i in vecToList v do Analysis.Classes.addInstance classes i
+                // MEMBERS too, and before the per-file resolution below: a
+                // library's `DMembers` never reached the project-wide
+                // "Type.Member" index, so a STATIC member of a library type
+                // did not resolve. `M44d.RotationZ 0.5` against fpp.base left
+                // a bare reference to the type, and the backend stubbed the
+                // enclosing function, which trapped if reached. Instance
+                // members were unaffected — they are found through the
+                // receiver — which is why only the statics showed it.
+                for d in lds do
+                    match d with
+                    | Fpp.Core.Ir.DMembers (n, own) ->
+                        for m, v in own do
+                            dictSet members (n + "." + m)
+                                { Analysis.Resolve.Name = m
+                                  Analysis.Resolve.Kind = Analysis.Resolve.DefMember
+                                  Analysis.Resolve.Path = v.Path
+                                  Analysis.Resolve.Offset = v.Offset
+                                  Analysis.Resolve.Length = strLen m
+                                  Analysis.Resolve.Access = 0 }
+                    | _ -> ()
             let trees = dictNew<string, Parser.ParseResult> ()
+            let mutable tParse = 0
+            let mutable tResolve = 0
+            let mutable tInfer = 0
+            let slowest = vecNew<string * int> ()
             for path in this.ProjectFiles do
                 let raw = this.ParseRaw path
                 // The PROBE. A computation expression's shape depends on what
@@ -462,6 +614,8 @@ type Workspace() =
                             let has (m : string) = (dictTryFind members0 (tyName + "." + m)).IsSome
                             dictSet builders off
                                 { Name = tyName
+                                  At = off
+                                  Has = has
                                   HasRun = has "Run"
                                   HasDelay = has "Delay"
                                   HasReturn = has "Return"
@@ -479,7 +633,12 @@ type Workspace() =
                         let stmts = dictNew<int, bool> ()
                         for off in inf0.CompStatements do dictSet stmts off true
                         let isStatement (off : int) = (dictTryFind stmts off).IsSome
-                        { raw with Root = Desugar.desugarWithStatements lookup isStatement raw.Root }
+                        let rewritten, ceDiags = Desugar.desugarWithDiags lookup isStatement raw.Root
+                        (if not (List.isEmpty ceDiags) then
+                            let v = vecNew<int * string> ()
+                            for d in ceDiags do vecAdd v d
+                            dictSet ceDiagsByPath path v)
+                        { raw with Root = rewritten }
                 dictSet trees path p
                 let b = Analysis.Resolve.resolve path imports p.Root
                 for full, d in b.Exports do dictSet imports full d
@@ -505,7 +664,7 @@ type Workspace() =
                 dictSet results path (b, inf)
             // libraries declare their interfaces in their serialized core
             for _, text in this.Libraries do
-                let _, _, ds = Fpp.Core.Serialize.decodeLib text
+                let ds = (Fpp.Core.Serialize.decodeLib text).LDecls
                 for d in ds do
                     match d with
                     | Fpp.Core.Ir.DInterface (n, ms) -> dictSet ifaces n ms
@@ -517,7 +676,9 @@ type Workspace() =
                     | _ -> ()
             { Files = results; Schemes = schemes; Interfaces = ifaces; Bases = bases
               Members = members; Fields = fields; Classes = classes; Trees = trees
-              Aliases = aliases; BuiltinInfer = binf })
+              Aliases = aliases
+              Impls = impls; ImplTys = implTys; StructTypes = structTypes; Ctors = ctors
+              BuiltinInfer = binf })
 
     /// The LINKED (monomorphized, DCE'd) top-level names for the wasm-linear
     /// target. The stamping tests used to read clone names out of the emitted
@@ -564,6 +725,9 @@ type Workspace() =
                   EndLine = line; EndCol = col + 1; Message = msg }
             (r.Diagnostics |> List.map (fun d -> at d.Offset d.Message))
             @ (t.Diagnostics |> List.map (fun (off, msg) -> at off msg))
+            @ (match dictTryFind ceDiagsByPath path with
+               | Some v -> vecToList v |> List.map (fun (off, msg) -> at off msg)
+               | None -> [])
             // resolver misses with a known fix — a value some module
             // exports but this file never opened — CONFIRMED against
             // inference: only a use that really bottomed out at a fresh
@@ -971,7 +1135,7 @@ type Workspace() =
         // linked library declarations join the program before emission
         let libDecls = vecNew<Fpp.Core.Ir.Decl> ()
         for _, text in this.Libraries do
-            let _, _, ds = Fpp.Core.Serialize.decodeLib text
+            let ds = (Fpp.Core.Serialize.decodeLib text).LDecls
             for d in ds do vecAdd libDecls d
         for pe in this.PluginErrors do vecAdd errs pe
         if vecLen errs > 0 then [], vecToList errs
@@ -1042,7 +1206,61 @@ type Workspace() =
         // references preludeSourceRaw) can load its own prelude; ordinary programs
         // never touch it, so the constant is not emitted for them.
         Fpp.Backend.WasmLin.preludeSrc <- Fpp.Prelude.preludeSource ()
-        let linked, errs = this.LinkedCoreFor false true
+        let linked0, errs = this.LinkedCoreFor false true
+        // INLINING, for the by-value struct work. The note on `Optimize.optimize`
+        // measured this pass as worthless and said why: on an all-anyref IR the
+        // copied body boxed exactly as the call did, so nothing was enabled. A
+        // struct now crosses a call in REGISTERS and returns through a
+        // destination, so inlining a small struct accessor removes a real
+        // memory round trip. Measured on box-extend: a non-inlined struct
+        // return costs clang 166 ms in this same engine and costs us 152 — the
+        // ABI is not the gap, the call is.
+        // ON BY DEFAULT; FPP_INLINE=0 turns it off for a bisection.
+        //
+        // What it is worth, measured on the fpp.base benchmarks against .NET:
+        // rot-transform 1.30x -> 0.90x, rot-compose 1.33x -> 1.00x,
+        // transform-trafo 4.25x -> 1.86x, transform-m44 3.27x -> 2.15x,
+        // ray-triangle 4.58x -> 4.24x. That is the pass the old note on
+        // `Optimize.optimize` said would start paying "with the unboxing
+        // work" — the by-value struct ABI is that work, and it does.
+        //
+        // It was opt-in while two things were open, and both are closed. The
+        // first was a lost BOX: an inlined body dropped a box the call
+        // boundary used to place, so a large uint32 reached a consumer as a
+        // raw even word and was read as a heap pointer — `[ 3u; 1u; 2u;
+        // 4000000000u ]` sorted faulted at 0xee6b2800, which is the value
+        // itself. That was the inliner RENAMING binders; it keeps the
+        // originals now (see `expand`) and the repro prints.
+        //
+        // The second was the SELF-HOST: stage-1 did not reproduce stage-0.
+        // That one was not the inliner at all — `inlineMax` took its default
+        // from `System.Int32.MaxValue`, which the self-hosted compiler does
+        // not have and read as ZERO, so stage-1 capped itself at "inline no
+        // sites" while stage-0 inlined 2277. Same source, same flags, a
+        // smaller binary. It reads the flag with `intOr` now and the fixpoint
+        // is byte-exact with the pass on.
+        let linked =
+            if System.Environment.GetEnvironmentVariable "FPP_INLINE" = "0" then linked0
+            else
+                // fuseTuples AFTER inlining: an inlined tupled call leaves
+                // `let t = (a, b) in match t with (x, y) -> ...`, and fusing
+                // it back into two lets is what keeps the arguments in
+                // registers. Without it inlining is a large REGRESSION.
+                Fpp.Core.Optimize.fuseTuples (Fpp.Core.Optimize.inlineCalls linked0)
+        // LOOP-INVARIANT CODE MOTION, after inlining because an un-inlined
+        // call hides the arithmetic that would move. ON by default;
+        // FPP_LICM=0 turns it off for a bisection.
+        //
+        // Worth, on the fpp.base benchmarks: ray/triangle 98 -> 52 ms and
+        // Trafo3d.TransformPos 39 -> 21 (both with repeat inlining, which is
+        // what exposes the arithmetic to move). Moeller-Trumbore builds `e1`,
+        // `e2`, `pv`, `det` and `inv` from the triangle and the ray direction
+        // and none of them move, so all five were recomputed two million
+        // times. clang's wasm holds 8 multiplies in that loop where the
+        // source writes 15.
+        let linked =
+            if System.Environment.GetEnvironmentVariable "FPP_LICM" = "0" then linked
+            else Fpp.Core.Optimize.hoistInvariants linked
         if System.Environment.GetEnvironmentVariable "FPP_CORE_DUMP" = "1" then
             for d in linked do
                 match d with
@@ -1119,8 +1337,47 @@ type Workspace() =
             dictPairs r.Schemes
             |> List.filter (fun (k, _) -> not (k.StartsWith "(builtin)"))
         for pe in this.PluginErrors do vecAdd errs pe
+        // The library's OWN tables, and only those. `r` is project-wide, so
+        // it holds the prelude's entries too — shipping those would have a
+        // consumer overwrite its own prelude with re-numbered copies of the
+        // same thing. The prelude cache is the exact key set to subtract.
+        let cached = BuiltinCache.force defines
+        let mine (pre : Fpp.Prelude.Dict<string, 'v>) (src : Fpp.Prelude.Dict<string, 'w>) : Fpp.Prelude.Dict<string, 'w> =
+            let d = dictNew<string, 'w> ()
+            for k, v in dictPairs src do
+                if (dictTryFind pre k).IsNone then dictSet d k v
+            d
+        let libClasses = Analysis.Classes.newTables ()
+        for k, v in dictPairs (mine cached.Classes.Classes r.Classes.Classes) do dictSet libClasses.Classes k v
+        for k, v in dictPairs (mine cached.Classes.MemberOwner r.Classes.MemberOwner) do dictSet libClasses.MemberOwner k v
+        for k, v in dictPairs (mine cached.Classes.TypePaths r.Classes.TypePaths) do dictSet libClasses.TypePaths k v
+        // an instance is filtered by its OWN path, not by its class: a
+        // library may add instances to a PRELUDE class, and those are
+        // exactly the ones a consumer cannot rediscover
+        for cls, v in dictPairs r.Classes.Instances do
+            for i in vecToList v do
+                if i.Path <> Builtin.path then
+                    match dictTryFind libClasses.Instances cls with
+                    | Some nv -> vecAdd nv i
+                    | None ->
+                        let nv = vecNew<Analysis.Classes.InstanceDef> ()
+                        vecAdd nv i
+                        dictSet libClasses.Instances cls nv
         if vecLen errs > 0 then "", vecToList errs
-        else Fpp.Core.Serialize.encodeLib (vecToList exports) schemes (vecToList decls), []
+        else
+            Fpp.Core.Serialize.encodeLib
+                { LExports = vecToList exports
+                  LSchemes = schemes
+                  LDecls = vecToList decls
+                  LFields = mine cached.Fields r.Fields
+                  LClasses = libClasses
+                  LIfaces = mine cached.Ifaces r.Interfaces
+                  LBases = mine cached.Bases r.Bases
+                  LImpls = mine cached.Impls r.Impls
+                  LImplTys = mine cached.ImplTys r.ImplTys
+                  LStructTypes = mine cached.StructTypes r.StructTypes
+                  LCtors = mine cached.Ctors r.Ctors
+                  LAliases = mine cached.Aliases r.Aliases }, []
 
     /// Lower a file to typed core (Stage 3). Runs on top of the project check.
     member this.LowerFile (path : string) : Core.Ir.LowerResult =

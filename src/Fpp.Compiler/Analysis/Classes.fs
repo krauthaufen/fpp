@@ -130,15 +130,27 @@ let addClass (t : Tables) (c : ClassDef) : unit =
 let rec private sameType (a : Type) (b : Type) : bool =
     match prune a, prune b with
     | TVar v, TVar w -> v.Id = w.Id
+    // canonically: a scalar's alias spelling survives inference so a
+    // diagnostic can echo it, and `Mul<double, float>` is `Mul<float, float>`
     | TCon (n1, a1), TCon (n2, a2) ->
-        n1 = n2 && a1.Length = a2.Length && List.forall2 sameType a1 a2
+        canonTypeName n1 = canonTypeName n2 && a1.Length = a2.Length && List.forall2 sameType a1 a2
     | TFun (p1, r1), TFun (p2, r2) -> sameType p1 p2 && sameType r1 r2
     | TTuple x, TTuple y -> x.Length = y.Length && List.forall2 sameType x y
     | TApp (h1, a1), TApp (h2, a2) ->
         a1.Length = a2.Length && sameType h1 h2 && List.forall2 sameType a1 a2
     | _ -> false
 
+/// Bumped whenever the instance table changes, so the head index below knows
+/// its buckets are stale. Inference registers instances as it goes, so the
+/// index cannot be built once and trusted.
+let mutable private instGen = 0
+
+/// The instance-table generation. A caller that cached a SELECTION result
+/// re-checks this: any instance registered since invalidates it.
+let instGeneration () : int = instGen
+
 let addInstance (t : Tables) (i : InstanceDef) : unit =
+    instGen <- instGen + 1
     match dictTryFind t.Instances i.Class with
     | Some v ->
         // the same DECLARATION registered twice (a re-inference, a table
@@ -234,7 +246,7 @@ let rec private matchTy (ps : Set<int>) (sub : Dict<int, Type>) (pat : Type) (tg
          | None -> dictSet sub v.Id t; true)
     | TVar v, TVar w -> v.Id = w.Id
     | TCon (n1, a1), TCon (n2, a2) ->
-        n1 = n2 && a1.Length = a2.Length && List.forall2 (matchTy ps sub) a1 a2
+        canonTypeName n1 = canonTypeName n2 && a1.Length = a2.Length && List.forall2 (matchTy ps sub) a1 a2
     | TFun (p1, r1), TFun (p2, r2) -> matchTy ps sub p1 p2 && matchTy ps sub r1 r2
     | TTuple x, TTuple y -> x.Length = y.Length && List.forall2 (matchTy ps sub) x y
     | TApp (h1, a1), TApp (h2, a2) ->
@@ -266,7 +278,7 @@ let rec private compatible (ps : Set<int>) (sub : Dict<int, Type>) (pat : Type) 
          | None -> dictSet sub v.Id t; true)
     | _, TVar _ -> true
     | TCon (n1, a1), TCon (n2, a2) ->
-        n1 = n2 && a1.Length = a2.Length && List.forall2 (compatible ps sub) a1 a2
+        canonTypeName n1 = canonTypeName n2 && a1.Length = a2.Length && List.forall2 (compatible ps sub) a1 a2
     | TFun (p1, r1), TFun (p2, r2) -> compatible ps sub p1 p2 && compatible ps sub r1 r2
     | TTuple x, TTuple y -> x.Length = y.Length && List.forall2 (compatible ps sub) x y
     // an UNRESOLVED application stands for whatever its head becomes,
@@ -314,15 +326,81 @@ type Selection =
 /// deferring it: a CLASS MEMBER body has no constraint-carrying scheme, so
 /// the eager commit is its only resolution — a let body defers and the
 /// constraint rides its scheme to the stamp.
+/// The instances of a class BUCKETED by the outer type constructor of their
+/// first head argument, plus the ones whose first head is a variable (which
+/// can match anything and so belong to every bucket).
+///
+/// Selection used to scan every instance of the class: 208 K selections
+/// against 31.5 M candidate visits on one fpp.base build, 151 per call, when
+/// at most a couple can apply. `Real<float>` cannot match `V3d` and the name
+/// says so before any matching starts.
+/// Buckets carry each instance's REGISTRATION INDEX, and a lookup re-sorts the
+/// survivors by it. Selection compares candidates against each other, so the
+/// order it sees is part of its answer — handing it "matching bucket first,
+/// then the variable-headed ones" is a different question from the one the
+/// unindexed scan asked, and the self-host stopped reproducing.
+let private idxCache = dictNew<string, int * Dict<string, Vec<int * InstanceDef>> * Vec<int * InstanceDef>> ()
+
+let private headKey (t : Type) : string option =
+    match prune t with
+    | TCon (n, _) -> Some (canonTypeName n)
+    | _ -> None
+
+let private bucketed (t : Tables) (cls : string) (a0 : Type) : InstanceDef list =
+    match headKey a0 with
+    | None -> instancesOf t cls
+    | Some k ->
+        let byCon, anyv =
+            match dictTryFind idxCache cls with
+            | Some (g, byCon, anyv) when g = instGen -> byCon, anyv
+            | _ ->
+                let byCon = dictNew<string, Vec<int * InstanceDef>> ()
+                let anyv = vecNew<int * InstanceDef> ()
+                let mutable n = 0
+                for i in instancesOf t cls do
+                    (match (match i.Head with h :: _ -> headKey h | [] -> None) with
+                     | Some hk ->
+                         (match dictTryFind byCon hk with
+                          | Some v -> vecAdd v (n, i)
+                          | None ->
+                              let v = vecNew<int * InstanceDef> ()
+                              vecAdd v (n, i)
+                              dictSet byCon hk v)
+                     | None -> vecAdd anyv (n, i))
+                    n <- n + 1
+                dictSet idxCache cls (instGen, byCon, anyv)
+                byCon, anyv
+        ((match dictTryFind byCon k with Some v -> vecToList v | None -> []) @ vecToList anyv)
+        |> List.sortWith (fun (a, _) (b, _) -> compare a b)
+        |> List.map snd
+
+/// Can this instance be ruled out WITHOUT allocating? Selection scans every
+/// instance of a class and, for each, built a `Set` of its parameter ids and a
+/// substitution `Dict` before `matchTy` looked at anything — 31.5 M candidate
+/// visits on one fpp.base build, almost all of them doomed. Two concrete and
+/// different head constructors in the same position can never match, and that
+/// test is a name comparison with nothing allocated behind it.
+let private cannotMatch (head : Type list) (args : Type list) : bool =
+    let rec go (hs : Type list) (as_ : Type list) =
+        match hs, as_ with
+        | h :: ht, a :: at ->
+            (match prune h, prune a with
+             | TCon (n1, _), TCon (n2, _) when canonTypeName n1 <> canonTypeName n2 -> true
+             | _ -> go ht at)
+        | _ -> false
+    go head args
+
+
 let private selectCore (t : Tables) (eager : bool) (cls : string) (args : Type list) (assoc : (string * Type) list) : Selection =
-    let cands = instancesOf t cls
+    let cands = match args with a0 :: _ -> bucketed t cls a0 | [] -> instancesOf t cls
     let exact =
         cands |> List.choose (fun i ->
-            let ps = i.Params |> List.map (fun v -> v.Id) |> Set.ofList
-            let sub = dictNew<int, Type> ()
-            if i.Head.Length = args.Length
-               && List.forall2 (matchTy ps sub) i.Head args then Some (i, sub)
-            else None)
+            if i.Head.Length <> args.Length || cannotMatch i.Head args then None
+            else
+                let ps = i.Params |> List.map (fun v -> v.Id) |> Set.ofList
+                let sub = dictNew<int, Type> ()
+                if List.forall2 (matchTy ps sub) i.Head args then Some (i, sub)
+                else None)
     /// Could a STRICTLY more specific instance than `chosen` still apply once
     /// the target's own variables are known? If so, committing now would
     /// answer a question the use site has not finished asking: inside a body

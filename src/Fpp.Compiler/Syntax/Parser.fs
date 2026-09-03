@@ -140,6 +140,8 @@ let parse (src : string) : ParseResult =
     let mutable pendingExtern = false
 
     let isLiteral () = List.contains s.Cur.Kind literalKinds
+    /// the token AFTER the current one — the enum-case arm looks past its `=`
+    let isLiteral2 () = List.contains (s.Peek 1).Kind literalKinds
     let isLiteralKw () = s.IsKw "true" || s.IsKw "false" || s.IsKw "null"
 
     /// Can the current token start an atomic expression (an application arg)?
@@ -727,6 +729,13 @@ let parse (src : string) : ParseResult =
         let names = if partial then names0 |> List.filter (fun c -> c <> "_") else names0
         let fname = "$ap$" + String.concat "$" names0
         let n = List.length names
+        // A MULTI-CASE PARTIAL is not a thing: `(|A|B|_|)`. A total pattern
+        // answers which case (a Choice), a partial one answers whether it
+        // matched (an option), and no return type says both. F# rejects it
+        // and so must this — accepted, the cases here rode a Choice while
+        // callers read an option.
+        if partial && n > 1 then
+            s.Diag "multi-case partial active patterns are not supported"
         names |> List.iteri (fun i c ->
             dictSet apFunctionOf c fname
             dictSet apCaseIndex c i
@@ -1339,6 +1348,23 @@ let parse (src : string) : ParseResult =
                  | _ -> ())
                 // explicit generic application: GetValue<string>, vecNew<Green>
                 e <- Green.node AppExpr [ e; Green.node TyParams (parseAngleArgs ctx) ]
+            elif s.Is LBracket && isAdjacentTo e && s.SameLine
+                 && not ((s.Peek 1).Kind = Operator && ((s.Peek 1).Text = "|" || (s.Peek 1).Text = "||"))
+                 && not ((s.Peek 1).Kind = Operator && (s.Peek 1).Text = "<") then
+                // F# 6 INDEXING WITHOUT THE DOT: `a[i]` means `a.[i]` when the
+                // bracket is adjacent to what it indexes. With a space it is
+                // still application (`List.map f [1; 2]`), which is the rule
+                // F# uses and the only thing separating the two.
+                //
+                // A synthetic dot keeps the tree IDENTICAL to the `a.[i]`
+                // form, so nothing downstream learns this spelling exists —
+                // the index paths in Infer and Lower key on DotExpr with a
+                // bracket child, and a two-child node would have missed both.
+                // Excluded: `[|` and `[<`, which open an array literal and an
+                // attribute list.
+                let br = s.Cur
+                let dot = { Kind = Operator; Text = "."; Leading = []; Trailing = []; Offset = br.Offset }
+                e <- Green.node DotExpr [ e; GToken dot; parseAtom ctx ]
             elif s.Is LParen && isAdjacentTo e then
                 // F#'s high-precedence application: an atom IMMEDIATELY
                 // followed by `(` binds tighter than juxtaposition, so
@@ -2352,27 +2378,38 @@ let parse (src : string) : ParseResult =
                 vecAdd acc (Green.node TyParams (parseAngleArgs mcol))
             while canStartAtomPat () && (s.SameLine || s.CurCol > mcol) do
                 vecAdd acc (parseAtomPat mcol)
-            if s.IsOp ":" then
-                vecAdd acc (s.Bump ())
-                vecAdd acc (parseType mcol)
-            // trailing constraints — after the ascription (`... : int when
-            // Pinnable<'a>`) or standing alone (`static member Identity
-            // when Num<'a> = ...`). The same WhenDecl a let signature
-            // carries, so the member's walk can skip the node and
-            // constraintOf can read it. Left as bare tokens, `Pinnable`
-            // and `'a` land among the pre-`=` identifiers and the member
-            // loses its NAME.
-            while s.IsKw "when" && (s.SameLine || s.CurCol > mcol) do
-                if (s.Peek 1).Kind = Ident then (for w__ in parseWhen false mcol do vecAdd acc w__)
-                else
-                    // F#-style variable constraint (`when 'm : Monad`):
-                    // its tokens, in their own node
-                    let cons = vecNew<Green> ()
-                    vecAdd cons (s.Bump ())
-                    while not s.AtEof && not (s.IsOp "=") && not (s.IsKw "when")
-                          && (s.SameLine || s.CurCol > mcol) do
+            // The ascription and the constraints ALTERNATE. F# accepts both
+            // orders — `: 'a when Num<'a>` and `when Num<'a> : 'a` — and this
+            // took the ascription once, then the constraints, and stopped; a
+            // return type written AFTER the constraints was left for the
+            // top-level loop, which reported "unexpected token" four times on
+            // one member (KNOWN-ISSUES #7).
+            //
+            // The constraints are the same WhenDecl a let signature carries,
+            // so the member's walk can skip the node and constraintOf can read
+            // it. Left as bare tokens, `Pinnable` and `'a` land among the
+            // pre-`=` identifiers and the member loses its NAME.
+            let mutable sigMore = true
+            while sigMore do
+                sigMore <- false
+                if s.IsOp ":" then
+                    vecAdd acc (s.Bump ())
+                    vecAdd acc (parseType mcol)
+                    sigMore <- true
+                while s.IsKw "when" && (s.SameLine || s.CurCol > mcol) do
+                    sigMore <- true
+                    if (s.Peek 1).Kind = Ident then (for w__ in parseWhen false mcol do vecAdd acc w__)
+                    else
+                        // F#-style variable constraint (`when 'm : Monad`):
+                        // its tokens, in their own node. It ends at the `=`, at
+                        // the next `when` — or at a `:` that starts the RETURN
+                        // type, which is why the ascription can follow.
+                        let cons = vecNew<Green> ()
                         vecAdd cons (s.Bump ())
-                    vecAdd acc (Green.node WhenDecl (vecToList cons))
+                        while not s.AtEof && not (s.IsOp "=") && not (s.IsKw "when")
+                              && (s.SameLine || s.CurCol > mcol) do
+                            vecAdd cons (s.Bump ())
+                        vecAdd acc (Green.node WhenDecl (vecToList cons))
             if s.IsKw "with"
                && (let p = s.Peek 1 in
                    p.Text = "get" || p.Text = "set" || p.Text = "inline"
@@ -2426,8 +2463,16 @@ let parse (src : string) : ParseResult =
         Green.node MemberDecl (vecToList acc)
 
     /// `type T = A | B of int` — an identifier directly followed by `|`/`of`.
+    /// An ENUM writes its first case the same way, with a value instead:
+    /// `type E = A = 1 | B = 2`. Without the `=` arm that read as the
+    /// ABBREVIATION `type E = A` and the value after it was a syntax error at
+    /// top level, so the one-line enum form did not parse at all. The literal
+    /// is what tells the two apart — `type T = A` really is an abbreviation.
     and looksLikeInlineUnion () : bool =
-        s.Is Ident && (let n = s.Peek 1 in n.Text = "of" || n.Text = "|")
+        s.Is Ident
+        && (let n = s.Peek 1 in
+            n.Text = "of" || n.Text = "|"
+            || (n.Text = "=" && List.contains (s.Peek 2).Kind literalKinds))
 
     and parseUnionCases (acc : Vec<Green>) (typeCol : int) : unit =
         // optional first case without a leading bar: `type T = A | B`
@@ -2441,6 +2486,10 @@ let parse (src : string) : ParseResult =
                 let fns = payloadFieldNames payload
                 if fns |> List.exists (fun x -> x <> "") then dictSet ucFieldNames nameTok fns
                 vecAdd c payload
+            elif s.IsOp "=" && isLiteral2 () then
+                // the leading ENUM case, the barless twin of `| A = 1` below
+                vecAdd c (s.Bump ())
+                vecAdd c (Green.node LiteralExpr [ s.Bump () ])
             vecAdd acc (Green.node UnionCase (vecToList c))
         let mutable go = true
         while go && s.IsOp "|" && (s.SameLine || s.CurCol > typeCol) do

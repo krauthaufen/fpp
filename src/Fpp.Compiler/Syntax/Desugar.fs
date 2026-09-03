@@ -94,6 +94,16 @@ let private tuple (items : Green list) : Green =
 /// and this has been read off its type.
 type CeBuilder =
     { Name : string
+      /// the CE expression's OWN offset, so a missing builder method can be
+      /// reported at the source rather than at the rewrite's synthetic
+      /// tokens — which sit above 500000000 and are deliberately excluded
+      /// from the missing-member diagnostic, since blaming a position the
+      /// author never wrote is worse than saying nothing
+      At : int
+      /// does the builder declare this method? General, because the control
+      /// constructs need arbitrary names and the flags below only cover the
+      /// ones the REWRITE branches on
+      Has : string -> bool
       HasRun : bool
       HasDelay : bool
       HasReturn : bool
@@ -111,7 +121,12 @@ type CeBuilder =
 /// SMALLEST builder, so an unknown one degrades to the minimum rather than to
 /// a call that cannot resolve.
 let unknownBuilder (name : string) : CeBuilder =
-    { Name = name; HasRun = false; HasDelay = false; HasReturn = true
+    // `Has` answers TRUE for an unknown builder: it could not be typed, so
+    // every method is assumed present and nothing is reported. Guessing the
+    // other way would turn a file that does not type check into a pile of
+    // missing-method errors that vanish once it does.
+    { Name = name; At = 0; Has = (fun _ -> true)
+      HasRun = false; HasDelay = false; HasReturn = true
       HasBindReturn = false; HasBind2 = false; HasBind3 = false
       HasBind2Return = false; HasBind3Return = false
       HasMergeSources = false; HasMergeSources3 = false }
@@ -125,7 +140,19 @@ let private callOn (recv : string) (name : string) (args : Green list) : Green =
     | [ a ] -> Green.node AppExpr [ target; paren a ]
     | many -> Green.node AppExpr [ target; paren (tuple many) ]
 
+/// What a computation expression asked its builder for and did not get.
+/// Module state, like the offset counter above, and drained by the entry
+/// point under the same lock so two files cannot mix.
+let private ceDiags = vecNew<int * string> ()
+
 let private call (b : CeBuilder) (name : string) (args : Green list) : Green =
+    // F# FS0708. Without this the rewrite emitted a call to a method that is
+    // not there: it compiled, and the module TRAPPED when the construct was
+    // reached — a diagnostic F# gives at compile time, arriving at run time.
+    if not (b.Has name) then
+        vecAdd ceDiags
+            (b.At, "this control construct may only be used if the computation "
+                   + "expression builder defines a '" + name + "' method")
     callOn b.Name name args
 
 let private lambda (pats : Green list) (body : Green) : Green =
@@ -865,13 +892,22 @@ let private rewriteUnlocked (lookup : int -> CeBuilder) (isStatement : int -> bo
     statementAt <- (fun _ -> false)
     r
 
-let desugarWithStatements (lookup : int -> CeBuilder) (isStatement : int -> bool) (root : GreenNode) : GreenNode =
+/// Answers the rewritten tree AND what the builders could not supply. The
+/// diagnostics are drained under the SAME lock the rewrite holds — they are
+/// module state for the same reason the offset counter is.
+let desugarWithDiags (lookup : int -> CeBuilder) (isStatement : int -> bool) (root : GreenNode) : GreenNode * (int * string) list =
     // The offset counter and the probe's answers are module state — every
     // constructor above reads them, and threading them through forty call
     // sites would say nothing this does not. It has to BE a lock: two
     // workspaces rewriting at once corrupted each other's answers, and the
     // symptom was a `BindReturn` that fused in one run and not the next.
-    lock rewriteLock (fun () -> rewriteUnlocked lookup isStatement root)
+    lock rewriteLock (fun () ->
+        vecClear ceDiags
+        let tree = rewriteUnlocked lookup isStatement root
+        tree, vecToList ceDiags)
+
+let desugarWithStatements (lookup : int -> CeBuilder) (isStatement : int -> bool) (root : GreenNode) : GreenNode =
+    fst (desugarWithDiags lookup isStatement root)
 
 /// Is there anything here for the rewrite to do? Files without a computation
 /// expression — which is nearly all of them, the compiler's own sources and

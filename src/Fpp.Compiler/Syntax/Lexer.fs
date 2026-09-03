@@ -231,6 +231,16 @@ let rec tokenize (src : string) : Token list =
     // names resolve, and its operators get their kinds, exactly as if they had
     // been written outside the string. `{{` and `}}` are literal braces.
     //
+    // A PRINTF SPECIFIER binds to the hole that follows it: `$"n=%d{x}"` is
+    //
+    //     ( "n=" + sprintf "%d" ( x ) )
+    //
+    // rather than `string`. Routing it through sprintf is what makes the
+    // specifier both FORMAT and TYPE-CHECK — `%.2f` pads and `%d` refuses a
+    // string — for free, since printf is already complete. Left as literal
+    // text it printed itself: `$"%d{x}"` rendered `%d42`, a wrong answer with
+    // no diagnostic anywhere.
+    //
     // NOT supported: a .NET format specifier (`{x:N2}`) — the `:` would read as
     // a type annotation — and `$$"""…"""`.
     let expandInterp (ts : Token list) : Token list =
@@ -247,8 +257,43 @@ let rec tokenize (src : string) : Token list =
         let pieceIsLit = vecNew<bool> ()
         let pieceText = vecNew<string> ()
         let pieceAt = vecNew<int> ()
+        /// the printf specifier a hole inherits from the literal before it
+        /// ("" when it has none). Parallel to the three above.
+        let pieceSpec = vecNew<string> ()
+        // `System.Char.IsDigit` is OUT of the self-hosting subset (it stubs,
+        // and stage-1 then traps) — this file is compiler source.
+        let isDig (c : char) : bool = c >= '0' && c <= '9'
+        let isConv (c : char) : bool =
+            c = 'd' || c = 'i' || c = 'u' || c = 'x' || c = 'X' || c = 'o'
+            || c = 'b' || c = 's' || c = 'c' || c = 'f' || c = 'F' || c = 'e'
+            || c = 'E' || c = 'g' || c = 'G' || c = 'M' || c = 'O' || c = 'A'
+        /// The trailing printf specifier of a literal piece, or "". Scans
+        /// BACKWARDS from the end: `%` flags width `.` precision conversion,
+        /// and the `%` must not itself be escaped (`%%` is a literal percent,
+        /// so `$"100%%{x}"` keeps its text and the hole stays a `string`).
+        let trailingSpec (txt : string) : string =
+            let n = strLen txt
+            if n < 2 then ""
+            elif not (isConv (charAt txt (n - 1))) then ""
+            else
+                let mutable i = n - 2
+                let mutable ok = true
+                while ok && i >= 0 && (isDig (charAt txt i) || charAt txt i = '.'
+                                       || charAt txt i = '+' || charAt txt i = '-'
+                                       || charAt txt i = ' ' || charAt txt i = '0') do
+                    i <- i - 1
+                if i < 0 || charAt txt i <> '%' then ""
+                // an ESCAPED percent is not a specifier: count the run of `%`
+                // ending here, and an even-length run is all literal pairs
+                else
+                    let mutable j = i
+                    let mutable runs = 0
+                    while j >= 0 && charAt txt j = '%' do
+                        runs <- runs + 1
+                        j <- j - 1
+                    if runs % 2 = 0 then "" else substr txt i (n - i)
         let pieces (body : string) : unit =
-            vecClear pieceIsLit; vecClear pieceText; vecClear pieceAt
+            vecClear pieceIsLit; vecClear pieceText; vecClear pieceAt; vecClear pieceSpec
             let bn = strLen body
             let mutable lit = ""
             let mutable litStart = 0
@@ -278,6 +323,39 @@ let rec tokenize (src : string) : Token list =
                 else
                     lit <- lit + string c; i <- i + 1
             vecAdd pieceIsLit true; vecAdd pieceText lit; vecAdd pieceAt litStart
+        /// Move each hole's specifier off the END of the literal before it.
+        /// Runs after `pieces`, so it can see both sides.
+        /// `%%` is one literal percent, because an interpolated string IS a
+        /// printf format in F#. The literal pieces here become ORDINARY string
+        /// literals, which no formatter ever sees, so the pair survived and
+        /// `$"100%%{x}"` printed `100%%42`.
+        let collapsePct (txt : string) : string =
+            let n = strLen txt
+            let mutable outp = ""
+            let mutable i = 0
+            while i < n do
+                if charAt txt i = '%' && i + 1 < n && charAt txt (i + 1) = '%' then
+                    outp <- outp + "%"; i <- i + 2
+                else
+                    outp <- outp + string (charAt txt i); i <- i + 1
+            outp
+        let bindSpecs () : unit =
+            vecClear pieceSpec
+            for _ in 0 .. vecLen pieceIsLit - 1 do vecAdd pieceSpec ""
+            for k in 0 .. vecLen pieceIsLit - 1 do
+                if not (vecGet pieceIsLit k) && k > 0 && vecGet pieceIsLit (k - 1) then
+                    let prev = vecGet pieceText (k - 1)
+                    let sp = trailingSpec prev
+                    if sp <> "" then
+                        vecSet pieceSpec k sp
+                        vecSet pieceText (k - 1) (substr prev 0 (strLen prev - strLen sp))
+            // AFTER the specifiers are taken: `trailingSpec` counts the run of
+            // `%` to tell a specifier from an escaped pair, and collapsing
+            // first would turn `%%d{x}` — a literal `%d` — into one that reads
+            // as a specifier and eats the hole
+            for k in 0 .. vecLen pieceIsLit - 1 do
+                if vecGet pieceIsLit k then
+                    vecSet pieceText k (collapsePct (vecGet pieceText k))
         let rec go (ts : Token list) (acc : Token list) : Token list =
             match ts with
             | d :: str :: rest when d.Kind = Operator && d.Text = "$" && str.Kind = StringLit
@@ -286,6 +364,7 @@ let rec tokenize (src : string) : Token list =
                 let body = substr str.Text 1 (strLen str.Text - 2)
                 let bodyOff = str.Offset + 1
                 pieces body
+                bindSpecs ()
                 let o = d.Offset
                 let out = vecNew<Token> ()
                 vecAdd out (synL LParen "(" o d.Leading)
@@ -307,7 +386,15 @@ let rec tokenize (src : string) : Token list =
                         // the conversion then rendered nothing at all. The
                         // hole's `{` is a position no real token occupies.
                         if not first then vecAdd out (syn Operator "+" o)
-                        vecAdd out (syn Ident "string" (bodyOff + at - 1))
+                        let spec = vecGet pieceSpec k
+                        if spec = "" then
+                            vecAdd out (syn Ident "string" (bodyOff + at - 1))
+                        else
+                            // the format literal takes the specifier's OWN
+                            // source position — unique (offsets key the kind
+                            // tables) and honest, since that is where it is
+                            vecAdd out (syn Ident "sprintf" (bodyOff + at - 1))
+                            vecAdd out (syn StringLit ("\"" + spec + "\"") (bodyOff + at - 1 - strLen spec))
                         vecAdd out (syn LParen "(" (bodyOff + at - 1))
                         for ht in tokenizeAt (bodyOff + at) txt do
                             if ht.Kind <> Eof then vecAdd out ht
@@ -319,7 +406,287 @@ let rec tokenize (src : string) : Token list =
             | t :: rest -> go rest (t :: acc)
             | [] -> List.rev acc
         go ts []
-    if (toks |> List.exists (fun t -> t.Kind = Operator && t.Text = "$")) then expandInterp toks else toks
+    // ---- anonymous records ------------------------------------------------
+    //
+    // `{| X = 1; Y = "s" |}` is F#'s STRUCTURAL record and everything here is
+    // nominal, so it expands to an ordinary record of a SYNTHESIZED type, one
+    // per distinct field-name set:
+    //
+    //     ({ X = 1; Y = "s" } : $anon$X$Y<_, _>)
+    //
+    // with `type $anon$X$Y<'a, 'b> = { X : 'a; Y : 'b }` injected after the
+    // module header. GENERIC, so two literals with the same labels and
+    // different value types are different types the way F# has them; SORTED,
+    // so writing the fields in another order does not make another type.
+    //
+    // The ascription is not decoration. A record literal resolves by
+    // field-name SET, so a nominal `type P = { X : int; Y : string }` in the
+    // same program would capture `{| X = 1; Y = "s" |}` — the expected type
+    // is what pins the owner, and that rule already exists for F#'s sake.
+    //
+    // `{| r with X = 2 |}` needs NO ascription: copy-and-update takes its
+    // type from the base expression, which already has one.
+    let expandAnon (srcLen : int) (ts : Token list) : Token list =
+        let arr = vecNew<Token> ()
+        for t in ts do vecAdd arr t
+        let n = vecLen arr
+        // synthetic offsets live PAST the end of the source: unique in this
+        // file, so no table keyed by `path:offset` can confuse one with a
+        // real token, and never negative or absurd
+        let mutable synth = srcLen + 8
+        // laid out by TEXT LENGTH, not one apart: `Name<int>` only reads as
+        // type arguments when the `<` TOUCHES the name, and the parser tests
+        // that with `offset + length`. Spaced by one, every synthetic `<`
+        // read as less-than instead
+        let syn (k : TokenKind) (txt : string) : Token =
+            let at = synth
+            synth <- synth + strLen txt
+            { Kind = k; Text = txt; Leading = []; Trailing = []; Offset = at }
+        /// A synthetic token AT a real position. The type form mixes
+        /// synthesized brackets with the user's own type tokens, and
+        /// `looksLikeTypeArgs` refuses a `<...>` whose tokens are not all on
+        /// ONE LINE — past-EOF offsets all report the file's last line, so a
+        /// `{| N : int |}` written anywhere else was read as less-than and
+        /// the annotation ended at the name. Anchoring to the `{` that is
+        /// being dropped puts them back on the right line; nothing keys on
+        /// these offsets, since only the type NAME is an identifier.
+        let synAt (at : int) (k : TokenKind) (txt : string) : Token =
+            { Kind = k; Text = txt; Leading = []; Trailing = []; Offset = at }
+        let tokAt (i : int) : Token = vecGet arr i
+        let isOpenAt (i : int) : bool =
+            i + 1 < n && (tokAt i).Kind = LBrace
+            && (tokAt (i + 1)).Kind = Operator && (tokAt (i + 1)).Text = "|"
+            && (tokAt (i + 1)).Offset = (tokAt i).Offset + 1
+        let isCloseAt (i : int) : bool =
+            i + 1 < n && (tokAt i).Kind = Operator && (tokAt i).Text = "|"
+            && (tokAt (i + 1)).Kind = RBrace
+            && (tokAt (i + 1)).Offset = (tokAt i).Offset + 1
+        let opens (k : TokenKind) = k = LBrace || k = LParen || k = LBracket
+        let closes (k : TokenKind) = k = RBrace || k = RParen || k = RBracket
+        /// index just past the `|}` matching the `{|` that starts at `i`
+        let matchEnd (i : int) : int =
+            let mutable j = i + 2
+            let mutable depth = 0
+            let mutable stop = -1
+            while stop < 0 && j < n do
+                if isOpenAt j then depth <- depth + 1; j <- j + 2
+                elif isCloseAt j && depth = 0 then stop <- j
+                elif isCloseAt j then depth <- depth - 1; j <- j + 2
+                else
+                    (if opens (tokAt j).Kind then depth <- depth + 1
+                     elif closes (tokAt j).Kind then depth <- depth - 1)
+                    j <- j + 1
+            if stop < 0 then n else stop
+        let splitOn (sep : char) (txt : string) : string list =
+            let acc = vecNew<string> ()
+            let mutable cur = ""
+            let ln = strLen txt
+            let mutable i = 0
+            while i < ln do
+                (if charAt txt i = sep then (vecAdd acc cur; cur <- "")
+                 else cur <- cur + string (charAt txt i))
+                i <- i + 1
+            vecAdd acc cur
+            vecToList acc
+        // every distinct field-name set the file uses, as "X,Y" (sorted)
+        let shapes = vecNew<string> ()
+        let joinLabels (ls : string list) : string = String.concat "," (List.sort ls)
+        let nameOfShape (key : string) : string =
+            "$anon$" + String.concat "$" (splitOn ',' key)
+        /// the labels of one anon record, from its INNER token range
+        let labelsIn (lo : int) (hi : int) : string list =
+            let acc = vecNew<string> ()
+            let mutable depth = 0
+            let mutable atFieldStart = true
+            let mutable j = lo
+            while j < hi do
+                let t = tokAt j
+                if isOpenAt j then depth <- depth + 1; j <- j + 2; atFieldStart <- false
+                elif isCloseAt j then depth <- depth - 1; j <- j + 2; atFieldStart <- false
+                else
+                    (if opens t.Kind then depth <- depth + 1
+                     elif closes t.Kind then depth <- depth - 1)
+                    (if depth = 0 && t.Kind = Semicolon then atFieldStart <- true
+                     elif depth = 0 && t.Kind = Ident && atFieldStart
+                          && j + 1 < hi
+                          && (tokAt (j + 1)).Kind = Operator
+                          && ((tokAt (j + 1)).Text = "=" || (tokAt (j + 1)).Text = ":") then
+                        vecAdd acc t.Text
+                        atFieldStart <- false
+                     elif t.Kind <> Semicolon then atFieldStart <- false)
+                    j <- j + 1
+            vecToList acc
+        /// is this a TYPE (`{| X : int |}`) rather than a value? A field is
+        /// introduced by `=` in one and `:` in the other, and a `:` inside a
+        /// value sits under a paren, so depth 0 tells them apart.
+        let isTypeForm (lo : int) (hi : int) : bool =
+            let mutable depth = 0
+            let mutable sawEq = false
+            let mutable sawColon = false
+            let mutable j = lo
+            while j < hi do
+                let t = tokAt j
+                (if opens t.Kind then depth <- depth + 1
+                 elif closes t.Kind then depth <- depth - 1
+                 elif depth = 0 && t.Kind = Operator && t.Text = "=" then sawEq <- true
+                 elif depth = 0 && t.Kind = Operator && t.Text = ":" then sawColon <- true)
+                j <- j + 1
+            not sawEq && sawColon
+        /// does this range use `with` (copy-and-update) at depth 0?
+        let hasWith (lo : int) (hi : int) : bool =
+            let mutable depth = 0
+            let mutable found = false
+            let mutable j = lo
+            while j < hi do
+                let t = tokAt j
+                (if opens t.Kind then depth <- depth + 1
+                 elif closes t.Kind then depth <- depth - 1
+                 elif depth = 0 && t.Kind = Keyword && t.Text = "with" then found <- true)
+                j <- j + 1
+            found
+        let rec expandRange (lo : int) (hi : int) : Token list =
+            let out = vecNew<Token> ()
+            let mutable i = lo
+            while i < hi do
+                if isOpenAt i then
+                    let e = matchEnd i
+                    let inner = expandRange (i + 2) e
+                    let labels = labelsIn (i + 2) e
+                    if isTypeForm (i + 2) e then
+                        // `{| X : int; Y : string |}` names the same
+                        // synthesized type its literals do, with the field
+                        // TYPES as its arguments — in sorted label order, so
+                        // the written order cannot make a second type
+                        let key = joinLabels labels
+                        if not (List.contains key (vecToList shapes)) then vecAdd shapes key
+                        // each field's type tokens, kept as index ranges
+                        let flab = vecNew<string> ()
+                        let flo = vecNew<int> ()
+                        let fhi = vecNew<int> ()
+                        let mutable depth = 0
+                        let mutable j = i + 2
+                        let mutable cur = -1
+                        while j < e do
+                            let t = tokAt j
+                            if depth = 0 && t.Kind = Semicolon then
+                                (if cur >= 0 then vecAdd fhi j)
+                                cur <- -1
+                                j <- j + 1
+                            elif depth = 0 && cur < 0 && t.Kind = Ident
+                                 && j + 1 < e && (tokAt (j + 1)).Kind = Operator
+                                 && (tokAt (j + 1)).Text = ":" then
+                                vecAdd flab t.Text
+                                vecAdd flo (j + 2)
+                                cur <- 1
+                                j <- j + 2
+                            else
+                                (if opens t.Kind then depth <- depth + 1
+                                 elif closes t.Kind then depth <- depth - 1)
+                                j <- j + 1
+                        if cur >= 0 then vecAdd fhi e
+                        let anchor = (tokAt i).Offset
+                        vecAdd out (synAt anchor Ident (nameOfShape key))
+                        vecAdd out (synAt anchor Operator "<")
+                        let ls = List.sort labels
+                        List.iteri (fun k (l : string) ->
+                            if k > 0 then vecAdd out (synAt anchor Comma ",")
+                            let mutable found = -1
+                            for m in 0 .. vecLen flab - 1 do
+                                if found < 0 && vecGet flab m = l then found <- m
+                            if found >= 0 && found < vecLen fhi then
+                                for q in vecGet flo found .. vecGet fhi found - 1 do
+                                    vecAdd out (tokAt q)) ls
+                        vecAdd out (synAt anchor Operator ">")
+                    elif hasWith (i + 2) e then
+                        // the base expression carries the type already
+                        vecAdd out (syn LParen "(")
+                        vecAdd out (syn LBrace "{")
+                        for t in inner do vecAdd out t
+                        vecAdd out (syn RBrace "}")
+                        vecAdd out (syn RParen ")")
+                        // a GAP, so this `)` is not adjacent to the next
+                        // expansion's `(`: adjacency is F#'s high-precedence
+                        // application, and `f {| .. |} {| .. |}` became the
+                        // first argument APPLIED to the second
+                        synth <- synth + 1
+                    else
+                        let key = joinLabels labels
+                        if not (List.contains key (vecToList shapes)) then vecAdd shapes key
+                        vecAdd out (syn LParen "(")
+                        vecAdd out (syn LBrace "{")
+                        for t in inner do vecAdd out t
+                        vecAdd out (syn RBrace "}")
+                        vecAdd out (syn Operator ":")
+                        vecAdd out (syn Ident (nameOfShape key))
+                        vecAdd out (syn Operator "<")
+                        let ls = List.sort labels
+                        List.iteri (fun k _ ->
+                            if k > 0 then vecAdd out (syn Comma ",")
+                            vecAdd out (syn Ident "_")) ls
+                        vecAdd out (syn Operator ">")
+                        vecAdd out (syn RParen ")")
+                        // a GAP, so this `)` is not adjacent to the next
+                        // expansion's `(`: adjacency is F#'s high-precedence
+                        // application, and `f {| .. |} {| .. |}` became the
+                        // first argument APPLIED to the second
+                        synth <- synth + 1
+                    i <- e + 2
+                else
+                    vecAdd out (tokAt i)
+                    i <- i + 1
+            vecToList out
+        let body = expandRange 0 n
+        if vecLen shapes = 0 then body
+        else
+            // the declarations go after the module or namespace HEADER: a
+            // type cannot precede it, and everything else may follow it
+            let decls = vecNew<Token> ()
+            for k in 0 .. vecLen shapes - 1 do
+                let ls = splitOn ',' (vecGet shapes k)
+                vecAdd decls (syn Keyword "type")
+                vecAdd decls (syn Ident (nameOfShape (vecGet shapes k)))
+                vecAdd decls (syn Operator "<")
+                List.iteri (fun j _ ->
+                    if j > 0 then vecAdd decls (syn Comma ",")
+                    vecAdd decls (syn Operator "'")
+                    vecAdd decls (syn Ident ("anon" + string j))) ls
+                vecAdd decls (syn Operator ">")
+                vecAdd decls (syn Operator "=")
+                vecAdd decls (syn LBrace "{")
+                List.iteri (fun j (l : string) ->
+                    if j > 0 then vecAdd decls (syn Semicolon ";")
+                    vecAdd decls (syn Ident l)
+                    vecAdd decls (syn Operator ":")
+                    vecAdd decls (syn Operator "'")
+                    vecAdd decls (syn Ident ("anon" + string j))) ls
+                vecAdd decls (syn RBrace "}")
+            let outv = vecNew<Token> ()
+            let barr = vecNew<Token> ()
+            for t in body do vecAdd barr t
+            let bn = vecLen barr
+            // past `module`/`namespace`, its dotted name and an optional `=`
+            let mutable cut = 0
+            let mutable j = 0
+            let mutable seen = false
+            while j < bn && not seen do
+                let t = vecGet barr j
+                if t.Kind = Keyword && (t.Text = "module" || t.Text = "namespace") then
+                    seen <- true
+                    let mutable k = j + 1
+                    while k < bn && ((vecGet barr k).Kind = Ident
+                                     || ((vecGet barr k).Kind = Operator && (vecGet barr k).Text = ".")
+                                     || ((vecGet barr k).Kind = Keyword && (vecGet barr k).Text = "rec")) do
+                        k <- k + 1
+                    if k < bn && (vecGet barr k).Kind = Operator && (vecGet barr k).Text = "=" then k <- k + 1
+                    cut <- k
+                else j <- j + 1
+            for k in 0 .. cut - 1 do vecAdd outv (vecGet barr k)
+            for t in vecToList decls do vecAdd outv t
+            for k in cut .. bn - 1 do vecAdd outv (vecGet barr k)
+            vecToList outv
+    let toks2 =
+        if (toks |> List.exists (fun t -> t.Kind = Operator && t.Text = "$")) then expandInterp toks else toks
+    if (toks2 |> List.exists (fun t -> t.Kind = LBrace)) then expandAnon (strLen src) toks2 else toks2
 
 /// `tokenize`, with every offset shifted by `base0` — an interpolation hole
 /// is lexed on its own text but has to report the offsets it really occupies.
