@@ -18,15 +18,25 @@ let private adaptiveRoot =
     let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
     home + "/projects/FSharp.Data.Adaptive/src/FSharp.Data.Adaptive"
 
+/// A child process, BOUNDED. Nothing bounded this before, and a wasmtime
+/// running the suite hung and spun a core for 8.6 days before anyone noticed
+/// — a test that never finishes is not a test that passes.
+///
+/// The reads are async on purpose: `ReadToEnd` blocks until the pipe closes,
+/// so a child that hangs WITHOUT printing never reaches `WaitForExit` and no
+/// timeout on that call can fire. That is the shape the hang actually had.
 let private run (exe : string) (args : string) : string * string * int =
     let psi = System.Diagnostics.ProcessStartInfo(exe, args)
     psi.RedirectStandardOutput <- true
     psi.RedirectStandardError <- true
     use p = System.Diagnostics.Process.Start psi
-    let o = p.StandardOutput.ReadToEnd()
-    let e = p.StandardError.ReadToEnd()
-    p.WaitForExit()
-    o, e, p.ExitCode
+    let ot = p.StandardOutput.ReadToEndAsync()
+    let et = p.StandardError.ReadToEndAsync()
+    // the suite runs in ~90 s; ten minutes is a hang on any machine
+    if not (p.WaitForExit (10 * 60 * 1000)) then
+        (try p.Kill true with _ -> ())
+        failwithf "%s did not finish within 10 minutes — killed (it normally takes ~90s)" exe
+    ot.Result, et.Result, p.ExitCode
 
 [<Tests>]
 let adaptiveSuiteTests =

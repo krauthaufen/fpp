@@ -214,4 +214,47 @@ noteWrite (&seqv, "c")
 eq "writes-in-order" trace "abc"
 eq "writes-all-landed" (string seqv) "3"
 
+// ---- a write FOLLOWED by statements (the statement-position dispatch) ------
+// the write lowered through the statement path, which bypassed the offset
+// interception and stored through the tagged word into nowhere — the write
+// VANISHED whenever anything followed it in the body
+
+let growList (r : byref<int list>, n : int) : unit =
+    r <- n :: r
+    let mutable after = 0
+    after <- after + 1
+    ignore after
+
+let statementWrite () : string =
+    let mutable xs : int list = []
+    growList (&xs, 7)
+    growList (&xs, 8)
+    string (List.length xs) + "/" + string (List.head xs)
+
+eq "byref-write-then-statements" (statementWrite ()) "2/8"
+
+// ---- allocation BEFORE the dispatch, through an array element --------------
+// the callee churns first; the byref arrives as a view over an element (an
+// unconvertible caller), so this pins the heap path with the collector
+// moving things between entry and the write
+
+let churnThenGrow (r : byref<int list>, n : int) : unit =
+    let mutable churn : int list = []
+    let mutable i = 0
+    while i < 20 do
+        churn <- i :: churn
+        i <- i + 1
+    ignore churn
+    r <- n :: r
+
+let viaElement () : string =
+    let box = [| ([] : int list) |]
+    let mutable i = 0
+    while i < 200 do
+        churnThenGrow (&box.[0], i)
+        i <- i + 1
+    string (List.length box.[0]) + "/" + string (List.head box.[0])
+
+eq "byref-churn-into-element" (viaElement ()) "200/199"
+
 printfn "DONE tests=%d failures=%d" ntests failures

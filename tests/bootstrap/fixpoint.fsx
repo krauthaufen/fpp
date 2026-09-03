@@ -349,8 +349,40 @@ let out, err, code =
         if mcode <> 0 then (printfn "wasm-merge failed: %s" (merr.Substring (0, min 800 merr.Length)); exit 1)
         let _, perr, pcode = run "wasm-tools" ("parse " + mergedWat + " -o " + mergedWasm)
         if pcode <> 0 then (printfn "wasm-tools parse failed: %s" (perr.Substring (0, min 800 perr.Length)); exit 1)
+        // FORWARD the FPP_ flags: stage-1 can read the environment now (WASI
+        // getenv), so a pass gated on one must see the same setting stage-0
+        // did — otherwise the two stages compile differently BY CONSTRUCTION
+        // and the byte comparison means nothing. That artifact is what made an
+        // env-gated pass untestable here for so long.
+        let fwd =
+            [ "FPP_INLINE"; "FPP_INLINE_MAX"; "FPP_INLINE_THRESHOLD"; "FPP_INLINE_ROUNDS"
+              "FPP_INLINE_REPEAT"; "FPP_LICM"; "FPP_SPECIALIZE" ]
+            |> List.choose (fun k ->
+                match System.Environment.GetEnvironmentVariable k with
+                | null | "" -> None
+                | v -> Some (" --env " + k + "=" + v))
+            |> String.concat ""
         run wasmtime ("run -W exceptions=y,gc=y,max-wasm-stack=536870912"
-                      + " --env FPPRT_HEAP_MB=1024"
+                      // the self-hosted compiler's heap. A knob, because the
+                      // nofl heap is RESERVED up front and the driver then
+                      // builds its whole answer as one string through
+                      // `str_cat`: the bigger the emitted compiler, the more
+                      // contiguous space that needs BEYOND the reservation,
+                      // and wasm32 only has 2 GB of address space to split
+                      // between them. A larger heap can therefore fail where
+                      // a smaller one succeeds.
+                      + " --env FPPRT_HEAP_MB="
+                      + (match System.Environment.GetEnvironmentVariable "FPP_FIXPOINT_HEAP_MB" with
+                         // 768, not 1024: the nofl heap is RESERVED up front
+                         // and the driver then builds its whole answer — an
+                         // ~18 MB wasm — as one string through `str_cat`, which
+                         // needs a large CONTIGUOUS block on top. wasm32 has
+                         // 2 GB for both, so the larger reservation is the one
+                         // that fails: at 1024 the answer cannot be built, at
+                         // 768 the fixpoint is byte-exact.
+                         | null | "" -> "768"
+                         | v -> v)
+                      + fwd
                       + " --dir " + srvDir + "::."
                       + " " + mergedWasm)
     else

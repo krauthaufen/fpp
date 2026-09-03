@@ -10,7 +10,22 @@ root=$(cd "$here/../../.." && pwd)
 adaptive="$HOME/projects/FSharp.Data.Adaptive/src/FSharp.Data.Adaptive"
 [ -d "$adaptive" ] || { echo "SKIP: no FSharp.Data.Adaptive checkout"; exit 0; }
 out=$(mktemp -d)
-trap 'rm -rf "$out"' EXIT
+# KEEP THE INPUT WHEN IT FAILS. This gate once failed inside a parallel run
+# with five type errors on a 900 KB generated suite, and the trap deleted the
+# only copy of what it had been given — the same inputs regenerated and
+# compiled clean afterwards, so there was nothing left to diagnose. A failure
+# here is rare and expensive to reproduce; the directory is cheap.
+ok=0
+cleanup() {
+    if [ "$ok" = 1 ]; then rm -rf "$out"
+    else echo "adaptive-gate: inputs KEPT for diagnosis in $out"; fi
+}
+trap cleanup EXIT
+
+# a hang is not a pass. One of these wedged a core for 8.6 days before it was
+# noticed, because nothing bounded it — the suite takes ~90s, so ten minutes
+# is a hang however slow the machine is.
+runbounded() { timeout 600 "$@"; }
 
 python3 "$root/tests/port-adaptive.py" "$adaptive" "$out/lib.fpp"
 cat "$out/lib.fpp" "$root/tests/adaptive-suite/Tests.fpp" > "$out/suite.fpp"
@@ -34,7 +49,7 @@ gcc -O1 -g -I"$rt" -I"$rt/gc/api" -I"$rt/gc/src" -DNDEBUG -DGC_PRECISE_ROOTS=1 \
     -DGC_ATTRS="\"$rt/gc/api/mmc-attrs.h\"" -DGC_EMBEDDER="\"$rt/fpprt-embedder.h\"" \
     "$out/suite.c" "$rt/build/mmc/fpprt.o" "$out/fpprt-lang.o" \
     "$rt/build/mmc/libwhippet.a" -lm -lpthread -o "$out/suite"
-FPP_HEAP_MB=1024 "$out/suite" > "$out/native.txt"
+FPP_HEAP_MB=1024 runbounded "$out/suite" > "$out/native.txt"
 check "$out/native.txt" "native/mmc"
 
 # ---- wasm-linear (emcc, optional) ------------------------------------------
@@ -49,9 +64,10 @@ if command -v emcc >/dev/null 2>&1; then
         -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sWASM_LEGACY_EXCEPTIONS=0 \
         -sSTACK_SIZE=8388608 -s STANDALONE_WASM -s PURE_WASI=1 \
         -s ALLOW_MEMORY_GROWTH=1 -o "$out/suite.wasm"
-    "$HOME/.wasmtime/bin/wasmtime" run -W exceptions=y \
+    runbounded "$HOME/.wasmtime/bin/wasmtime" run -W exceptions=y \
         --env FPP_HEAP_MB=1024 "$out/suite.wasm" > "$out/wasm.txt"
     check "$out/wasm.txt" "wasm-linear/mmc"
 else
     echo "wasm-linear: SKIP (no emcc)"
 fi
+ok=1

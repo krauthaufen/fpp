@@ -33,16 +33,19 @@ for g in "$here"/tooling/cback/*-gate.sh; do
   gates+=("$(basename "$g" .sh)|$g")
 done
 gates+=("hkt-gate|$here/tooling/hkt-gate.sh")
+gates+=("classconst-gate|$here/tooling/classconst-gate.sh")
 gates+=("pkg-gate|$here/tooling/pkg-gate.sh")
 [ -x "$here/tooling/jsinterop/jsinterop-gate.sh" ] && gates+=("jsinterop-gate|$here/tooling/jsinterop/jsinterop-gate.sh")
 [ -x "$here/tooling/gc/cleanup-gate.sh" ] && gates+=("cleanup-gate|$here/tooling/gc/cleanup-gate.sh")
 [ -x "$here/tooling/gc/weak-gate.sh" ] && gates+=("weak-gate|$here/tooling/gc/weak-gate.sh")
+[ -x "$here/tooling/gc/noalloc-gate.sh" ] && gates+=("noalloc-gate|$here/tooling/gc/noalloc-gate.sh")
 gates+=("conformance|$here/conformance/run.sh")
 # the benchmarks as a regression check: answers, bounds-check counts, and
 # times under a loose ceiling. --full only — it runs every benchmark three
 # times and is minutes of wall clock.
 [ "$full" = 1 ] && gates+=("perf-regress|$here/tooling/perf/regress.sh")
 gates+=("conformance-neg|$here/conformance/neg.sh")
+gates+=("web-gate|$here/tooling/web-gate.sh")
 if [ "$full" = 1 ]; then
   # heaviest first, so they overlap the whole small-gate tail. The unit
   # suite's sequenced adaptive test (an 8-minute in-process compile) runs

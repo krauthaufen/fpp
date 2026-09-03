@@ -157,4 +157,23 @@ type WithStatics =
 
 test "struct-static-member" (WithStatics.Origin.V = 0)
 
+// ---- the ONE-LINE enum declaration ------------------------------------------
+// `type E = A = 1 | B = 2` is the barless form of the block above, and the
+// literal after the `=` is the only thing separating it from the type
+// ABBREVIATION `type E = A`. Read as an abbreviation, the value after it was
+// a syntax error at top level and the form did not parse at all.
+
+type Level = Low = 1 | High = 2
+
+test "one-line-enum-first-case" (int Level.Low = 1)
+test "one-line-enum-second-case" (int Level.High = 2)
+test "one-line-enum-equality" (Level.Low = Level.Low)
+test "one-line-enum-inequality" (Level.Low <> Level.High)
+test "one-line-enum-printed" (string Level.High = "High")
+
+// the abbreviation it could have been mistaken for still abbreviates
+type Count = int
+let counted : Count = 7
+test "abbreviation-still-abbreviates" (counted = 7)
+
 printfn "DONE tests=%d failures=%d" ntests failures

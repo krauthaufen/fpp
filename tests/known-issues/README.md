@@ -20,10 +20,9 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
 ~/.wasmtime/bin/wasmtime run -W gc=y,exceptions=y /tmp/x.wasm
 ```
 
-* `let-rec-and-group-self-host.fpp` — a `let rec ... and` group inside the
-  `lower` function miscompiles under SELF-HOST only. Not reproduced in
-  isolation; the note records exactly what was ruled out. Kept as the
-  record of a shape to avoid, not a live defect.
+This directory currently holds NO open issues — only this README. The last
+entry (`let-rec-and-group-self-host.fpp`) was root-caused and is covered by
+`suites/letrecand.fpp`; see the bottom of this file.
 
 Fixed and removed (see git history for the repros):
 `module-abbreviation` (`module Ab = Inner` parsed as a module with an EMPTY
