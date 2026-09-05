@@ -188,6 +188,12 @@ type private St =
       /// read back by its methods from `self`. name -> class-param count. A
       /// stamped subclass is concrete (empty Quantified ctor) and is absent.
       WitnessedClasses : Dict<string, int>
+      /// object expressions (obj@N) close over ENCLOSING type params (their
+      /// interface's `'T`, a generic capture). synth -> the enclosing type var
+      /// ids, in witness-slot order. Filled from the `#id` tyParams Lower puts
+      /// on the obj@ record; the construction reads their witnesses out of the
+      /// enclosing ctx.Witness, and the members read them back off `self`.
+      ObjWit : Dict<string, int list>
       /// interface dispatch: "bareIface|method" -> vtable slot; the row width;
       /// the base address of the flat [class-id][slot] vtable in linear memory;
       /// and, for hierarchy type tests, a class/interface name -> the set of
@@ -7399,8 +7405,16 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             // stored RAW (never scanned — they point into immortal g_witnesses
             // static data). Slot j forwards this ctor's j-th class-param witness
             // from its hidden param, so the class' methods can read it off self.
+            // an obj@ reads its enclosing type-var witnesses from the ENCLOSING
+            // context (ObjWit names the vars); an ordinary class forwards its
+            // ctor's hidden witness params (ClassCtorWits).
+            let objVars = dictTryFind st.ObjWit name
             let witVal j =
-                match List.tryItem j ctx.ClassCtorWits |> Option.bind (fun (wid, _) -> dictTryFind ctx.Witness wid) with
+                let fromWid =
+                    match objVars with
+                    | Some vars -> List.tryItem j vars |> Option.bind (fun vid -> dictTryFind ctx.Witness vid)
+                    | None -> List.tryItem j ctx.ClassCtorWits |> Option.bind (fun (wid, _) -> dictTryFind ctx.Witness wid)
+                match fromWid with
                 | Some r -> LGet (wReg r)
                 | None -> witnessPtrRM st 4 4 1
             let wits = [ 0 .. k - 1 ] |> List.map witVal
@@ -9753,7 +9767,12 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
         match refKinds with
         | Some ks when List.length ks = n -> [ 0 .. n - 1 ] |> List.exists (fun i -> List.item i ks = RKGen && (witOf i).IsNone)
         | _ -> false
-    (if gc && unresolvedGen then witBump "obj" curFnDbg)
+    (if gc && unresolvedGen then
+        witBump "obj" curFnDbg
+        if System.Environment.GetEnvironmentVariable "FPP_WITDET" = "1" then
+            let nm = st.ClassId |> dictPairs |> List.tryPick (fun (n2, c2) -> if c2 = cid then Some n2 else None)
+            let unres = match refKinds with Some ks -> [ 0 .. n - 1 ] |> List.filter (fun i -> List.item i ks = RKGen && (witOf i).IsNone) | None -> []
+            eprintfn "WITDETOBJ %s cid=%d name=%s unresolved=[%s]" curFnDbg cid (match nm with Some s -> s | None -> "?") (unres |> List.map string |> String.concat ","))
     if gc && cid = CID_ARRAY then
         // [tag][len][elems]: fpprt_alloc_array writes tag@0 and len@4; we store
         // the elements from offset 8. Each element is pushed to the shadow stack
@@ -13292,7 +13311,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
           LamName = refMapNew shallowLamHash; TailApp = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew (); LamWits = dictNew ()
           RecFields = dictNew (); ClassNames = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); SubFieldKind = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew (); EnumConst = dictNew ()
-          ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew (); CasePod = dictNew (); UnionFlat = dictNew ()
+          ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew (); ObjWit = dictNew (); CasePod = dictNew (); UnionFlat = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
           FuncRetStruct = dictNew (); FuncParamPlan = dictNew (); FuncParamByRef = dictNew (); BrParamPay = brParamPay; TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
@@ -13403,7 +13422,20 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     (let recTyParams = dictNew<string, int> ()
      for d in decls0 do
          match d with
-         | DRecord (n, ps, _, isStruct) when not (List.isEmpty ps) && not isStruct -> dictSet recTyParams n (List.length ps)
+         | DRecord (n, ps, fs, isStruct) when not (List.isEmpty ps) && not isStruct ->
+             dictSet recTyParams n (List.length ps)
+             // an object expression's tyParams are `#id` markers naming the
+             // ENCLOSING type vars it closes over (Lower). Record them so the
+             // construction fills the witness slots from the enclosing scope
+             // and the members read them back off self (selfWits below). obj@ is
+             // a DRecord (no DClass row), so witness it here directly.
+             if n.StartsWith "obj@" && ps |> List.forall (fun p -> p.StartsWith "#") then
+                 dictSet st.ObjWit n (ps |> List.map (fun p -> int (p.Substring 1)))
+                 (match dictTryFind st.ClassId n with
+                  | Some cid ->
+                      dictSet st.WitnessedClasses n (List.length ps)
+                      dictSet st.WitOff cid (HDR + 4 * List.length fs)
+                  | None -> ())
          | _ -> ()
      let witExcluded (n : string) =
          let bare = let i = n.IndexOf "$<" in if i > 0 then n.Substring (0, i) else n
@@ -14606,6 +14638,11 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 match (match prune sch.Body with TFun (a, _) -> Some a | _ -> None) with
                 | Some recv ->
                     (match prune recv with
+                     // an obj@ member: the receiver carries no type args (the
+                     // synth class is nominal), so read the enclosing type vars
+                     // it closed over off self, in ObjWit order.
+                     | TCon (cn, _) when (dictTryFind st.ObjWit cn).IsSome ->
+                         (match dictTryFind st.ObjWit cn with Some vars -> vars |> List.mapi (fun j vid -> (vid, j)) | None -> [])
                      | TCon (cn, args) when (dictTryFind st.WitnessedClasses cn).IsSome ->
                          args |> List.mapi (fun j a -> match prune a with TVar vv -> Some (vv.Id, j) | _ -> None) |> List.choose id
                      | _ -> [])

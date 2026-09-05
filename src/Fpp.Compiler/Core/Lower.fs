@@ -3651,7 +3651,28 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | _ -> "?"
                     let cm = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then "&" else ""
                     v.Name, cm + tn
-                vecAdd decls (DRecord (synth, [], caps |> List.map capFieldTy, false))
+                // an object expression closes over the ENCLOSING type params
+                // (its interface's `'T`, a generic capture): its members build
+                // aggregates in those, so they need the witnesses. Record the
+                // free type vars of the captures as the obj@ class' witness
+                // params (`#id`), stored as trailing slots and filled at
+                // construction from the enclosing context — so a reader over a
+                // stamped `int` is precisely traced, not conservatively.
+                let objTyVars =
+                    let acc = vecNew<int> ()
+                    let seenV = dictNew<int, bool> ()
+                    let rec go (t : Type) =
+                        match prune t with
+                        | TVar v -> let id = prunedId v in (if (dictTryFind seenV id).IsNone then (dictSet seenV id true; vecAdd acc id))
+                        | TCon (_, args) -> List.iter go args
+                        | TApp (h, args) -> go h; List.iter go args
+                        | TFun (a, b) -> go a; go b
+                        | TTuple ts -> List.iter go ts
+                        | _ -> ()
+                    for (_, sch) in caps do go sch.Body
+                    vecToList acc
+                let objTyParams = objTyVars |> List.map (fun id -> "#" + string id)
+                vecAdd decls (DRecord (synth, objTyParams, caps |> List.map capFieldTy, false))
                 let savedClass = currentClass
                 currentClass <- synth
                 let bound =

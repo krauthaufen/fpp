@@ -471,7 +471,7 @@ trace_one(struct gc_ref ref, struct gc_heap *heap,
          scalars in generic slots; trace them conservatively (validated,
          marked in place) so a raw even int is never chased or rewritten.
          Evacuation is disabled at init (heap_has_ambiguous_edges). */
-      size_t cons_sz = gc_object_conservative_body(ref);
+      size_t cons_sz = fpprt_ranges_ambiguous_ ? gc_object_conservative_body(ref) : 0;
       if (GC_UNLIKELY(cons_sz != 0)) {
         uintptr_t addr = gc_ref_value(ref);
         trace_conservative_edges(addr, addr + cons_sz, 0, heap, worker);
