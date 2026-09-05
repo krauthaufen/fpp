@@ -529,6 +529,12 @@ void fpprt_pin(fpprt_ref o) {
   gc_pin_object(mut_, gc_ref((uintptr_t)o));
 }
 
+void fpprt_unpin(fpprt_ref o) {
+  // temporary pinning: allow the object to move again at the next collection.
+  if (!gc_can_pin_objects()) return;
+  gc_unpin_object(mut_, gc_ref((uintptr_t)o));
+}
+
 /* ---- control ----------------------------------------------------------- */
 
 void fpprt_collect(void) { gc_collect(mut_, GC_COLLECTION_COMPACTING); }

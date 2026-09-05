@@ -1714,6 +1714,23 @@ nofl_space_pin_object(struct nofl_space *space, struct gc_ref ref) {
   } while (!gc_atomic_cmpxchg_weak(metadata, &byte, new_byte));
 }
 
+static inline void
+nofl_space_unpin_object(struct nofl_space *space, struct gc_ref ref) {
+  // temporary pinning: clear the pinned bit so the object may move at the next
+  // collection. No-op in the conservative configuration (the bit means
+  // "trace conservatively" there, and everything is pinned anyway).
+  if (nofl_space_heap_has_ambiguous_edges (space))
+    return;
+  uint8_t *metadata = nofl_metadata_byte_for_object(ref);
+  uint8_t byte = gc_atomic_load_relaxed(metadata);
+  if (!(byte & NOFL_METADATA_BYTE_PINNED))
+    return;
+  uint8_t new_byte;
+  do {
+    new_byte = byte & ~((uint8_t) NOFL_METADATA_BYTE_PINNED);
+  } while (!gc_atomic_cmpxchg_weak(metadata, &byte, new_byte));
+}
+
 static inline uint8_t
 clear_logged_bits_in_evacuated_object(uint8_t head, uint8_t *metadata,
                                       size_t count) {

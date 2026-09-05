@@ -184,6 +184,7 @@ uint32_t fpprt_drain1(uint32_t kind);
  * always-moving collectors this aborts — pinning is a capability the
  * embedder selects with the collector). */
 void fpprt_pin(fpprt_ref o);
+void fpprt_unpin(fpprt_ref o);
 int fpprt_can_pin(void);
 
 /* ---- control ----------------------------------------------------------- */

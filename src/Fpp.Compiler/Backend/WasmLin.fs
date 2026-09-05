@@ -514,6 +514,7 @@ let private importFpprt (m : Mod) : unit =
     // per-object pinning: real under the mmc reactor, aborts under semi —
     // Array.pin's zero-copy contract needs the object to stop moving
     importFn m "fpprt" "fpprt_pin" "$fppin" [ "i32" ] []
+    importFn m "fpprt" "fpprt_unpin" "$fppunpin" [ "i32" ] []
     importMem m "fpprt" "memory" 258 32768
 
 // the slot key for an interface method uses the interface's BARE name: the
@@ -8131,16 +8132,23 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // [hdr][len]). Standalone: storage never moves, the address IS stable.
     // GC: fpprt_pin first — real under the mmc reactor (Immix per-object
     // pinning, the browser/product collector), an abort under semi (the
-    // shakeout collector; a pin-using program belongs on mmc). The pin is
-    // PERMANENT — mmc pins for the object's whole life — so unpin is a
-    // no-op in both modes; pin long-lived buffers once, not per call.
+    // shakeout collector; a pin-using program belongs on mmc). Pinning is
+    // TEMPORARY: Array.unpin clears it and the object may move at the next
+    // collection (movement resumes when nothing holds it). Under the default
+    // conservative mode nothing moves anyway, so pin/unpin are inert there.
     | EArrayPin (_, arr) ->
         if gc then
             let r = freshTmp ctx
             LDo ([ LSet (wReg r, coreToLowE ctx arr); LCallVoidS ("$fppin", [ LGet (wReg r) ]) ],
                  LPrim (AddW, [ LGet (wReg r); LConstW (HDR + 4) ]))
         else LPrim (AddW, [ coreToLowE ctx arr; LConstW (HDR + 4) ])
-    | EArrayUnpin (_, arr) -> LDo ([ LEval (coreToLowE ctx arr) ], lowInt 0)
+    // Array.unpin clears the pin so the object may move again at the next
+    // collection (temporary per-object pinning under mmc). No-op standalone.
+    | EArrayUnpin (_, arr) ->
+        if gc then
+            let r = freshTmp ctx
+            LDo ([ LSet (wReg r, coreToLowE ctx arr); LCallVoidS ("$fppunpin", [ LGet (wReg r) ]) ], lowInt 0)
+        else LDo ([ LEval (coreToLowE ctx arr) ], lowInt 0)
     | EArrayBytes (nm, arr) ->
         let w =
             match storLTy (storKindRes ctx.LSt nm) with

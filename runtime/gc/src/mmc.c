@@ -1166,6 +1166,13 @@ gc_pin_object(struct gc_mutator *mut, struct gc_ref ref) {
   // Otherwise if it's a large or external object, it won't move.
 }
 
+void
+gc_unpin_object(struct gc_mutator *mut, struct gc_ref ref) {
+  struct nofl_space *nofl = heap_nofl_space(mutator_heap(mut));
+  if (nofl_space_contains(nofl, ref))
+    nofl_space_unpin_object(nofl, ref);
+}
+
 struct gc_ref
 gc_resolve_conservative_ref(struct gc_heap *heap,
                             struct gc_conservative_ref ref,
