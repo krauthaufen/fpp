@@ -294,6 +294,8 @@ type private St =
       /// with equal contents must compare equal. Dispatch and type tests keep
       /// the exact cid.
       mutable CidEqSlot : int
+      mutable WitOffSlot : int
+      WitOff : Dict<int, int>
       /// root slots for the two descriptor arrays: tid -> index, and the flat
       /// `[n, off, kind, off, kind, …]` data
       mutable DescIdxSlot : int
@@ -425,6 +427,7 @@ let mutable private gcConsRawTid = 0
 let mutable private gcConsRefTid = 0
 let mutable private gcCmpTblSlot = 0
 let mutable private gcCidEqSlot = 0
+let mutable private gcWitOffSlot = 0
 let mutable private gcDescIdxSlot = 0
 let mutable private gcDescDataSlot = 0
 // identity dispatch ($cmpv/$hashv -> a class' own Equals/GetHashCode/CompareTo):
@@ -7432,7 +7435,19 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
                 | Some e2 -> refKindOfElemC ctx e2
                 | None -> copiedKind fnm)
-        LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 slots (Some kinds) [])
+        // a witnessed DERIVED class appends its trailing witness slots after all
+        // fields (from the ctor's hidden witness params); the base object's own
+        // witnesses are dropped — the derived's cover every param.
+        match (if gc then dictTryFind st.WitnessedClasses name else None) with
+        | Some k ->
+            let witVal j =
+                match List.tryItem j ctx.ClassCtorWits |> Option.bind (fun (wid, _) -> dictTryFind ctx.Witness wid) with
+                | Some r -> LGet (wReg r)
+                | None -> witnessPtrRM st 4 4 1
+            let wits = [ 0 .. k - 1 ] |> List.map witVal
+            LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 (slots @ wits) (Some (kinds @ List.replicate k RKRaw)) [])
+        | None ->
+            LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 slots (Some kinds) [])
     // an enum case IS its raw integer value — no heap object
     | ECtor (case, _, _) when (dictTryFind st.EnumConst case).IsSome ->
         LConstW (optGet (dictTryFind st.EnumConst case))
@@ -12146,10 +12161,14 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<st
         match ps with
         | self0 :: _ when not (List.isEmpty selfWits) ->
             let selfReg = regOf ctx (key self0)
-            selfWits |> List.map (fun (vid, off) ->
+            let wbReg = freshTmp ctx
+            let tblPtr = LLoad (W, LGetGlobal "$roots", 4 * gcWitOffSlot)
+            let wbInit = LSet (wReg wbReg, LLoad (W, LPrim (AddW, [ tblPtr; LPrim (MulW, [ lowHeaderCid (wReg selfReg); LConstW 4 ]) ]), 8))
+            wbInit ::
+            (selfWits |> List.map (fun (vid, j) ->
                 let r = freshTmp ctx
                 dictSet ctx.Witness vid r
-                LSet (wReg r, LLoad (W, LGet (wReg selfReg), off)))
+                LSet (wReg r, LLoad (W, LPrim (AddW, [ LGet (wReg selfReg); LPrim (AddW, [ LGet (wReg wbReg); LConstW (4 * j) ]) ]), 0))))
         | _ -> []
     // a STAMPED generic-class member: its class type param is concrete here, so
     // seed a CONSTANT static witness for it (the receiver is fully concrete, so
@@ -13274,7 +13293,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
           FuncRetStruct = dictNew (); FuncParamPlan = dictNew (); FuncParamByRef = dictNew (); BrParamPay = brParamPay; TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           FieldOwnerOf = dictNew ()
-          GcConstData = vecNew (); GcCloData = vecNew (); CloSlot = dictNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; CidEqSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
+          GcConstData = vecNew (); GcCloData = vecNew (); CloSlot = dictNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; CidEqSlot = 0; WitOffSlot = 0; WitOff = dictNew (); DescIdxSlot = 0; DescDataSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -13329,43 +13348,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // a stamped subclass resolves its fields through the base it was stamped
     // from (DClass carries `Some base`); record subclass -> base for EField.
     for d in decls0 do match d with DClass (n, Some b, _, _) when b <> n -> dictSet st.RecBase n b | _ -> ()
-    // WITNESSED CLASSES: a CANONICAL generic class carries one trailing witness
-    // pointer per type parameter, so its MEMBERS can recover 'a's runtime GC
-    // nature (raw-vs-ref) off `self` instead of building unwitnessed aggregates
-    // that force the conservative tagged fallback. The ctor already builds its
-    // object precisely (its FuncWitness resolves each generic field); this adds
-    // the trailing slots (filled from the ctor's hidden witness params) and lets
-    // `selfWits` seed a member's ctx.Witness from them. Phase 1: NON-inherited
-    // generic classes only (a base's witness prefix is Phase 1b). A stamped
-    // clone (`Base$inst`, has a RecBase) is concrete and needs none. Structs
-    // ride by value and have no members that build generic objects.
-    (let recTyParams = dictNew<string, int> ()
-     for d in decls0 do
-         match d with
-         | DRecord (n, ps, _, isStruct) when not (List.isEmpty ps) && not isStruct -> dictSet recTyParams n (List.length ps)
-         | _ -> ()
-     // ephemeron-backed and other runtime-special classes have a fixed layout
-     // the collector assumes — appending witness slots corrupts them.
-     let witExcluded (n : string) =
-         let bare = let i = n.IndexOf "$<" in if i > 0 then n.Substring (0, i) else n
-         bare = "WeakReference" || bare = "ConditionalWeakTable"
-     // a class that is a BASE of another (has subclasses) cannot carry witness
-     // slots at a static offset: a base member reads self's witness where a
-     // derived object holds a derived field. Only leaf-of-hierarchy classes
-     // (no subclasses) are witnessed by Phase 1; inheritance is Phase 1b (a
-     // runtime witness-offset table). RecBase values are the base names.
-     let baseNames = dictNew<string, bool> ()
-     for _, b in dictPairs st.RecBase do dictSet baseNames b true
-     if System.Environment.GetEnvironmentVariable "FPP_NOWITCLS" <> "1" then
-      for d in decls0 do
-         match d with
-         | DClass (n, None, _, _) when (dictTryFind st.RecBase n).IsNone && not (witExcluded n) && (dictTryFind baseNames n).IsNone ->
-             (match dictTryFind recTyParams n with
-              | Some k when k > 0 ->
-                  dictSet st.WitnessedClasses n k
-                  (if System.Environment.GetEnvironmentVariable "FPP_WCLS" = "1" then eprintfn "WCLS %s k=%d nf=%d" n k (match dictTryFind st.RecFields n with Some fs -> List.length fs | None -> -1))
-              | _ -> ())
-         | _ -> ())
+    // (witness population moved AFTER the field-expand — see below)
     for d in decls0 do
         match d with
         | DFieldSubst (n, fs) ->
@@ -13406,6 +13389,34 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         | [ f ] when (dictTryFind noCollapse (fst kv)).IsNone && (dictTryFind classNames (fst kv)).IsNone ->
             dictSet st.Collapse (fst kv) f
         | _ -> ()
+    // WITNESSED CLASSES (RecFields is FULL here): every generic class — base
+    // and derived alike — carries one trailing witness pointer per type
+    // parameter, after ALL its fields. A member reads them off self at the
+    // per-cid byte offset in WitOff, so a BASE member finds a DERIVED object's
+    // witnesses at the derived (larger) offset. Ephemeron-backed runtime
+    // classes are excluded (fixed layout); stamped clones (`Base$inst`) are
+    // concrete and need none.
+    (let recTyParams = dictNew<string, int> ()
+     for d in decls0 do
+         match d with
+         | DRecord (n, ps, _, isStruct) when not (List.isEmpty ps) && not isStruct -> dictSet recTyParams n (List.length ps)
+         | _ -> ()
+     let witExcluded (n : string) =
+         let bare = let i = n.IndexOf "$<" in if i > 0 then n.Substring (0, i) else n
+         bare = "WeakReference" || bare = "ConditionalWeakTable"
+     let isStampedClone (n : string) =
+         match dictTryFind st.RecBase n with Some b -> n.StartsWith (b + "$") | None -> false
+     if System.Environment.GetEnvironmentVariable "FPP_NOWITCLS" <> "1" then
+      for d in decls0 do
+         match d with
+         | DClass (n, _, _, _) when not (isStampedClone n) && not (witExcluded n) ->
+             (match dictTryFind recTyParams n, dictTryFind st.ClassId n with
+              | Some k, Some cid when k > 0 ->
+                  dictSet st.WitnessedClasses n k
+                  let nf = match dictTryFind st.RecFields n with Some fs -> List.length fs | None -> 0
+                  dictSet st.WitOff cid (HDR + 4 * nf)
+              | _ -> ())
+         | _ -> ())
     // record every STRUCT record's ordered declared fields FIRST: the layout
     // below resolves a nested struct field through this table, so it has to be
     // complete before the first layout is computed (a record may mention a
@@ -14082,6 +14093,9 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         st.CidEqSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
         gcCidEqSlot <- st.CidEqSlot
+        st.WitOffSlot <- st.RootNext
+        st.RootNext <- st.RootNext + 1
+        gcWitOffSlot <- st.WitOffSlot
         st.DescIdxSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
         st.DescDataSlot <- st.RootNext
@@ -14589,8 +14603,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 | Some recv ->
                     (match prune recv with
                      | TCon (cn, args) when (dictTryFind st.WitnessedClasses cn).IsSome ->
-                         let nf = match dictTryFind st.RecFields cn with Some fs -> List.length fs | None -> 0
-                         args |> List.mapi (fun j a -> match prune a with TVar vv -> Some (vv.Id, HDR + 4 * nf + 4 * j) | _ -> None) |> List.choose id
+                         args |> List.mapi (fun j a -> match prune a with TVar vv -> Some (vv.Id, j) | _ -> None) |> List.choose id
                      | _ -> [])
                 | None -> []
             // a stamped generic-class member: constant witnesses for its class
@@ -14779,7 +14792,11 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
          ic rf gcIntTid; ic rf cidMax; callf rf "$fpallocn"; ls rf "$t"
          gg rf "$roots"; ic rf (4 * st.CidEqSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
          for sc, cc in pairs do
-             lg rf "$t"; ic rf (8 + 4 * sc); ins rf "i32.add"; ic rf cc; mem rf "i32.store")
+             lg rf "$t"; ic rf (8 + 4 * sc); ins rf "i32.add"; ic rf cc; mem rf "i32.store"
+         ic rf gcIntTid; ic rf cidMax; callf rf "$fpallocn"; ls rf "$t"
+         gg rf "$roots"; ic rf (4 * st.WitOffSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
+         for cid, off in dictPairs st.WitOff do
+             lg rf "$t"; ic rf (8 + 4 * cid); ins rf "i32.add"; ic rf off; mem rf "i32.store")
         // tid -> shape info (kind<<20 | start<<10 | nwords) for the generic $cmpv
         if st.TidNext > 0 then
             ic rf gcIntTid; ic rf st.TidNext; callf rf "$fpallocn"; ls rf "$t"
@@ -14787,8 +14804,17 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // tid -> its shape key, for naming a SCALAR ARRAY's element kind
             let keyOfTid = dictNew<int, string> ()
             for k2, t2 in dictPairs st.Tids do dictSet keyOfTid t2 k2
+            // witnessed classes carry k TRAILING witness slots that are NOT part
+            // of the value: the structural walkers ($eqv/$cmpv/$hashv) must stop
+            // before them, so their nwords is the FIELD count, not the alloc size.
+            let witKByCid = dictNew<int, int> ()
+            for nm, k in dictPairs st.WitnessedClasses do
+                match dictTryFind st.ClassId nm with Some cid -> dictSet witKByCid cid k | None -> ()
+            let cidByTid = dictNew<int, int> ()
+            for t2, c2 in vecToList st.TidCid do dictSet cidByTid t2 c2
             for tid, size, kind, start in vecToList st.TidRegs do
-                let nwords = size / 4
+                let witK = match dictTryFind cidByTid tid |> Option.bind (fun c -> dictTryFind witKByCid c) with Some k -> k | None -> 0
+                let nwords = size / 4 - witK
                 // ref bitmask (bit w set = word w is a pointer), packed above the
                 // 10-bit word count. FK_STRUCT knows its exact ref OFFSETS, so a raw
                 // scalar anywhere (a tuple's trailing int) is marked raw; every other
