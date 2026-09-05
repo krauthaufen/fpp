@@ -95,6 +95,41 @@ be different ids that unify (the `equals<'T>` case — 91373 vs 163931).
 - **Phase 4 — shadow-stack precision** (push-site audit): RANGE roots must
   carry no raw ints, or the range roots stay conservative → global flag stays.
 
+## MOVING-GC NODE CONSTRUCTION FIXED — 3 of 4 type combos move (2026-09-05)
+
+Root-caused why witnessed generic CLASSES (the HashMap/HashSet node machinery)
+were traced conservatively, and fixed three layers so their constructions are
+PRECISE under evacuation:
+
+1. **`selfWits` read the receiver from `sch.Body`** — but an ABSTRACT-OVERRIDE
+   method (`HashInner.AddWith`) carries the abstract signature `int -> 'k -> 'v
+   -> …` with NO receiver, so `recv` was `int` and every node it built fell to
+   the tagged fallback. Fixed: read the receiver from the first PARAM's type
+   (`ps[0]`), gated to methods with no FuncWitness (the vtable impls).
+2. **`ERecordExt` passed `genWits = []`** — a witnessed class' ctor `inherit`s
+   its base, so it lowers through ERecordExt, which never resolved its generic
+   slots. Fixed: compute per-slot witnesses from the update exprs.
+3. **`copiedKind` gated concrete scalars on the never-set `intStamped`** — a
+   copied `int` base field (`count`) stayed RKGen, dragging the WHOLE object to
+   the tagged fallback (scanning even the raw `hash`). Fixed: a concrete scalar
+   field is never a pointer → RKRaw unconditionally.
+
+RESULT under FPPRT_MOVING + forced GC (3000-5000 elems, aggressive collection):
+- **int→string, string→string, hashset<int>, generic Pair<int,int>: MOVE
+  correctly** (verified, correct values after eviction).
+- int→int, string→int (raw-scalar VALUE): still trap.
+
+REMAINING BUG (precisely localized): the VALUE (2nd type param) witness of a
+HashMap gets a REF default while the KEY (1st) resolves — so a raw-scalar VALUE
+is scanned and chased. The asymmetry is real and confirmed: `key=int` works
+(int→string moves), `value=int` fails (int→int, string→int). `HashMap.empty` is
+a generic VALUE (`let empty : HashNode<'k,'v> = hmEmpty ()`) referenced with NO
+instantiation in Core (`m = (empty)`), so no witnesses flow to it; HashSet's
+`empty : HashNode<'k,int>` has a CONCRETE value type and hashset MOVES. The fix
+is in the value-witness propagation for the generic `empty` value / the 2nd
+type param — a generic-VALUE witnessing gap, not the class construction (which
+is now precise). All safe-mode gates green, self-host byte-exact.
+
 ## REAL per-object pinning SHIPPED (2026-09-05)
 
 `Array.pin`/`Array.unpin` are real temporary pinning under mmc: `fpprt_pin` sets
