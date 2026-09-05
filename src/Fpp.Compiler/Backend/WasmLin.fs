@@ -81,7 +81,7 @@ type private St =
       /// a top-level generic function's quantified type-var ids, in order. It
       /// receives one hidden LEADING witness-pointer param per id; the direct
       /// caller prepends the matching witnesses. Empty/absent = non-generic.
-      FuncWitness : Dict<string, int list>
+      FuncWitness : Dict<string, (int * int) list>
       /// interned value-witness tables: a "size:align:refMask" key -> its BYTE
       /// offset in the static g_witnesses pool. Deduped, emitted at startup.
       Witnesses : Dict<string, int>
@@ -4615,7 +4615,7 @@ type private LowCtx =
       /// while emitting a Canon generic class' constructor: the class-param
       /// witness var-ids in declared order (= this ctor's witnessVars). The
       /// class ERecord it builds stores `ctx.Witness[each]` into trailing slots.
-      mutable ClassCtorWits : int list
+      mutable ClassCtorWits : (int * int) list
       /// the destination register of the struct-returning call most recently
       /// LOWERED. A struct binder wants the fields the callee wrote there, not
       /// the object built afterwards for a one-value context — and it cannot
@@ -5780,7 +5780,18 @@ let private genWitsOf (ctx : LowCtx) (base_ : int) (exprs : Expr list) : (int * 
              | None ->
                  (if System.Environment.GetEnvironmentVariable "FPP_WITSCAN" = "1" then
                      let hasW = if dictPairs ctx.Witness |> List.isEmpty then "noW" else "hasW"
-                     witBump ("slot:" + hasW + ":" + exprTag e) curFnDbg)
+                     witBump ("slot:" + hasW + ":" + exprTag e) curFnDbg
+                     (if System.Environment.GetEnvironmentVariable "FPP_WITDET" = "1" then
+                         let tv =
+                             match e with
+                             | EVar (_, s) | EVarI (_, s, _) ->
+                                 (match prune s.Body with
+                                  | TVar v -> "tv:" + string v.Id
+                                  | TCon (n, _) -> "con:" + n
+                                  | _ -> "oth")
+                             | _ -> "-"
+                         let ws = dictPairs ctx.Witness |> List.map (fst >> string) |> String.concat ","
+                         eprintfn "WITDET %s %s wits=[%s] tag=%s" curFnDbg tv ws (exprTag e)))
                  None)
         | _ -> None)
     |> List.choose id
@@ -7382,7 +7393,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             // static data). Slot j forwards this ctor's j-th class-param witness
             // from its hidden param, so the class' methods can read it off self.
             let witVal j =
-                match List.tryItem j ctx.ClassCtorWits |> Option.bind (fun wid -> dictTryFind ctx.Witness wid) with
+                match List.tryItem j ctx.ClassCtorWits |> Option.bind (fun (wid, _) -> dictTryFind ctx.Witness wid) with
                 | Some r -> LGet (wReg r)
                 | None -> witnessPtrRM st 4 4 1
             let wits = [ 0 .. k - 1 ] |> List.map witVal
@@ -8930,7 +8941,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let witnessArgs =
             match dictTryFind st.FuncWitness (key v) with
             | Some vids ->
-                vids |> List.mapi (fun i vid ->
+                vids |> List.mapi (fun i (vid, pid) ->
                     match List.tryItem i inst with
                     | Some nm -> witnessArgOfName ctx nm
                     | None ->
@@ -8942,7 +8953,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                         // scalars as pointers (sortWith<int>'s sublists).
                         match dictTryFind ctx.Witness vid with
                         | Some reg -> LGet (wReg reg)
-                        | None -> witnessPtrRM st 4 4 1)
+                        | None -> (match dictTryFind ctx.Witness pid with Some reg -> LGet (wReg reg) | None -> witnessPtrRM st 4 4 1))
             | None -> []
         // a SELF call in tail position transfers via return_call: same
         // function, so the signature matches by construction. The result
@@ -12023,13 +12034,18 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | EIfaceCall (_, _, r, xs) -> preRecGroups ctx r; List.iter (preRecGroups ctx) xs
     | _ -> ()
 
-let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<string, string>) (isInit : bool) (sig_ : (LTy list * LTy) option) (structPlan : string option list) (byrefPlan : bool list) (retStruct : string option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
+let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<string, string>) (isInit : bool) (sig_ : (LTy list * LTy) option) (structPlan : string option list) (byrefPlan : bool list) (retStruct : string option) (witnessVars : (int * int) list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
     curFnDbg <- dbgName
+    (if System.Environment.GetEnvironmentVariable "FPP_FNWIT" = dbgName then
+        eprintfn "FNWIT %s witnessVars=[%s] paramVars=[%s] selfWits=[%s]" dbgName
+            (witnessVars |> List.map (fun (a,b) -> string a + "/" + string b) |> String.concat ",")
+            (paramTypes |> List.map (fun t -> match prune t with TVar v -> "tv" + string v.Id | TCon (n,_) -> n | _ -> "?") |> String.concat ",")
+            (selfWits |> List.map (fun (v,o) -> string v + "@" + string o) |> String.concat ","))
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); VarKind = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SretDst = None; BrPays = brPays; BrPost = []; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
     // var, recorded in ctx.Witness so a generic aggregate can read the element
     // type's witness. Regular params follow.
-    let wnames = witnessVars |> List.map (fun vid -> let r = freshReg ctx ("$w" + string vid) in dictSet ctx.Witness vid r; regNm (wReg r))
+    let wnames = witnessVars |> List.mapi (fun i (vid, pid) -> let r = freshReg ctx ("$w" + string i) in dictSet ctx.Witness vid r; (if pid <> vid then dictSet ctx.Witness pid r); regNm (wReg r))
     // a BY-VALUE struct parameter arrives as its FIELDS, each in its own
     // typed register: no object, nothing for the collector to manage. Only a
     // use of the whole value materialises one.
@@ -13861,7 +13877,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // nothing needs it, so FuncWitness stays empty and the whole hidden-
             // param path (decl, emit, call, generic cons) is a no-op there.
             if gc && not (List.isEmpty s.Quantified) && (dictTryFind vtImpls (key v)).IsNone then
-                dictSet st.FuncWitness (key v) (s.Quantified |> List.map (fun qv -> qv.Id))
+                dictSet st.FuncWitness (key v) (s.Quantified |> List.map (fun qv -> qv.Id, prunedId qv))
         | DLet (_, v, s, _) ->
             dictSet st.Globals (key v) true
             (match scalarLTy s.Body with
