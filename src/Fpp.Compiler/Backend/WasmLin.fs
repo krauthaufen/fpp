@@ -10483,7 +10483,7 @@ and private lowSlotInit (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) :
         // a still-generic cell with the element WITNESS in scope selects its
         // tid at runtime: raw 'a -> unscanned cell$s, ref 'a -> scanned cell
         match ck, (match prune sch.Body with TVar tv -> dictTryFind ctx.Witness tv.Id | _ -> None) with
-        | RKGen, Some wreg when gc -> lowMkCellW ctx wreg (coreToLowE ctx rhs)
+        | RKGen, Some wreg when gc -> lowMkCellW ctx (LGet (wReg wreg)) (coreToLowE ctx rhs)
         | _ -> lowMkCell ctx ck (coreToLowE ctx rhs)
     else coreToLowE ctx rhs
 
@@ -10800,7 +10800,7 @@ and private lowLetBind (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) : 
                 dictSet ctx.LSt.CellKind k ck
                 // runtime-witnessed tid for a generic cell (see lowSlotInit)
                 match ck, (match prune sch.Body with TVar tv -> dictTryFind ctx.Witness tv.Id | _ -> None) with
-                | RKGen, Some wreg when gc -> lowMkCellW ctx wreg (coreToLowE ctx rhs)
+                | RKGen, Some wreg when gc -> lowMkCellW ctx (LGet (wReg wreg)) (coreToLowE ctx rhs)
                 | _ -> lowMkCell ctx ck (coreToLowE ctx rhs)
             else coreToLowE ctx rhs
         LSet (wReg id, init)
@@ -10826,9 +10826,10 @@ and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
 /// fallback minted every generic cell FK_TAGGED, and a raw int key stored
 /// through the canonical SetLeaf ctor was then chased by the collector
 /// (the adaptive suite's mmc trace_edge crash).
-and private lowMkCellW (ctx : LowCtx) (wreg : int) (v : LExpr) : LExpr =
+and private lowMkCellW (ctx : LowCtx) (witExpr : LExpr) (v : LExpr) : LExpr =
     let b = freshTmp ctx
     let t = freshTmp ctx
+    let wr = freshTmp ctx
     let tidS = gcTidRef ctx.LSt "cell$s" (HDR + 4) []
     let tidT = gcTid ctx.LSt "cell" (HDR + 4) FK_TAGGED 1
     let rawBuild =
@@ -10838,8 +10839,8 @@ and private lowMkCellW (ctx : LowCtx) (wreg : int) (v : LExpr) : LExpr =
         gcPushStmts (LGet (wReg t))
         @ [ LSet (wReg b, lowAllocSized ctx tidT (HDR + 4)) ]
         @ gcPopInto (LGet (wReg b)) HDR
-    LDo ([ LSet (wReg t, v)
-           LIf (LPrim (EqW, [ LLoad (W, LGet (wReg wreg), 8); LConstW 0 ]),
+    LDo ([ LSet (wReg t, v); LSet (wReg wr, witExpr)
+           LIf (LPrim (EqW, [ LLoad (W, LGet (wReg wr), 8); LConstW 0 ]),
                 rawBuild, refBuild) ],
          LGet (wReg b))
 
