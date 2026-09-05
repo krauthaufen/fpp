@@ -3934,10 +3934,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some t when t.Text = "nativeint" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (TCon ("nativeint", []))
-                              | Some t when (t.Text = "int" || t.Text = "uint32" || t.Text = "int16" || t.Text = "uint16")
+                              | Some t when (t.Text = "int" || t.Text = "uint32")
                                             && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (if t.Text = "int" then tInt else tUInt)
+                              // int16/uint16 are int-shaped like byte: the
+                              // conversion produces the NARROW type itself and
+                              // the emitter masks/sign-extends to the width.
+                              // They used to share the int/uint32 arm above,
+                              // so `uint16 x` TYPED as uint32 and no
+                              // expression could produce a uint16 value at
+                              // all (fpp.base #30, the C3us/C4us blocker).
+                              | Some t when (t.Text = "int16" || t.Text = "uint16")
+                                            && (dictTryFind useDefs t.Offset).IsNone ->
+                                  exprType (GNode onlyArg) |> ignore
+                                  Some (TCon (t.Text, []))
                               // widening and narrowing between float widths
                               | Some t when List.contains t.Text [ "float"; "float32"; "float16" ]
                                             && (dictTryFind useDefs t.Offset).IsNone ->

@@ -48,3 +48,18 @@ heap; the larger backend2 gate still traps unpinned — wasm trap during a
 printfn right after emitting `texture(arraySampler, vec3(...))` GLSL.
 Repro: fpp.shader tests/backend2-run.sh with the inline
 `--env FPPRT_HEAP_MB=512` removed. Pins stay in until this one is green.
+
+## 2026-09-05 (later): #36 AND #30 FIXED
+
+#36 root cause: an ENUM-typed field in an inline (POD) record was marked as
+a REFERENCE leaf in the layout's refoffs (enum names were not in storLTy),
+so the collector chased AsmState.selfStage's raw stage value during a
+collection — heap-size-dependent, which is why 512 MB "fixed" it. Enum
+names now resolve as scalar words in the layout. backend2-run.sh passes at
+the DEFAULT heap; the 512 MB pins can come out.
+
+#30: uint16/int16 conversions produce the narrow type itself now (they
+shared the int/uint32 arm), with .NET truncation/sign-extension semantics
+— verified byte-for-byte against dotnet fsi, conformance suite
+`narrowconv` pins it. C3us/C4us are unblocked. NOTE: the repro header's
+"expected 232" for `uint16 70000u` was a miscalc — fsi says 4464.

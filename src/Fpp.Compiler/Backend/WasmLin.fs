@@ -339,6 +339,13 @@ let mutable gc = false
 // stamped-int container slot is excluded from the scan map. Off => narrow ints
 // stay tagged and type-based slots keep the tagged fallback (int-off unchanged).
 let mutable intStamped = false
+/// enum TYPE names of the compilation unit: an enum value IS its raw int, so
+/// a field/element declared at an enum type is a SCALAR word — storLTy answers
+/// (W, 4) for these, which keeps it out of every refoffs map. Left out, an
+/// inline record's enum field was marked as a REFERENCE leaf and the collector
+/// chased the raw stage value (fpp.base #36 — the GLSL assembler's AsmState
+/// trapped mid-collection at default heap). Reset per emission.
+let mutable private enumTypeSet : Dict<string, bool> = dictNew ()
 // preload linking (wasmtime --preload fpprt=reactor.wasm): the mutator
 // re-exports the imported memory as "memory" so WASI finds it on the main
 // module. OFF under wasm-merge — the merged file would carry two exports.
@@ -4724,7 +4731,7 @@ let private storLTy (k : string) : (LTy * int) option =
     | "int" | "int32" | "uint32" | "nativeint" | "unativeint" | "bool" -> Some (W, 4)
     | "int16" | "uint16" -> Some (I16, 2)
     | "byte" | "sbyte" -> Some (I8, 1)
-    | _ -> None
+    | _ -> if (dictTryFind enumTypeSet k).IsSome then Some (W, 4) else None
 // the machine type a pre-store element value rides in before it hits its slot:
 // f64/i64 stay wide; a packed narrow int or f32-bits is just an i32 word.
 let private storValTy (sty : LTy) : LTy = match sty with F64 -> F64 | I64 -> I64 | F32 -> F32 | _ -> W
@@ -13211,6 +13218,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     let unionNextTag = dictNew<string, int> ()
     // enum TYPE names: a slot declared at one holds a RAW int, never a pointer
     let enumTypeNames = dictNew<string, bool> ()
+    enumTypeSet <- dictNew ()
     for d in decls0 do
         match d with
         | DRecord (n, _, fs, _) ->
@@ -13237,6 +13245,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // the enum's own NAME as well: a slot declared at an enum type
             // holds a RAW int, so it must never be laid out as a reference
             dictSet enumTypeNames en true
+            dictSet enumTypeSet en true
             for c, v in cs do dictSet st.EnumConst c v
         | _ -> ()
     // single-field-collapse (repr(T)): a one-field record travels as its field
