@@ -5719,6 +5719,30 @@ let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
                    | Some k -> (match List.tryItem k inst with Some nm -> Some (witnessArgOfName ctx nm) | None -> None)
                    | None -> (match dictTryFind ctx.Witness rv.Id with Some r -> Some (LGet (wReg r)) | None -> None))
               | _ -> (match dictTryFind ctx.Witness rv.Id with Some r -> Some (LGet (wReg r)) | None -> None))
+             |> (fun res ->
+                 match res with
+                 | Some _ -> res
+                 | None ->
+                     // a MEMBER ACCESSOR whose result rides the RECEIVER's class
+                     // type param — `node.Key : 'k` where `node : C<'k,'v>`. The
+                     // accessor's own `rv` is not in ctx.Witness, but it is the
+                     // class' j-th parameter, and the receiver's ACTUAL j-th
+                     // argument is: so map through the receiver's instantiation
+                     // and resolve THAT (a witnessed class var, or a concrete
+                     // static). Closes the `.Key`/`.Value` slots that selfWits
+                     // seeded the class vars for.
+                     match prune s.Body, ar with
+                     | TFun (recvP, _), (recv :: _) ->
+                         match prune recvP with
+                         | TCon (_, keyParams) ->
+                             (match List.tryFindIndex (fun p -> match prune p with TVar v -> v.Id = rv.Id | _ -> false) keyParams with
+                              | Some j ->
+                                  (match (match recv with EVar (_, rs) | EVarI (_, rs, _) -> Some (prune rs.Body) | _ -> None) with
+                                   | Some (TCon (_, recvArgs)) when j < List.length recvArgs -> ofTy (List.item j recvArgs)
+                                   | _ -> None)
+                              | None -> None)
+                         | _ -> None
+                     | _ -> None)
          | t -> ofTy t)
     | EField (_, f, owner) -> (match recFieldTy st owner f with Some ty -> Some (ofName (if ty.StartsWith "&" then ty.Substring 1 else ty)) | None -> None)
     | EIndex (k, _, _) -> Some (ofName k)
@@ -5737,12 +5761,27 @@ let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
 // per-slot witness for a generic aggregate: an RKGen slot gets one from
 // slotWitness; a resolved (RKRaw/RKRef) slot needs none. `base_` is the slot
 // index of exprs.[0] (0 for a tuple/record, 1 past a union's raw tag).
+let private exprTag (e : Expr) : string =
+    match e with
+    | EVar _ -> "EVar" | EVarI _ -> "EVarI" | EApp (EUnknown u, _) -> "EApp/" + u
+    | EApp (EVar (v,_),_) | EApp (EVarI (v,_,_),_) -> "call:" + v.Name
+    | EApp _ -> "EApp?" | EField (_,f,_) -> "EField." + f | EIf _ -> "EIf"
+    | EMatch _ -> "EMatch" | ELet _ -> "ELet" | ECtor (c,_,_) -> "ECtor:" + c
+    | ELit _ -> "ELit" | ETuple _ -> "ETuple" | EPrim (o,_) -> "EPrim:" + o
+    | ECast (t,_,_) -> "ECast:" + t | _ -> "other"
 let private genWitsOf (ctx : LowCtx) (base_ : int) (exprs : Expr list) : (int * LExpr) list =
     if not gc then [] else
     exprs
     |> List.mapi (fun j e ->
         match refKindOfExprC ctx.LSt e with
-        | RKGen -> (match slotWitness ctx e with Some w -> Some (base_ + j, w) | None -> None)
+        | RKGen ->
+            (match slotWitness ctx e with
+             | Some w -> Some (base_ + j, w)
+             | None ->
+                 (if System.Environment.GetEnvironmentVariable "FPP_WITSCAN" = "1" then
+                     let hasW = if dictPairs ctx.Witness |> List.isEmpty then "noW" else "hasW"
+                     witBump ("slot:" + hasW + ":" + exprTag e) curFnDbg)
+                 None)
         | _ -> None)
     |> List.choose id
 
@@ -13273,6 +13312,28 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // a stamped subclass resolves its fields through the base it was stamped
     // from (DClass carries `Some base`); record subclass -> base for EField.
     for d in decls0 do match d with DClass (n, Some b, _, _) when b <> n -> dictSet st.RecBase n b | _ -> ()
+    // WITNESSED CLASSES: a CANONICAL generic class carries one trailing witness
+    // pointer per type parameter, so its MEMBERS can recover 'a's runtime GC
+    // nature (raw-vs-ref) off `self` instead of building unwitnessed aggregates
+    // that force the conservative tagged fallback. The ctor already builds its
+    // object precisely (its FuncWitness resolves each generic field); this adds
+    // the trailing slots (filled from the ctor's hidden witness params) and lets
+    // `selfWits` seed a member's ctx.Witness from them. Phase 1: NON-inherited
+    // generic classes only (a base's witness prefix is Phase 1b). A stamped
+    // clone (`Base$inst`, has a RecBase) is concrete and needs none. Structs
+    // ride by value and have no members that build generic objects.
+    (let recTyParams = dictNew<string, int> ()
+     for d in decls0 do
+         match d with
+         | DRecord (n, ps, _, isStruct) when not (List.isEmpty ps) && not isStruct -> dictSet recTyParams n (List.length ps)
+         | _ -> ()
+     for d in decls0 do
+         match d with
+         | DClass (n, None, _, _) when (dictTryFind st.RecBase n).IsNone ->
+             (match dictTryFind recTyParams n with
+              | Some k when k > 0 -> dictSet st.WitnessedClasses n k
+              | _ -> ())
+         | _ -> ())
     for d in decls0 do
         match d with
         | DFieldSubst (n, fs) ->
