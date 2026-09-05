@@ -1750,6 +1750,8 @@ module Array =
     extern let byteSize : 'a[] -> int
     let length (xs : 'a[]) = xs.Length
     let isEmpty (xs : 'a[]) = xs.Length = 0
+    /// the zero-length array (F#'s Array.empty)
+    let empty : 'a[] = zeroCreate 0
     let item (i : int) (xs : 'a[]) = xs.[i]
     let get (xs : 'a[]) (i : int) = xs.[i]
     let set (xs : 'a[]) (i : int) (v : 'a) = xs.[i] <- v
@@ -4109,11 +4111,11 @@ instance Ordered<'a[]> when Ordered<'a>
 /// still lazy, so the computation expression is too: `Combine` appends
 /// without walking, `Delay` defers to enumeration time, and `For` collects.
 ///
-/// `Using`, `TryWith` and `TryFinally` are absent. Scoping a resource or a
-/// handler ACROSS a suspension needs the enumerator to own it, which this
-/// representation — a sequence built from combinators — cannot express. The
-/// desugaring emits them, so `use` or `try` inside a `seq { }` is an error
-/// naming the missing member rather than a wrong answer.
+/// `Using`, `TryWith` and `TryFinally` scope a resource or a handler ACROSS
+/// a suspension: the enumerator the construct returns owns it, disposing the
+/// resource or running the compensation when enumeration ends — exactly as
+/// `While` below owns its inner enumerator. `use` and `try` inside a
+/// `seq { }` are ordinary, not an error.
 type SeqBuilder() =
     member _.Zero () : seq<'a> = Seq.empty
     member _.Yield (v : 'a) : seq<'a> = Seq.singleton v
@@ -4121,6 +4123,51 @@ type SeqBuilder() =
     member _.Combine (a : seq<'a>, b : seq<'a>) : seq<'a> = Seq.append a b
     member _.Delay (f : unit -> seq<'a>) : seq<'a> = Seq.delay f
     member _.For (xs : seq<'a>, f : 'a -> seq<'b>) : seq<'b> = Seq.collect f xs
+    /// `use r = e` inside the sequence: the enumerator produced by the body
+    /// owns `r` and disposes it when enumeration ends — completed, broken
+    /// out of, or abandoned — which is when the enumerator itself is
+    /// disposed.
+    member _.Using (res : 'r, f : 'r -> seq<'a>) : seq<'a> when 'r :> System.IDisposable =
+        { new IEnumerable<'a> with
+            member _.GetEnumerator () =
+                let inner = (f res).GetEnumerator ()
+                { new IEnumerator<'a> with
+                    member _.MoveNext () = inner.MoveNext ()
+                    member _.Current = inner.Current
+                    member _.Dispose () =
+                        inner.Dispose ()
+                        (res :> System.IDisposable).Dispose () } }
+    /// `try BODY finally comp` — the compensation runs once, when the
+    /// enumerator is disposed (the loop finished, broke, or unwound).
+    member _.TryFinally (body : seq<'a>, comp : unit -> unit) : seq<'a> =
+        { new IEnumerable<'a> with
+            member _.GetEnumerator () =
+                let inner = body.GetEnumerator ()
+                let mutable ran = false
+                { new IEnumerator<'a> with
+                    member _.MoveNext () = inner.MoveNext ()
+                    member _.Current = inner.Current
+                    member _.Dispose () =
+                        inner.Dispose ()
+                        if not ran then (ran <- true; comp ()) } }
+    /// `try BODY with CS` — a step that raises hands the exception to the
+    /// handler, whose sequence is enumerated in the body's place.
+    member _.TryWith (body : seq<'a>, handler : exn -> seq<'a>) : seq<'a> =
+        { new IEnumerable<'a> with
+            member _.GetEnumerator () =
+                let mutable cur = body.GetEnumerator ()
+                let mutable switched = false
+                { new IEnumerator<'a> with
+                    member _.MoveNext () =
+                        try cur.MoveNext ()
+                        with ex ->
+                            if switched then raise ex
+                            else
+                                switched <- true
+                                cur <- (handler ex).GetEnumerator ()
+                                cur.MoveNext ()
+                    member _.Current = cur.Current
+                    member _.Dispose () = cur.Dispose () } }
     /// The body is a DELAYED sequence, so enumerating it again re-runs it —
     /// which is what makes an iteration of the loop repeatable.
     member _.While (cond : unit -> bool, body : seq<'a>) : seq<'a> =
@@ -6037,6 +6084,11 @@ type ResizeArray<'a>() =
     new (xs : seq<'a>) as x =
         ResizeArray<'a>()
         then x.AddRange xs
+    /// .NET's capacity constructor — a pre-sizing HINT; the backing array
+    /// grows on demand here, so the number only reserves room up front
+    new (capacity : int) as x =
+        ResizeArray<'a>()
+        then x.Reserve capacity
 
 type List<'a> = ResizeArray<'a>
 
@@ -6180,6 +6232,11 @@ type Dictionary<'k, 'v>() =
     interface IEnumerable<KeyValuePair<'k, 'v>> with
         member x.GetEnumerator () =
             (Array.init dcount (fun i -> KeyValuePair<'k, 'v>(dkeys.[i], dvals.[i])) :> seq<KeyValuePair<'k, 'v>>).GetEnumerator ()
+    /// .NET's capacity constructor — a pre-sizing HINT; the table grows on
+    /// demand here, so the number is accepted and otherwise ignored
+    new (capacity : int) as x =
+        Dictionary<'k, 'v>()
+        then ignore capacity
 
 /// System.Collections.Generic.HashSet — the same table without the values,
 /// under a DIFFERENT NAME. `HashSet` is taken twice over: by this prelude's

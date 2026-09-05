@@ -1353,6 +1353,7 @@ type Workspace() =
             // stamping has made the operand type concrete
             let instanceFns = Fpp.Core.Link.instanceFunctions r.Classes
             let mono0, monoErrs = Fpp.Core.Link.monomorphizeWith forLinear isStruct instanceFns program
+            Fpp.Core.Link.keyCollisionCheck mono0
             // stamped clones have concrete instantiations, so record layouts
             // can only be settled once monomorphization has run
             let mono = Fpp.Core.Link.stampRecords mono0
@@ -1378,6 +1379,7 @@ type Workspace() =
     member this.EmitProgramWasmReactor () : byte[] * string list =
         withLock WasmLinGate.gate (fun () ->
             Fpp.Backend.WasmLin.gc <- true
+            Fpp.Backend.WasmLin.intStamped <- Fpp.Core.Link.intStampNarrow
             Fpp.Backend.WasmLin.gcExportMem <- false
             this.EmitProgramWasmLinearWith true)
 
@@ -1387,6 +1389,7 @@ type Workspace() =
     member this.EmitProgramWasmPreload () : byte[] * string list =
         withLock WasmLinGate.gate (fun () ->
             Fpp.Backend.WasmLin.gc <- true
+            Fpp.Backend.WasmLin.intStamped <- Fpp.Core.Link.intStampNarrow
             Fpp.Backend.WasmLin.gcExportMem <- true
             this.EmitProgramWasmLinearWith true)
 

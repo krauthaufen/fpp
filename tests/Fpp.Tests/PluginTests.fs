@@ -943,7 +943,10 @@ let monoTests =
             // scalar-stamping (wasm-linear target): a boxed scalar stamps too
             Expect.equal (Fpp.Core.Link.classify true isStruct [ "float" ]) (Fpp.Core.Link.Stamp [ "float" ]) "float stamps under scalar-stamping"
             Expect.equal (Fpp.Core.Link.classify false isStruct [ "float" ]) Fpp.Core.Link.Canon "float shares without scalar-stamping"
-            Expect.equal (Fpp.Core.Link.classify true isStruct [ "int" ]) Fpp.Core.Link.Canon "int stays i31 even under scalar-stamping"
+            // int-stamping: a narrow int rides a stamped clone UNBOXED and RAW
+            // (Link.intStampNarrow) — the scan-map, witness and canonical-cid
+            // machinery keep it GC-sound and structurally equal
+            Expect.equal (Fpp.Core.Link.classify true isStruct [ "int" ]) (Fpp.Core.Link.Stamp [ "int" ]) "int stamps under scalar-stamping"
         }
     ]
 
@@ -968,9 +971,10 @@ let monoPropagationTests =
             Expect.equal (defsOf "outer$V2d") 1 "outer stamped at V2d"
             // the nested generic call inherits the caller's instantiation
             Expect.equal (defsOf "wrap$V2d") 1 "inner call specialized too"
-            // int goes through the shared bodies, no clones
-            Expect.equal (defsOf "outer$int") 0 "reference/immediate uses share"
-            Expect.equal (defsOf "wrap$int") 0 "reference/immediate uses share"
+            // int-stamping: the int use gets its own clones too (wasm-linear
+            // stampScalars is the LinkedNames default path)
+            Expect.equal (defsOf "outer$int") 1 "int uses stamp"
+            Expect.equal (defsOf "wrap$int") 1 "inner int call specialized too"
         }
     ]
 

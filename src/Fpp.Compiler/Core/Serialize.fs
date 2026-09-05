@@ -220,6 +220,8 @@ let private encDecl (d : Decl) : Sx =
         L [ A "dn"; S n; L (cs |> List.map (fun (c, v) -> L [ S c; A (string v) ])) ]
     | DMembers (n, own) ->
         L [ A "dm"; S n; L (own |> List.map (fun (m, v) -> L [ S m; encVarId v ])) ]
+    | DFieldSubst (n, fs) ->
+        L [ A "dfs"; S n; L (fs |> List.map (fun (a, b) -> L [ S a; S b ])) ]
     | DBaseInst (n, inst) ->
         L [ A "db"; S n; L (inst |> List.map S) ]
     | DClass (n, bse, own, impls) ->

@@ -107,6 +107,39 @@ static inline void gc_extern_space_finish_gc(struct gc_extern_space *space,
 extern size_t fpprt_census_[4096];
 #endif
 
+/* the collector (mmc) reads this at init: uniform-word bodies are traced
+ * conservatively, so evacuation must be off (see below) */
+#define FPPRT_UNIFORM_CONSERVATIVE 1
+
+/* set by mmc's gc_init: RANGE roots (the wasm shadow stack + root table) are
+ * scanned CONSERVATIVELY through the pinned-roots channel — a raw scalar that
+ * leaks onto the stack through a generic seam is then validated and skipped
+ * instead of chased. semi leaves it 0 and keeps the precise range scan. */
+extern int fpprt_ranges_ambiguous_;
+
+/* The wasm-linear UNIFORM-WORD forms (FK_TAGGED objects and ref arrays) may
+ * hold RAW scalars in slots whose static type is generic — a stamped int in a
+ * canonical cell, a builtin-seq head. Tracing those bodies PRECISELY chased
+ * the raw even word as a pointer (mmc's trace_edge crashed on it). They are
+ * traced CONSERVATIVELY instead: each word is validated against the heap and
+ * the target marked IN PLACE (never moved), so a raw int is skipped — or at
+ * worst over-retains one object — and never rewritten. Returns the byte size
+ * of the body to sweep conservatively, 0 for precisely-traced kinds. */
+static inline size_t gc_object_conservative_body(struct gc_ref ref) {
+  uintptr_t tag = *fpprt_tag_word_(ref);
+  struct fpprt_type_intern *t = &fpprt_types_[tag >> 1];
+  switch (t->kind) {
+  case FPPRT_EMB_KIND_TAGGED:
+    return t->size;
+  case FPPRT_EMB_KIND_REF_ARRAY: {
+    uintptr_t len = ((uintptr_t *)gc_ref_heap_object(ref))[1];
+    return 2 * sizeof(uintptr_t) + len * sizeof(uintptr_t);
+  }
+  default:
+    return 0;
+  }
+}
+
 static inline size_t gc_trace_object(struct gc_ref ref,
                                      void (*visit)(struct gc_edge edge,
                                                    struct gc_heap *heap,
@@ -270,9 +303,10 @@ static inline void gc_trace_heap_roots(struct gc_heap_roots *roots,
         abort();
       }
 #endif
-    for (size_t i = 0; i < roots->ranges[r].n; i++)
-      if (base[i] && !(base[i] & 1))
-        trace_edge(gc_edge(&base[i]), heap, trace_data);
+    if (!fpprt_ranges_ambiguous_)
+      for (size_t i = 0; i < roots->ranges[r].n; i++)
+        if (base[i] && !(base[i] & 1))
+          trace_edge(gc_edge(&base[i]), heap, trace_data);
   }
 }
 
@@ -299,7 +333,15 @@ gc_trace_heap_pinned_roots(struct gc_heap_roots *roots,
                                                    struct gc_heap *heap,
                                                    void *data),
                            struct gc_heap *heap,
-                           void *data) {}
+                           void *data) {
+  /* mmc: the RANGE roots, conservatively — validated + pinned, raw skipped */
+  if (fpprt_ranges_ambiguous_ && roots)
+    for (size_t r = 0; r < roots->nranges; r++) {
+      uintptr_t lo = (uintptr_t)roots->ranges[r].base;
+      trace_ambiguous(lo, lo + roots->ranges[r].n * sizeof(uintptr_t), 0,
+                      heap, data);
+    }
+}
 
 /* ---- forwarding: the tag word, atomically when parallel ---------------- */
 

@@ -321,6 +321,6 @@ let lint (decls : Decl list) : string list =
             let rt = exprType rhs
             unifyC ("top-level " + v.Name) declared rt
             dictSet generalized (keyOf v) true
-        | DExtern _ | DExport _ | DUnion _ | DUnionFields _ | DRecord _ | DInterface _ | DClass _ | DEnum _ | DMembers _ | DBaseInst _ -> ()
+        | DExtern _ | DExport _ | DUnion _ | DUnionFields _ | DRecord _ | DInterface _ | DClass _ | DEnum _ | DMembers _ | DBaseInst _ | DFieldSubst _ -> ()
 
     vecToList errors

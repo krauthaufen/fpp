@@ -1946,7 +1946,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              // and trapped. Its own branch answers null.
                              | Some t when t.Text <> "defaultof" ->
                                  (match dictTryFind memberSites t.Offset with
-                                  | Some owner when owner = "string" || owner.StartsWith "string#" ->
+                                  | Some owner when (owner = "string" || owner.StartsWith "string#")
+                                                    // a USER EXTENSION member on string
+                                                    // (`type string with member s.Foo`) is in
+                                                    // the project member index — route it there,
+                                                    // not to a nonexistent `$str.Foo` primitive
+                                                    && (dictTryFind memberIndex ("string." + t.Text)).IsNone ->
                                       let ord = if owner = "string" then "" else owner.Substring (owner.IndexOf "#")
                                       (match nodesOf head |> List.tryHead with
                                        | Some recv -> Some ("$str." + t.Text + ord, lowerExpr (GNode recv))
@@ -3626,7 +3631,27 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     caps |> List.map (fun (v, _) ->
                         (v.Path, v.Offset), dictTryFind fieldOfVar (v.Path, v.Offset))
                 for v, _ in caps do dictSet fieldOfVar (v.Path, v.Offset) (synth, v.Name)
-                vecAdd decls (DRecord (synth, [], caps |> List.map (fun (v, _) -> v.Name, "?"), false))
+                // Name each capture's field type — NOT "?" — so the backend
+                // derives an accurate ref map and lays the closure out as an
+                // FK_STRUCT (only real pointers traced) rather than the tagged
+                // fallback. A tagged closure SCANS every even word as a
+                // pointer; a captured raw scalar read from an ENCLOSING object
+                // expression's field (`this.n`) stores UNTAGGED, so an even
+                // int landing in the heap range was chased and the collector
+                // corrupted itself — the seq-over-seq (`Seq.collect`) GC trap.
+                // A type variable, function or non-nominal capture keeps "?"
+                // (the tagged form still traces its even pointer correctly).
+                let capFieldTy (v : VarId, sch : Scheme) : string * string =
+                    let tn =
+                        match prune sch.Body with
+                        | TCon (n2, []) -> n2
+                        | TCon (_, _) ->
+                            let r2 = typeConName (prune sch.Body)
+                            if r2.Contains "#" then "?" else r2
+                        | _ -> "?"
+                    let cm = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then "&" else ""
+                    v.Name, cm + tn
+                vecAdd decls (DRecord (synth, [], caps |> List.map capFieldTy, false))
                 let savedClass = currentClass
                 currentClass <- synth
                 let bound =
@@ -4201,7 +4226,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        // tuple binders destructure the
                                        // current element
                                        EMatch (c, [ p, None, loopBody body ])
-                               ELet (false, enV, anon, g, EWhile (m, inner))
+                               // dispose the enumerator when the walk ends,
+                               // exactly as F# does — but only when inference
+                               // bound a Dispose (the enumerator IS
+                               // disposable); a bare enumerator is left alone
+                               let loop =
+                                   match call (synth "Dispose" 60000000) (EVar (enV, anon)) true with
+                                   | Some d -> tryFinally (fo + 6000000) (EWhile (m, inner)) d
+                                   | None -> EWhile (m, inner)
+                               ELet (false, enV, anon, g, loop)
                            | _ -> note (offsetOf n) "for-in (no GetEnumerator on the source)"))
                  // `for i = lo to hi do body` (and `downto`): the classic
                  // counted loop, one bound each side
@@ -4426,7 +4459,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     let selfBind =
                         match selfTok |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
                         | Some sd -> varIdOf sd, selfSch
-                        | None -> { Path = path; Offset = d.Offset + 800000; Name = "this" }, selfSch
+                        | None -> { Path = path; Offset = d.Offset + 200000000; Name = "this" }, selfSch
                     let savedSelf = currentSelf
                     currentSelf <- Some selfBind
                     let mutable seenEq = false
@@ -4481,7 +4514,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let selfBind =
                 match selfTok |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
                 | Some sd -> varIdOf sd, selfSch
-                | None -> { Path = path; Offset = d.Offset + 800000; Name = "this" }, selfSch
+                | None -> { Path = path; Offset = d.Offset + 200000000; Name = "this" }, selfSch
             let isStaticM = tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static")
             // save, don't clear: a nested object expression's members lift
             // from INSIDE this body, and clearing killed the enclosing self
@@ -5117,9 +5150,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let tn =
                     match prune sch.Body with
                     | TCon (n2, []) -> n2
-                    | TCon (_, _) ->
-                        let r2 = typeConName (prune sch.Body)
-                        if r2.Contains "#" then "?" else r2
+                    // a bare generic field carries its var as a `#id` MARKER (the
+                    // spelling instantiations already use), so the stamper can
+                    // substitute it in a stamped sub's DFieldSubst layout — and a
+                    // CONSTRUCTED type keeps its marker-carrying name rather than
+                    // collapsing to "?": `keys : 'a[]` is a POINTER whatever 'a
+                    // is, and "?" hid that — the stamped MutableHashSetEnumerator
+                    // then fell to the FK_TAGGED fallback while its concrete
+                    // `count : int` slot was stored raw, and the collector
+                    // chased the raw count as a pointer (the mmc trace_edge
+                    // crash the adaptive suite hit).
+                    | TVar tv -> "#" + string (prunedId tv)
+                    | TCon (_, _) -> typeConName (prune sch.Body)
                     | _ -> "?"
                 let cm = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then "&" else ""
                 v.Name, cm + tn

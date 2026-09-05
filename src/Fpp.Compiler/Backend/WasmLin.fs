@@ -135,6 +135,10 @@ type private St =
       /// records (RecFieldTys is [<Struct>]-only). Lets a `$cellget` of a
       /// class-field cell resolve the field's scalar content to RAW.
       RecFieldTypes : Dict<string, (string * string) list>
+      /// stamped sub -> (field -> ref-kind), from its substituted layout; used
+      /// ONLY in ERecord/ERecordExt to give a narrow-scalar stamp a precise scan
+      /// map. Present only for narrow-raw stamps, so int-off is untouched.
+      SubFieldKind : Dict<string, (string * RefKind) list>
       /// inline value-type layout (repr step 1): a record/struct with >=1 scalar
       /// field stores its fields RAW inline. Fields are ordered SCALARS-FIRST,
       /// REFS-LAST; a scalar rides raw (`f64`/`i64`/packed), a ref/generic field
@@ -284,6 +288,12 @@ type private St =
       /// uses to structurally compare ANY shape at runtime (kind/start/nwords
       /// packed per tid). Standalone reads the same info from static memory.
       mutable CmpTblSlot : int
+      /// root slot of the cid -> CANONICAL-cid table: a stamped subclass
+      /// (`Base$inst`) maps to its canonical base for STRUCTURAL equality and
+      /// ordering — a canonical-built HashLeaf and a stamped HashLeaf$int$int
+      /// with equal contents must compare equal. Dispatch and type tests keep
+      /// the exact cid.
+      mutable CidEqSlot : int
       /// root slots for the two descriptor arrays: tid -> index, and the flat
       /// `[n, off, kind, off, kind, …]` data
       mutable DescIdxSlot : int
@@ -325,6 +335,10 @@ let private CLO_KIND = 2
 // wasm-merge pass. Off = the standalone bump-allocator path (no collection).
 // Set by the CLI (`--gc`) before emission.
 let mutable gc = false
+// mirrors Link.intStampNarrow: a narrow int rides a stamped clone RAW, so a
+// stamped-int container slot is excluded from the scan map. Off => narrow ints
+// stay tagged and type-based slots keep the tagged fallback (int-off unchanged).
+let mutable intStamped = false
 // preload linking (wasmtime --preload fpprt=reactor.wasm): the mutator
 // re-exports the imported memory as "memory" so WASI finds it on the main
 // module. OFF under wasm-merge — the merged file would carry two exports.
@@ -395,6 +409,7 @@ let mutable private chkSite = 0
 let mutable private gcConsRawTid = 0
 let mutable private gcConsRefTid = 0
 let mutable private gcCmpTblSlot = 0
+let mutable private gcCidEqSlot = 0
 let mutable private gcDescIdxSlot = 0
 let mutable private gcDescDataSlot = 0
 // identity dispatch ($cmpv/$hashv -> a class' own Equals/GetHashCode/CompareTo):
@@ -2274,7 +2289,12 @@ let private emitListIter (m : Mod) : unit =
     elseB f
     lg f "$it"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$rem"
     lg f "$rem"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f   // nil -> false
-    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; lg f "$rem"; ic f HDR; ins f "i32.add"; mem f "i32.load"; mem f "i32.store"
+    // current = the CONS CELL itself (a pointer), NOT its head value: the
+    // head of a concrete-element cons is an UNBOXED scalar, and stored into a
+    // scanned `current` slot an even int was chased as a pointer (the list
+    // iterator's half of the seq-over-seq GC trap). $literCur reads the head
+    // from this cons on demand, exactly as the array iterator reads arr[idx].
+    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; lg f "$rem"; mem f "i32.store"
     lg f "$it"; ic f HDR; ins f "i32.add"; lg f "$rem"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; mem f "i32.store"
     ic f 1; ins f "return"
     endB f
@@ -2289,7 +2309,8 @@ let private emitListIter (m : Mod) : unit =
     lg f "$it"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; ls f "$idx"
     lg f "$it"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ic f (HDR + 4); ins f "i32.add"; lg f "$idx"; ic f 4; ins f "i32.mul"; ins f "i32.add"; mem f "i32.load"; ins f "return"
     elseB f
-    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; ins f "return"
+    // list: current holds the CONS CELL; the element is its head word
+    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ins f "return"
     endB f
     ins f "unreachable"
     endFn f
@@ -3243,6 +3264,22 @@ let private emitCmpv (m : Mod) : unit =
         ifE f
         cidOfHdr "$ca"; ls f "$x"
         cidOfHdr "$cb"; ls f "$y"
+        // canonicalize a stamped subclass' cid to its base for structural
+        // comparison (0 in the table = no override)
+        (if gc then
+            let tbl () = (gg f "$roots"; ic f (4 * gcCidEqSlot); ins f "i32.add"; mem f "i32.load")
+            lg f "$x"
+            tbl (); ic f 8; ins f "i32.add"; lg f "$x"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+            tbl (); ic f 8; ins f "i32.add"; lg f "$x"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ins f "i32.eqz"
+            ins f "select"; ls f "$x")
+        // canonicalize a stamped subclass' cid to its base for structural
+        // comparison (0 in the table = no override)
+        (if gc then
+            let tbl () = (gg f "$roots"; ic f (4 * gcCidEqSlot); ins f "i32.add"; mem f "i32.load")
+            lg f "$y"
+            tbl (); ic f 8; ins f "i32.add"; lg f "$y"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+            tbl (); ic f 8; ins f "i32.add"; lg f "$y"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ins f "i32.eqz"
+            ins f "select"; ls f "$y")
         lg f "$x"; lg f "$y"; ins f "i32.ne"
         ifE f
         lg f "$x"; lg f "$y"; ins f "i32.gt_s"; lg f "$x"; lg f "$y"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"
@@ -3397,6 +3434,22 @@ let private emitEqv (m : Mod) : unit =
         ifE f
         cidOfHdr "$ca"; ls f "$x"
         cidOfHdr "$cb"; ls f "$r"
+        // canonicalize a stamped subclass' cid to its base for structural
+        // comparison (0 in the table = no override)
+        (if gc then
+            let tbl () = (gg f "$roots"; ic f (4 * gcCidEqSlot); ins f "i32.add"; mem f "i32.load")
+            lg f "$x"
+            tbl (); ic f 8; ins f "i32.add"; lg f "$x"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+            tbl (); ic f 8; ins f "i32.add"; lg f "$x"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ins f "i32.eqz"
+            ins f "select"; ls f "$x")
+        // canonicalize a stamped subclass' cid to its base for structural
+        // comparison (0 in the table = no override)
+        (if gc then
+            let tbl () = (gg f "$roots"; ic f (4 * gcCidEqSlot); ins f "i32.add"; mem f "i32.load")
+            lg f "$r"
+            tbl (); ic f 8; ins f "i32.add"; lg f "$r"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+            tbl (); ic f 8; ins f "i32.add"; lg f "$r"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ins f "i32.eqz"
+            ins f "select"; ls f "$r")
         lg f "$x"; lg f "$r"; ins f "i32.ne"
         ifE f; ic f 0; ins f "return"; endB f
         endB f
@@ -4523,6 +4576,18 @@ type private LowCtx =
       // contract (box-elim cancels it back in arithmetic); a capture re-boxes
       // into the closure env. Captured mutables are cells, so never listed here.
       VarScalar : Dict<string, LTy>
+      /// the KNOWN ref-kind of a local/param whose BINDER told us — a stamped
+      /// clone's `v : int` param rides a raw even word (RKRaw), its
+      /// `l : Node<...>` param a pointer (RKRef) — while the USE-site scheme is
+      /// still the generic `'a` (substBinderTypes substitutes binders only; a
+      /// use-site substitution mis-classified refs and broke the self-host).
+      /// refKindOfElemC consults this when the expression analysis answers
+      /// RKGen, so a stamped body's aggregates get a PRECISE scan map: a raw
+      /// int excluded (not chased), a ref included (traced) — instead of the
+      /// FK_TAGGED fallback that assumes tagged scalars. Keyed by the actual
+      /// STORED representation: locals by their rhs kind, params by the
+      /// (substituted) binder scheme.
+      VarKind : Dict<string, RefKind>
       /// a variable holding a BY-VALUE struct: field name -> its register.
       /// The value lives in registers, so reading a field is a register read
       /// and nothing is allocated; only a use of the WHOLE value materialises
@@ -5233,6 +5298,25 @@ let rec private refKindOfExprC (st : St) (e : Expr) : RefKind =
              else refKindOfExpr e
          | None -> refKindOfExpr e)
     | _ -> refKindOfExpr e
+
+// element ref-kind for a GENERIC AGGREGATE slot, ctx-aware: a variable recorded
+// as a raw narrow scalar (its binder produced a raw even word) reads RKRaw even
+// when its use-site scheme is still `'a` (refKindOfExpr would say RKGen). This
+// is what lets a stamped-int local ride a cons head / tuple / record field with
+// a PRECISE scan map instead of the tagged fallback that chases the even int.
+let private refKindOfElemC (ctx : LowCtx) (e : Expr) : RefKind =
+    match e with
+    // a captured-mutable CELL: `$cellof x` yields the cell POINTER (a ref),
+    // whatever the content — the raw scalar lives inside the unscanned cell.
+    | EApp (EUnknown "$cellof", _) -> RKRef
+    | _ ->
+    match refKindOfExprC ctx.LSt e with
+    | RKGen ->
+        (match e with
+         | EVar (v, _) | EVarI (v, _, _) ->
+             (match dictTryFind ctx.VarKind (key v) with Some k -> k | None -> RKGen)
+         | _ -> RKGen)
+    | k -> k
 
 // the element witness register for a comparison of two operands whose static
 // type is a type PARAMETER (so its ShOther comparison can pick raw-vs-ref at
@@ -6887,7 +6971,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // concrete head: skip/scan by compile-time ref-kind. GENERIC head: pick
         // the scan map at runtime from the element type's witness refMask
         // (looked up by the head's type-var id). The tail is always a pointer.
-        (match refKindOfExpr h with
+        (match refKindOfElemC ctx h with
          | RKGen ->
              (match tyVarIdOfExpr h |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with
               | Some wreg -> lowGenericCons ctx (LLoad (W, LGet (wReg wreg), 8)) (coreToLowE ctx h) (coreToLowE ctx t)
@@ -7135,7 +7219,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         | ">>>" when unsignedW -> LPrim (ShrUW, [ ta; tb ])
         | "/" | "%" -> divGuarded ctx false (intArithOp bop) ta tb
         | _ -> LPrim (intArithOp bop, [ ta; tb ])
-    | ETuple xs -> lowObjR ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs) (Some (List.map (refKindOfExprC st) xs)) (genWitsOf ctx 0 xs)
+    | ETuple xs -> lowObjR ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs) (Some (List.map (refKindOfElemC ctx) xs)) (genWitsOf ctx 0 xs)
     | EListLit xs -> lowList ctx xs
     // a collapsed one-field record IS its field value — no heap object
     | ERecord (name, fields) when (dictTryFind st.Collapse name).IsSome ->
@@ -7228,7 +7312,14 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 | Some e2 -> e2
                 | None -> ELit (LInt "0"))
         let baseSlots = valExprs |> List.map (coreToLowE ctx)
-        let baseKinds = valExprs |> List.map (refKindOfExprC st)
+        // a stamped narrow-scalar sub uses its substituted field kinds so the
+        // raw int slot is excluded from the scan map; every other record keeps
+        // the ordinary per-expression classification (int-off is unaffected).
+        let subKinds = dictTryFind st.SubFieldKind name
+        let baseKinds =
+            match subKinds with
+            | Some m -> order |> List.map (fun fnm -> match m |> List.tryPick (fun (f, k) -> if f = fnm then Some k else None) with Some k -> k | None -> RKGen)
+            | None -> valExprs |> List.map (refKindOfElemC ctx)
         let baseWits = genWitsOf ctx 0 valExprs
         match (if gc then dictTryFind st.WitnessedClasses name else None) with
         | Some k ->
@@ -7252,7 +7343,30 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
                 | Some e2 -> coreToLowE ctx e2
                 | None -> LLoad (W, LGet (wReg b), HDR + 4 * i))
-        LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObj ctx (cidRec st name) 0 slots)
+        // per-slot ref-kinds so a stamped-int copied slot is excluded from the
+        // scan map (its raw even int is never chased). A `&`-field is a CELL
+        // (ref); a concrete NARROW scalar is RKRaw only when int-stamping is on
+        // (else it is a tagged word — the tagged fallback is correct and this
+        // stays int-off-byte-identical); a concrete non-scalar is a ref; a
+        // generic/`#` field stays RKGen. Updated slots classify by expression.
+        let subKinds = dictTryFind st.SubFieldKind name
+        let copiedKind (fnm : string) : RefKind =
+            match subKinds |> Option.bind (fun m -> m |> List.tryPick (fun (f, k) -> if f = fnm then Some k else None)) with
+            | Some k -> k
+            | None ->
+                match recFieldTy st name fnm with
+                | Some ty0 ->
+                    if ty0.StartsWith "&" then RKRef
+                    elif rawScalarName ty0 then (if intStamped then RKRaw else RKGen)
+                    elif ty0 <> "" && not (ty0.StartsWith "#") && not (ty0.StartsWith "'") && not (ty0.StartsWith "?") then RKRef
+                    else RKGen
+                | None -> RKGen
+        let kinds =
+            order |> List.map (fun fnm ->
+                match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
+                | Some e2 -> refKindOfElemC ctx e2
+                | None -> copiedKind fnm)
+        LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 slots (Some kinds) [])
     // an enum case IS its raw integer value — no heap object
     | ECtor (case, _, _) when (dictTryFind st.EnumConst case).IsSome ->
         LConstW (optGet (dictTryFind st.EnumConst case))
@@ -7329,7 +7443,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                             | None -> (off, W, W, true, read i)))
                 | _ -> []
             if List.isEmpty items && nslots > 0 then
-                let kinds = RKRaw :: List.map (refKindOfExprC st) args
+                let kinds = RKRaw :: List.map (refKindOfElemC ctx) args
                 shareNullary (lowObjR ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args) (Some kinds) (genWitsOf ctx 1 args))
             else
                 let tagOff = (optGet (dictTryFind layout "$tag") |> fun (off, _) -> off)
@@ -7343,7 +7457,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         | _ ->
         // slot 0 is the raw tag word; the payload follows. A concrete payload
         // gets a ref-map so its unboxed scalars are skipped by the collector.
-        let kinds = RKRaw :: List.map (refKindOfExprC st) args
+        let kinds = RKRaw :: List.map (refKindOfElemC ctx) args
         shareNullary (lowObjR ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args) (Some kinds) (genWitsOf ctx 1 args))
     | EField (r, _, owner) when (dictTryFind st.Collapse owner).IsSome -> coreToLowE ctx r
     // fused element-field access on an array of inline records — MUST precede the
@@ -9786,7 +9900,7 @@ and private lowList (ctx : LowCtx) (xs : Expr list) : LExpr =
     match xs with
     | [] -> LConstW 0
     | x :: rest ->
-        (match refKindOfExpr x with
+        (match refKindOfElemC ctx x with
          | RKGen ->
              (match tyVarIdOfExpr x |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with
               | Some wreg -> lowGenericCons ctx (LLoad (W, LGet (wReg wreg), 8)) (coreToLowE ctx x) (lowList ctx rest)
@@ -10281,7 +10395,11 @@ and private lowSlotInit (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) :
     if (dictTryFind ctx.LSt.CellVars k).IsSome then
         let ck = match refKindOfTy sch.Body with RKGen -> refKindOfExpr rhs | kk -> kk
         dictSet ctx.LSt.CellKind k ck
-        lowMkCell ctx ck (coreToLowE ctx rhs)
+        // a still-generic cell with the element WITNESS in scope selects its
+        // tid at runtime: raw 'a -> unscanned cell$s, ref 'a -> scanned cell
+        match ck, (match prune sch.Body with TVar tv -> dictTryFind ctx.Witness tv.Id | _ -> None) with
+        | RKGen, Some wreg when gc -> lowMkCellW ctx wreg (coreToLowE ctx rhs)
+        | _ -> lowMkCell ctx ck (coreToLowE ctx rhs)
     else coreToLowE ctx rhs
 
 // bind a local `let`: a monomorphic scalar rides unboxed in a typed local
@@ -10575,6 +10693,15 @@ and private lowLetBind (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) : 
         dictSet ctx.VarScalar k ty
         LSet ({ Id = id; RTy = ty }, flatUnbox ty (coreToLowE ctx rhs))
     | None ->
+        // a non-cell local whose initialiser produced a RAW even word (a stamped
+        // narrow int, arithmetic, an array length): record it so a later use as a
+        // generic aggregate element reads RKRaw and the aggregate excludes it from
+        // its scan map. Keyed on the STORED representation, so a tagged/uniform
+        // rhs is never listed and the tagged fallback stays sound.
+        (if not isCell then
+            match refKindOfExprC st rhs with
+            | RKGen -> ()
+            | rk -> dictSet ctx.VarKind k rk)
         let id = freshReg ctx k
         let init =
             if isCell then
@@ -10586,7 +10713,10 @@ and private lowLetBind (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) : 
                 // is unresolved (a genuinely generic mutable).
                 let ck = match refKindOfTy sch.Body with RKGen -> refKindOfExpr rhs | k -> k
                 dictSet ctx.LSt.CellKind k ck
-                lowMkCell ctx ck (coreToLowE ctx rhs)
+                // runtime-witnessed tid for a generic cell (see lowSlotInit)
+                match ck, (match prune sch.Body with TVar tv -> dictTryFind ctx.Witness tv.Id | _ -> None) with
+                | RKGen, Some wreg when gc -> lowMkCellW ctx wreg (coreToLowE ctx rhs)
+                | _ -> lowMkCell ctx ck (coreToLowE ctx rhs)
             else coreToLowE ctx rhs
         LSet (wReg id, init)
 
@@ -10605,6 +10735,29 @@ and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
 // ref-map and stores its word directly — never scanned, never shadow-stacked,
 // so an even int in the cell is not chased as a pointer. A ref/generic cell
 // keeps the tagged form (scan the word, push across the alloc).
+/// a cell for a GENERIC ('a-typed) mutable whose element witness is in scope:
+/// pick the tid at RUNTIME from the witness refMask — a raw 'a (a stamped int)
+/// lands in the UNSCANNED cell$s, a ref in the scanned cell. The static
+/// fallback minted every generic cell FK_TAGGED, and a raw int key stored
+/// through the canonical SetLeaf ctor was then chased by the collector
+/// (the adaptive suite's mmc trace_edge crash).
+and private lowMkCellW (ctx : LowCtx) (wreg : int) (v : LExpr) : LExpr =
+    let b = freshTmp ctx
+    let t = freshTmp ctx
+    let tidS = gcTidRef ctx.LSt "cell$s" (HDR + 4) []
+    let tidT = gcTid ctx.LSt "cell" (HDR + 4) FK_TAGGED 1
+    let rawBuild =
+        [ LSet (wReg b, lowAllocSized ctx tidS (HDR + 4))
+          LStore (W, LGet (wReg b), HDR, LGet (wReg t)) ]
+    let refBuild =
+        gcPushStmts (LGet (wReg t))
+        @ [ LSet (wReg b, lowAllocSized ctx tidT (HDR + 4)) ]
+        @ gcPopInto (LGet (wReg b)) HDR
+    LDo ([ LSet (wReg t, v)
+           LIf (LPrim (EqW, [ LLoad (W, LGet (wReg wreg), 8); LConstW 0 ]),
+                rawBuild, refBuild) ],
+         LGet (wReg b))
+
 and private lowMkCell (ctx : LowCtx) (kind : RefKind) (v : LExpr) : LExpr =
     let b = freshTmp ctx
     if gc then
@@ -10613,7 +10766,10 @@ and private lowMkCell (ctx : LowCtx) (kind : RefKind) (v : LExpr) : LExpr =
             let t = freshTmp ctx
             LDo ([ LSet (wReg t, v); LSet (wReg b, lowAllocSized ctx tid (HDR + 4)); LStore (W, LGet (wReg b), HDR, LGet (wReg t)) ], LGet (wReg b))
         else
-            let tid = gcTid ctx.LSt "cell" (HDR + 4) FK_TAGGED 1
+            // FPP_CELLDBG=1: one tid per (creating fn) so a runtime trace of a
+            // mis-kinded cell names its creator via FPP_TIDDUMP
+            let key = if System.Environment.GetEnvironmentVariable "FPP_CELLDBG" = "1" then "cell@" + curFnDbg else "cell"
+            let tid = gcTid ctx.LSt key (HDR + 4) FK_TAGGED 1
             LDo ([ LCallVoidS ("$spush", [ v ]); LSet (wReg b, lowAllocSized ctx tid (HDR + 4)); LStore (W, LGet (wReg b), HDR, LCall ("$spop", [])) ], LGet (wReg b))
     else
         LDo ([ LSet (wReg b, LAlloc (LConstW 4)); LStore (W, LGet (wReg b), 0, v) ], LGet (wReg b))
@@ -11813,7 +11969,7 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
 
 let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<string, string>) (isInit : bool) (sig_ : (LTy list * LTy) option) (structPlan : string option list) (byrefPlan : bool list) (retStruct : string option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
     curFnDbg <- dbgName
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SretDst = None; BrPays = brPays; BrPost = []; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); VarKind = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SretDst = None; BrPays = brPays; BrPost = []; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
     // var, recorded in ctx.Witness so a generic aggregate can read the element
     // type's witness. Regular params follow.
@@ -11972,6 +12128,16 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<st
     // `loop` cons'd onto its `acc` after an allocating scan moved it). Reads go
     // through the slot's stable address (ctx.Slotted). Witness-pointer params are
     // static, never rooted.
+    // a concretely-typed PARAMETER records its kind so a use as a generic
+    // aggregate element classifies precisely even where the use-site scheme is
+    // still `'a` (a stamped clone's binder schemes are substituted; its use
+    // sites are not).
+    (if gc then
+        List.zip ps paramTypes |> List.iter (fun (pv, ty) ->
+            if (scalarLTy ty).IsNone && (dictTryFind ctx.StructVars (key pv)).IsNone then
+                match refKindOfTy ty with
+                | RKGen -> ()
+                | k -> dictSet ctx.VarKind (key pv) k))
     let rootParams =
         if gc then
             List.zip ps paramTypes
@@ -12246,7 +12412,7 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     // which construct in it lowered to a trap
     if System.Environment.GetEnvironmentVariable "FPP_LAM_DUMP" = lamName then
         eprintfn "LAM %s = %s" lamName (printExpr body)
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SretDst = None; BrPays = dictNew (); BrPost = []; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); VarKind = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SretDst = None; BrPays = dictNew (); BrPost = []; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
     // GC: root the env AND a ref-typed argument on the shadow stack for the body's
@@ -12263,6 +12429,13 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     let rootArg = gc && refKindOfTy psch.Body = RKRef && (scalarLTy psch.Body).IsNone
     let argSlotReg = if rootArg then Some (freshTmp ctx) else None
     (match argSlotReg with Some r -> dictSet ctx.Slotted (key pv) (LGet (wReg r)) | None -> ())
+    // a concretely-schemed arg records its kind so a use as a generic
+    // aggregate element classifies precisely (raw excluded from the scan map,
+    // ref included) even where the use-site scheme is still `'a`.
+    (if gc && (scalarLTy psch.Body).IsNone then
+        match refKindOfTy psch.Body with
+        | RKGen -> ()
+        | k -> dictSet ctx.VarKind (key pv) k)
     let sink = vecNew ()
     st.GapSink <- Some sink
     preRecGroups ctx body
@@ -13022,13 +13195,13 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; TailApp = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew (); LamWits = dictNew ()
-          RecFields = dictNew (); ClassNames = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew (); EnumConst = dictNew ()
+          RecFields = dictNew (); ClassNames = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); SubFieldKind = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew (); EnumConst = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew (); CasePod = dictNew (); UnionFlat = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
           FuncRetStruct = dictNew (); FuncParamPlan = dictNew (); FuncParamByRef = dictNew (); BrParamPay = brParamPay; TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           FieldOwnerOf = dictNew ()
-          GcConstData = vecNew (); GcCloData = vecNew (); CloSlot = dictNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
+          GcConstData = vecNew (); GcCloData = vecNew (); CloSlot = dictNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; CidEqSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -13081,6 +13254,19 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // a stamped subclass resolves its fields through the base it was stamped
     // from (DClass carries `Some base`); record subclass -> base for EField.
     for d in decls0 do match d with DClass (n, Some b, _, _) when b <> n -> dictSet st.RecBase n b | _ -> ()
+    for d in decls0 do
+        match d with
+        | DFieldSubst (n, fs) ->
+            let kindOf (ty0 : string) : RefKind =
+                // a `&`-prefixed field holds a CELL POINTER (a captured-mutable
+                // heap cell), which is a REF whatever its content — the raw
+                // scalar lives INSIDE the unscanned cell, never in this slot.
+                if ty0.StartsWith "&" then RKRef
+                elif rawScalarName ty0 then RKRaw
+                elif ty0 <> "" && not (ty0.StartsWith "#") && not (ty0.StartsWith "'") && not (ty0.StartsWith "?") then RKRef
+                else RKGen
+            dictSet st.SubFieldKind n (fs |> List.map (fun (fn, ty) -> fn, kindOf ty))
+        | _ -> ()
     // a class that INHERITS lays its base's fields out as a PREFIX: the base's
     // members read their slots at the same offsets through an upcast receiver.
     // Only classes with OWN fields expand — a stamped clone (own list empty)
@@ -13767,7 +13953,9 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         vecAdd st.TidCid (gcConsRefTid, CID_LIST)
         // the built-in list iterator: [remaining][current], both scanned as
         // tagged words (start=1) so a ref element is rooted and a tagged int skipped
-        gcIterTid <- gcTid st "iter" (HDR + 8) FK_TAGGED 1
+        // both words are CONS-CELL pointers (remaining tail, current cons) —
+        // never a raw scalar — so trace both and never scan a head value
+        gcIterTid <- gcTidRef st "iter" (HDR + 8) [ HDR; HDR + 4 ]
         // the built-in ARRAY iterator: [array][index]. The array (HDR) is a real
         // pointer the collector must trace+update; the index (HDR+4) is a raw int
         // (NEVER scanned), so an FK_STRUCT with refoffs = [HDR] only. Distinct tid
@@ -13779,6 +13967,9 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         st.CmpTblSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
         gcCmpTblSlot <- st.CmpTblSlot
+        st.CidEqSlot <- st.RootNext
+        st.RootNext <- st.RootNext + 1
+        gcCidEqSlot <- st.CidEqSlot
         st.DescIdxSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
         st.DescDataSlot <- st.RootNext
@@ -14452,6 +14643,31 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             gg rf "$roots"; ic rf (4 * st.DescDataSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
             vecToList data |> List.iteri (fun i w ->
                 lg rf "$t"; ic rf (8 + 4 * i); ins rf "i32.add"; ic rf w; mem rf "i32.store")
+        // cid -> CANONICAL cid for structural equality/ordering: a stamped
+        // subclass (`Base$inst`) compares as its base, so canonical-built and
+        // stamped instances of one logical type are equal when their contents
+        // are. 0 = no override; the walkers treat 0 as identity.
+        (let cidMax = (dictPairs st.ClassId |> List.fold (fun m (_, c) -> max m c) 0) + 1
+         let canonOf (n : string) : string =
+             let mutable cur = n
+             let mutable go = true
+             while go do
+                 match dictTryFind st.RecBase cur with
+                 | Some b when b <> cur && cur.StartsWith (b + "$") -> cur <- b
+                 | _ -> go <- false
+             cur
+         let pairs =
+             dictPairs st.RecBase
+             |> List.choose (fun (sub, b) ->
+                 if sub.StartsWith (b + "$") then
+                     match dictTryFind st.ClassId sub, dictTryFind st.ClassId (canonOf sub) with
+                     | Some sc, Some cc when sc <> cc -> Some (sc, cc)
+                     | _ -> None
+                 else None)
+         ic rf gcIntTid; ic rf cidMax; callf rf "$fpallocn"; ls rf "$t"
+         gg rf "$roots"; ic rf (4 * st.CidEqSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
+         for sc, cc in pairs do
+             lg rf "$t"; ic rf (8 + 4 * sc); ins rf "i32.add"; ic rf cc; mem rf "i32.store")
         // tid -> shape info (kind<<20 | start<<10 | nwords) for the generic $cmpv
         if st.TidNext > 0 then
             ic rf gcIntTid; ic rf st.TidNext; callf rf "$fpallocn"; ls rf "$t"

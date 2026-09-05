@@ -4054,6 +4054,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       // its LAST declaration, which may be
                                       // the wrong variant entirely
                                       let hasVariants = (arityVariants ctorName).Length > 1
+                                      // an ABBREVIATION whose target is a
+                                      // BCL-shaped reimplementation (RefMap ->
+                                      // Dictionary, Vec -> ResizeArray) may be
+                                      // constructed with arguments the prelude
+                                      // class never declared. The hop commits on
+                                      // arg COUNT, so a second target ctor of the
+                                      // right arity but wrong TYPE — a capacity
+                                      // `new (int)` beside a `(comparer)` the
+                                      // reimpl lacks — would commit the hop and
+                                      // then find nothing that fits. Carried to
+                                      // the resolver so a no-fit on an alias hop
+                                      // falls back to the lenient path instead of
+                                      // erroring, the way the single-ctor form did.
+                                      let isAbbrev = ctorName <> d.Name
                                       // the hop through an ABBREVIATION is
                                       // tentative: commit only when a target
                                       // constructor matches the written
@@ -4087,13 +4101,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                       n = writtenArgs
                                                   | _ -> false)
                                       (match cands with
-                                       | cs when cs.Length > 1 && hopOk () -> Some (ht, cs)
+                                       | cs when cs.Length > 1 && hopOk () -> Some (ht, cs, isAbbrev)
                                        // ONE candidate is still the answer
                                        // when the ordinary path has nothing:
                                        // a struct-block type's scheme lives
                                        // on its `new` members, and the TYPE
                                        // definition itself carries none
-                                       | [ _ ] when (hasVariants || (schemeOfDef d).IsNone) && hopOk () -> Some (ht, cands)
+                                       | [ _ ] when (hasVariants || (schemeOfDef d).IsNone) && hopOk () -> Some (ht, cands, isAbbrev)
                                        | [] when
                                             // `C()` on a class with NO ctor in
                                             // sight: remembered, not judged —
@@ -4185,7 +4199,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          selfTy
                      | None ->
                      match ctorChoice with
-                     | Some (ht, cs) ->
+                     | Some (ht, cs, isAbbrev) ->
                          let argTys =
                              args |> List.filter (fun a -> isExprish a.NodeKind)
                                   |> List.map (fun a -> exprType (GNode a))
@@ -4315,6 +4329,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     | d, a -> unifyArg ht.Offset d a)
                                    res
                                | other -> other)
+                          | None when isAbbrev ->
+                              // an alias hop that committed on arg count but
+                              // fits no target ctor by TYPE: the BCL-shaped
+                              // reimplementation simply lacks the constructor
+                              // the alias is built with (RefMap's identity
+                              // comparer). Yield the constructed type — the
+                              // args are already typed — rather than reporting
+                              // a constructor the writer never named.
+                              (match cs with
+                               | (_, sch) :: _ ->
+                                   (match prune (st.Instantiate sch) with
+                                    | TFun (_, res) -> pin res; res
+                                    | other -> other)
+                               | [] -> st.Fresh ())
                           | None ->
                               vecAdd diags (ht.Offset, "no constructor of " + ht.Text + " accepts these arguments")
                               st.Fresh ())
@@ -4514,6 +4542,31 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let anyNamed =
                          not (List.isEmpty names)
                          && suppliedNodes |> List.exists (fun a -> (namedArg names a).IsSome)
+                     // A named argument reads as a comparison (`height = 9` :
+                     // bool) until the reorder runs, so the argTy the dot
+                     // demand carried never matched the member's parameters
+                     // and `funTy` came back an unresolved variable. The sig
+                     // record already holds the member's real type — pin it
+                     // here so the reorder below sees the parameter tuple.
+                     (if anyNamed then
+                        let usable =
+                            match prune funTy with
+                            | TFun (pt, _) ->
+                                (match prune pt with
+                                 | TTuple ps -> List.length ps = List.length names
+                                 | _ -> false)
+                            | _ -> false
+                        if not usable then
+                            match calleeSig with
+                            | Some fi ->
+                                let subst = dictNew<int, Type> ()
+                                for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
+                                for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
+                                for fv in freeVars fi.FieldType do
+                                    if (dictTryFind subst (prunedId fv)).IsNone then
+                                        dictSet subst (prunedId fv) (st.Fresh ())
+                                unify funTy (substVars subst fi.FieldType) |> ignore
+                            | None -> ())
                      let mutable handled = false
                      (if anyNamed then
                         match prune funTy with
@@ -7385,15 +7438,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         //    dispatch looks, so the real method keeps answering.
         (if isExtensionDecl then
             (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
-             | Some t when
-                   List.contains t.Text
-                       [ "string"; "int"; "float"; "float32"; "float16"; "int64"
-                         "uint64"; "uint32"; "int16"; "uint16"; "byte"; "sbyte"
-                         "bool"; "char"; "unit"; "nativeint"; "obj"; "seq"
-                         "list"; "array"; "option"; "voption" ] ->
-                 vecAdd diags
-                     (t.Offset,
-                      "'" + t.Text + "' cannot be extended: its members are a fixed builtin set, so the added member would resolve to nothing")
              | _ -> ())
             for m in nodesOf n do
                 if m.NodeKind = LetDecl then

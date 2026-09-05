@@ -16,6 +16,12 @@ type Classification =
     | Unclassifiable of string  // compile error
 
 /// `isStructName` decides which type names are value types needing layout.
+/// int-stamping toggle: a narrow int rides a stamped clone UNBOXED and RAW.
+/// The backend reads this (WasmLin.intStamped) to give a stamped-int container
+/// slot a precise scan map (raw excluded) — with it off, a narrow int stays a
+/// tagged word and the tagged fallback is correct, so the two never disagree.
+let intStampNarrow = true
+
 let classify (stampScalars : bool) (isStructName : string -> bool) (inst : string list) : Classification =
     // "#id" = instantiated at the enclosing binding's type variable. In the
     // UNSTAMPED generic body that is exactly the canonical (uniform) case;
@@ -24,11 +30,29 @@ let classify (stampScalars : bool) (isStructName : string -> bool) (inst : strin
     // `stampScalars` (the wasm-linear target, whose backend unboxes concrete
     // scalars) a boxed scalar ALSO stamps, so a generic carries it unboxed
     // instead of via a heap box: float/double/int64/uint64 don't fit a tagged
-    // word, and float32/single ride an f64 box. int/char/bool and the narrow
-    // ints already ride an unboxed tagged word, so they stay Canon.
+    // word, and float32/single ride an f64 box.
+    //
+    // `int` stamps too (intStampNarrow): a narrow int rides its clones as a
+    // RAW word — unboxed, untagged. Four mechanisms keep that sound, each of
+    // which was a real failure before it existed:
+    //  * globally-unique alphaRename offsets — the old hash-derived delta
+    //    collided (birthday paradox at 1M buckets) and aliased two clones'
+    //    locals in the flat VarId-keyed tables;
+    //  * disjoint synthetic-offset ZONES (stamps 800M, desugar 500M, `this`
+    //    +200M) — stamps used to land on CE-synthesized declarations;
+    //  * precise/conservative GC split — FK_STRUCT gets exact scan maps
+    //    (DFieldSubst substitutes a stamped sub's field types), while the
+    //    uniform-word forms (FK_TAGGED, ref arrays, RANGE roots) are traced
+    //    CONSERVATIVELY under mmc (validated + pinned, raw ints skipped),
+    //    which costs compaction (nofl ambiguous-edges mode);
+    //  * a cid -> canonical-cid table for $eqv/$cmpv — a canonical-built
+    //    HashLeaf and a stamped HashLeaf$int$int with equal contents must
+    //    compare equal, and cids differ per stamp.
     let boxedScalar (t : string) =
         stampScalars
-        && (t = "float" || t = "double" || t = "int64" || t = "uint64" || t = "float32" || t = "single")
+        && (t = "float" || t = "double" || t = "int64" || t = "uint64"
+            || t = "float32" || t = "single"
+            || (intStampNarrow && (t = "int")))
     if inst |> List.exists (fun t -> t = "" || t.StartsWith "#") then Canon
     elif inst |> List.exists (fun t -> isStructName t || boxedScalar t) then Stamp inst
     else Canon
@@ -165,9 +189,7 @@ let private substScheme (inst : string list) (sch : Scheme) : Scheme =
 /// The substitution is the decl's own quantified variables against the
 /// instantiation, applied to every binder the body introduces: lambda
 /// parameters, `let`s, and pattern binders.
-let private substBinderTypes (inst : string list) (declSch : Scheme) (e : Expr) : Expr =
-    if List.isEmpty declSch.Quantified || declSch.Quantified.Length <> inst.Length then e
-    else
+let private substBinderTypes (inst : string list) (declSch : Scheme) (over : (string * string) list) (e : Expr) : Expr =
     // ONLY scalar instantiations. Specializing a binder to a REFERENCE type
     // changes no representation — both ride the uniform word — while it does
     // perturb how a typeclass witness is chosen, which cost four adaptive-suite
@@ -178,9 +200,14 @@ let private substBinderTypes (inst : string list) (declSch : Scheme) (e : Expr) 
         [ "int"; "float"; "float32"; "float16"; "int64"; "uint32"; "uint64"
           "int16"; "uint16"; "byte"; "sbyte"; "bool"; "char"; "nativeint" ]
     let m = dictNew<int, Type> ()
-    List.zip declSch.Quantified inst
-    |> List.iter (fun (v, n) ->
-        if List.contains n scalarNames then dictSet m (prunedId v) (TCon (n, [])))
+    (if not (List.isEmpty declSch.Quantified) && declSch.Quantified.Length = inst.Length then
+        List.zip declSch.Quantified inst
+        |> List.iter (fun (v, n) ->
+            if List.contains n scalarNames then dictSet m (prunedId v) (TCon (n, []))))
+    (for (k, nm) in over do
+        if k.Length > 1 && k.[0] = '#' && List.contains nm scalarNames then
+            dictSet m (int (k.Substring 1)) (TCon (nm, [])))
+    if dictPairs m |> List.isEmpty then e else
     let rec go (t : Type) : Type =
         match prune t with
         | TVar v -> (match dictTryFind m v.Id with Some c -> c | None -> TVar v)
@@ -387,6 +414,12 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
         match d with
         | DLet (rc, v, sch, e) -> dictSet bodies (v.Path, v.Offset) (rc, v, sch, e)
         | _ -> ()
+    let recFieldsIdx = dictNew<string, (string * string) list> ()
+    for d in decls do
+        match d with
+        | DRecord (n, _, fs, _) when not (List.isEmpty fs) -> dictSet recFieldsIdx n fs
+        | _ -> ()
+
     // Two top-level functions may share a bare name (Array.rev and Seq.rev):
     // their stamps must not collide, so an AMBIGUOUS name carries its
     // definition offset. Unique names keep the readable form.
@@ -576,7 +609,11 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
     // stamp offset -> the TEMPLATE's offset. What lets a demand on a stamped
     // constructor unpark the class members that parked on the template.
     let stampOrigins = dictNew<int, int> ()
-    let mutable stampNext = 500000000
+    // 800M zone: DISJOINT from desugar synthetics (500M..~500.1M — sharing
+    // 500M made a stamped clone collide with a CE-synthesized declaration at
+    // the same path:offset, corrupting whichever the function table kept) and
+    // from every Lower bias zone (<=632M) and alphaRename (1G+).
+    let mutable stampNext = 800000000
     let stampOffsetOf (baseOffset : int) (mangled : string) : int =
         match dictTryFind stampOffsets mangled with
         | Some o -> o
@@ -788,6 +825,16 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                               && inst |> List.exists (fun t -> t <> "obj" && t <> "$ref") ->
                             Stamp inst
                         | other -> other
+                // A top-level VALUE binding (its body is not a lambda) is
+                // initialised ONCE at module load. A scalar-stamped clone of it
+                // is emitted but never wired into module init — only FUNCTION
+                // stamps are — so the clone's global stays NULL and every read
+                // faults (a stamped `Map.empty : Map<'k,'v> = MapEmpty` read
+                // back 0, then the consumer's cid dispatch hit its `unreachable`).
+                // A value gains nothing from scalar stamping — a nullary union
+                // case shares one singleton, a scalar rides its box — so keep it
+                // Canon, which stays initialised and interoperates by cid.
+                let cls = match cls with | Stamp _ -> (match dictTryFind bodies (v.Path, v.Offset) with Some (_,_,_,ELam _) -> cls | Some _ -> Canon | None -> cls) | other -> other
                 (match cls with
                  // The shared (Canon) body is emitted once and generic. Under
                  // the wasm-linear witness ABI (stampScalars) a raw scalar like
@@ -1042,8 +1089,21 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
     /// same template otherwise share parameter and local VarIds, and every
     /// backend table keyed by those (scalarized parameters, local kinds)
     /// would then leak state from one specialization into another.
+    // GLOBALLY-UNIQUE binder offsets per stamped clone, so no two clones' locals
+    // can ever share a (path, offset) key — the hash-derived `delta` collided
+    // (1M buckets, ~1000 clones = birthday-paradox likely), and a collision
+    // aliased two clones' locals in the flat VarId-keyed backend tables.
+    // GLOBALLY-UNIQUE binder offsets per stamped clone, so no two clones' locals
+    // share a (path, offset) key — the hash-derived `delta` collided (1M
+    // buckets, ~1000s of clones = birthday-paradox), aliasing two clones' locals
+    // in the flat VarId-keyed backend tables and silently corrupting values
+    // (a stamped node's byte field read 0 where 1 was stored). Fixed 24->6
+    // adaptive failures; self-host stays byte-exact.
+    let alphaCounter = ref 1000000000
     let alphaRename (delta : int) (e : Expr) : Expr =
+        ignore delta
         let bound = dictNew<string * int, bool> ()
+        let renMap = dictNew<string * int, int> ()
         let rec collectPat (p : Pat) =
             match p with
             | PVar (v, _) -> dictSet bound (v.Path, v.Offset) true
@@ -1064,7 +1124,13 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                 x)
             e |> ignore
         let ren (v : VarId) =
-            if (dictTryFind bound (v.Path, v.Offset)).IsSome then { v with Offset = v.Offset + delta } else v
+            if (dictTryFind bound (v.Path, v.Offset)).IsSome then
+                let no =
+                    match dictTryFind renMap (v.Path, v.Offset) with
+                    | Some o -> o
+                    | None -> let o = alphaCounter.Value in alphaCounter.Value <- o + 1; dictSet renMap (v.Path, v.Offset) o; o
+                { v with Offset = no }
+            else v
         let rec renPat (p : Pat) =
             match p with
             | PVar (v, sc) -> PVar (ren v, sc)
@@ -1136,6 +1202,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
         | DClass (n, Some b, _, _) -> dictSet classBaseOf n b
         | DBaseInst (n, inst) -> dictSet classBaseInstOf n inst
         | _ -> ()
+
     /// the class a constructor builds — a class' ctor is the top-level
     /// function that carries its name
     let classOfCtor = dictNew<string * int, string> ()
@@ -1146,8 +1213,46 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
             dictSet classOfCtor (v.Path, v.Offset) v.Name
             dictSet ctorSchemeOf v.Name sch
         | _ -> ()
+    // a stamped sub's FULL substituted field layout (base prefix + own, every
+    // `#id` resolved) — emitted ONLY when SOME field is a narrow-raw scalar
+    // (a stamped int/bool/char), so int-off (no such stamps) is untouched.
+    let narrowRaw (t : string) =
+        match t with
+        | "int" | "int32" | "uint32" | "nativeint" | "unativeint"
+        | "bool" | "char" | "int16" | "uint16" | "byte" | "sbyte" -> true
+        | _ -> false
+    let substOwn (cn : string) (sb : Dict<string, string>) : (string * string) list =
+        match dictTryFind recFieldsIdx cn with
+        | Some fs ->
+            fs |> List.map (fun (fn, ty) ->
+                if ty.StartsWith "&" then fn, "&" + substName sb (ty.Substring 1)
+                else fn, substName sb ty)
+        | None -> []
+    let rec substChain (seen : string list) (cn : string) (sb : Dict<string, string>) : (string * string) list =
+        let prefix =
+            match dictTryFind classBaseOf cn with
+            | Some b when b <> cn && not (List.contains b seen) ->
+                let binst = match dictTryFind classBaseInstOf cn with Some xs -> xs |> List.map (substName sb) | None -> []
+                let bsubst = dictNew<string, string> ()
+                (match dictTryFind ctorSchemeOf b with
+                 | Some bsch when bsch.Quantified.Length = binst.Length ->
+                     List.zip bsch.Quantified binst
+                     |> List.iter (fun (qv, nm) ->
+                            dictSet bsubst ("#" + string (prunedId qv)) nm
+                            dictSet bsubst ("#" + string qv.Id) nm)
+                 | _ -> ())
+                substChain (cn :: seen) b bsubst
+            | _ -> []
+        prefix @ substOwn cn sb
+    let substFieldsFor (cn : string) (sb : Dict<string, string>) : (string * string) list =
+        let full = substChain [] cn sb
+        // only when a field became a NARROW-RAW scalar the base named as `#`:
+        // that is the sole case the tagged fallback would chase. Float/struct/
+        // ref stamps produce no entry, so int-off compilation is byte-identical.
+        if full |> List.exists (fun (_, ty) -> narrowRaw (if ty.StartsWith "&" then ty.Substring 1 else ty)) then full else []
+
     /// the instantiated subclasses to declare, in discovery order
-    let instClasses = vecNew<string * string * (string * (string * VarId) list) list * (string * VarId) list> ()
+    let instClasses = vecNew<string * string * (string * (string * VarId) list) list * (string * VarId) list * (string * string) list> ()
     let instClassSeen = dictNew<string, bool> ()
 
     let mutable i = 0
@@ -1401,7 +1506,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                                       | _ -> ())
                              | None -> ()
                          walkBase cn subst
-                         vecAdd instClasses (sub, cn, impls, own @ vecToList inherited)
+                         vecAdd instClasses (sub, cn, impls, own @ vecToList inherited, substFieldsFor cn subst)
                      Some sub
                  | None -> None
              // allocate the subclass instead of the class itself
@@ -1465,7 +1570,9 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                                      match dictTryFind classOwnOf n with
                                      | Some xs -> xs |> List.map (fun (mn, mv) -> mn, objStamp mv)
                                      | None -> []
-                                 vecAdd instClasses (sub, n, impls, own)
+                                 let esb = dictNew<string, string> ()
+                                 for k2, nm2 in enclosingSubst do dictSet esb k2 nm2
+                                 vecAdd instClasses (sub, n, impls, own, substFieldsFor n esb)
                              ERecord (sub, fs)
                          | ERecordExt (n, b, fs) when n.StartsWith "obj@" && (dictTryFind classImplsOf n).IsSome && not (List.isEmpty inst) ->
                              let sub = mangleInst n inst
@@ -1497,7 +1604,9 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                                      match dictTryFind classOwnOf n with
                                      | Some xs -> xs |> List.map (fun (mn, mv) -> mn, objStamp mv)
                                      | None -> []
-                                 vecAdd instClasses (sub, n, impls, own)
+                                 let esb = dictNew<string, string> ()
+                                 for k2, nm2 in enclosingSubst do dictSet esb k2 nm2
+                                 vecAdd instClasses (sub, n, impls, own, substFieldsFor n esb)
                              ERecordExt (sub, b, fs)
                          | other -> other)
                      x
@@ -1508,7 +1617,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                  // GetEnvironmentVariable answers null inside the wasm-hosted
                  // compiler, so stage-0 would run it and stage-1 would not.
                  let body0 = objFix (allocFix (selfFix (rewrite mangled selfKey subst false e)))
-                 let body1 = substBinderTypes inst sch body0
+                 let body1 = substBinderTypes inst sch substOverride body0
                  DLet (rc, nv, substScheme inst sch,
                        alphaRename (10000000 + (abs (strHash mangled) % 1000000) * 10) body1)
              dictSet stamped mangled clone
@@ -1572,11 +1681,12 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
     // the class' layout exactly; only the vtable differs
     let instDecls =
         vecToList instClasses
-        |> List.collect (fun (sub, cn, impls, own) ->
-            [ DRecord (sub, [], [], false)
-              DClass (sub, Some cn, own, impls) ])
+        |> List.collect (fun (sub, cn, impls, own, sfields) ->
+            (if List.isEmpty sfields then [] else [ DFieldSubst (sub, sfields) ])
+            @ [ DRecord (sub, [], [], false)
+                DClass (sub, Some cn, own, impls) ])
     if System.Environment.GetEnvironmentVariable "FPP_INSTCLS" = "1" then
-        for sub, cn, _, own in vecToList instClasses do
+        for sub, cn, _, own, _ in vecToList instClasses do
             eprintfn "INSTCLS %s <- %s (%d own)" sub cn (List.length own)
         for k, _ in dictPairs vtableLayoutDep do eprintfn "VTLAYDEP %s" k
     emitted @ (dictPairs stamped |> List.map snd) @ instDecls, vecToList errors
@@ -1584,6 +1694,41 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
 // The link step, v0: demand-closure over symbols. Roots are the program's
 // top-level value initializers; only reachable functions survive. Tier-1
 // instantiation stamping plugs in here once call sites carry instantiations.
+
+/// FPP_KEYCHECK=1: report every (path, offset) key claimed by two binders of
+/// DIFFERENT names — a key collision aliases the two in every flat VarId-keyed
+/// table (cells, kinds, function table) and corrupts one of them silently.
+let keyCollisionCheck (decls : Decl list) : unit =
+    if System.Environment.GetEnvironmentVariable "FPP_KEYCHECK" = "1" then
+        let ownerOf = dictNew<string * int, string> ()
+        let reported = dictNew<string * int, bool> ()
+        let claim (v : VarId) (what : string) =
+            let k = (v.Path, v.Offset)
+            match dictTryFind ownerOf k with
+            | Some prev when prev <> v.Name && not ((dictTryFind reported k).IsSome) ->
+                dictSet reported k true
+                eprintfn "KEYCLASH %s:%d  %s  vs  %s (%s)" v.Path v.Offset prev v.Name what
+            | Some _ -> ()
+            | None -> dictSet ownerOf k v.Name
+        let rec pat (p : Pat) =
+            match p with
+            | PVar (v, _) -> claim v "pat"
+            | PAs (i, v, _) -> pat i; claim v "pat-as"
+            | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) | POr ps -> List.iter pat ps
+            | PAnd (a, b) -> pat a; pat b
+            | PCons (h, t) -> pat h; pat t
+            | _ -> ()
+        let rec walk (e : Expr) =
+            (match e with
+             | ELam (ps, _) -> for v, _ in ps do claim v "param"
+             | ELet (_, v, _, _, _) -> claim v "let"
+             | EMatch (_, cs) | ETry (_, cs) -> for p, _, _ in cs do pat p
+             | _ -> ())
+            List.iter walk (children e)
+        for d in decls do
+            match d with
+            | DLet (_, v, _, e) -> claim v "decl"; walk e
+            | _ -> ()
 
 let deadCodeEliminate (decls : Decl list) : Decl list =
     let keep = dictNew<string * int, bool> ()

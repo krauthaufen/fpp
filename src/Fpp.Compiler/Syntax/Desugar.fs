@@ -573,9 +573,22 @@ and private item1 (b : CeBuilder) (explicit : bool) (item : GreenNode) (rest : G
     | LetDecl when hasBang item -> bangLet b explicit item rest
 
     | LetDecl when hasKw item "use" ->
-        (match bangBinder item with
-         | Some (pat, rhs) -> call b "Using" [ rhs; lambda [ GNode pat ] (tail ()) ]
-         | None -> sequential ())
+        // `use p = e` and `use p = e in BODY` both bind a resource whose
+        // scope is the continuation. In the block form the continuation is
+        // `rest`; in the `in` form the body sits INSIDE this node after the
+        // `in`, and `rest` follows it. bangBinder's tryLast would take that
+        // body for the resource — so read the resource as the FIRST exprish
+        // child and splice any post-`in` body ahead of rest.
+        let pat = nodesOf item |> List.tryFind (fun m -> isPatKind m.NodeKind)
+        let exprs = nodesOf item |> List.filter (fun m -> isExprish m.NodeKind)
+        (match pat, exprs with
+         | Some p, rhs :: after ->
+             let body =
+                 match after with
+                 | _ :: _ -> blockYielding b explicit (after @ rest)
+                 | [] -> tail ()
+             call b "Using" [ walk (GNode rhs); lambda [ GNode p ] body ]
+         | _ -> sequential ())
     | LetDecl ->
         // `let b = 3 in <body>` inside a builder: the BODY is a computation
         // item too. Walked plainly it left a bare `return` in the tree, which

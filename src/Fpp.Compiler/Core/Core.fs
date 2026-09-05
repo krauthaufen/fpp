@@ -185,6 +185,12 @@ type Decl =
     /// type that declares members — records and DUs included — so an
     /// override can be found without the type being a class.
     | DMembers of string * (string * VarId) list
+    /// a stamped subclass' substituted field layout (name, (field, kind)) —
+    /// emitted ONLY for a sub that has a NARROW-RAW scalar field (a stamped
+    /// int/bool/char), so the backend gives its construction a precise scan
+    /// map (raw scalar excluded, ref traced) instead of the tagged fallback
+    /// that chases the raw even int. Never for float/struct stamps (unchanged).
+    | DFieldSubst of string * (string * string) list
 
 type LowerResult =
     { Decls : Decl list
@@ -299,6 +305,8 @@ let printDecl (d : Decl) : string =
         "interface " + n + " = {" + String.concat "; " (ms |> List.map (fun (m, a) -> m + "/" + string a)) + "}"
     | DMembers (n, own) ->
         "members " + n + " {" + String.concat "; " (own |> List.map fst) + "}"
+    | DFieldSubst (n, fs) ->
+        "fieldsubst " + n + " {" + String.concat "; " (fs |> List.map fst) + "}"
     | DBaseInst (n, inst) ->
         "baseinst " + n + " <" + String.concat ", " inst + ">"
     | DClass (n, bse, own, impls) ->
