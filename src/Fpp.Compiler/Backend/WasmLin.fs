@@ -13488,7 +13488,15 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
              (match dictTryFind recTyParams n, dictTryFind st.ClassId n with
               | Some k, Some cid when k > 0 ->
                   dictSet st.WitnessedClasses n k
-                  let nf = match dictTryFind st.RecFields n with Some fs -> List.length fs | None -> 0
+                  // nf = the FULL inherited field count the object actually
+                  // stores (chainFields), NOT own RecFields: a derived class with
+                  // NO own fields (HashEmpty, which only inherits `count`) has an
+                  // empty RecFields, so the old `RecFields.length` gave 0 and the
+                  // witness slots were read one field too early — the SECOND type
+                  // param's witness came out wrong and int values were scanned
+                  // under evacuation. (RecFields still drives layout; only this
+                  // offset needs the true count.)
+                  let nf = List.length (chainFields [] n)
                   dictSet st.WitOff cid (HDR + 4 * nf)
               | _ -> ())
          | _ -> ())
