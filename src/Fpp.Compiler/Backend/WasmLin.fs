@@ -5731,18 +5731,19 @@ let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
                      // and resolve THAT (a witnessed class var, or a concrete
                      // static). Closes the `.Key`/`.Value` slots that selfWits
                      // seeded the class vars for.
-                     match prune s.Body, ar with
-                     | TFun (recvP, _), (recv :: _) ->
-                         match prune recvP with
-                         | TCon (_, keyParams) ->
-                             (match List.tryFindIndex (fun p -> match prune p with TVar v -> v.Id = rv.Id | _ -> false) keyParams with
-                              | Some j ->
-                                  (match (match recv with EVar (_, rs) | EVarI (_, rs, _) -> Some (prune rs.Body) | _ -> None) with
-                                   | Some (TCon (_, recvArgs)) when j < List.length recvArgs -> ofTy (List.item j recvArgs)
-                                   | _ -> None)
-                              | None -> None)
-                         | _ -> None
-                     | _ -> None)
+                     (if System.Environment.GetEnvironmentVariable "FPP_NOACCMAP" = "1" then None else
+                      match prune s.Body, ar with
+                      | TFun (recvP, _), (recv :: _) ->
+                          match prune recvP with
+                          | TCon (_, keyParams) ->
+                              (match List.tryFindIndex (fun p -> match prune p with TVar v -> v.Id = rv.Id | _ -> false) keyParams with
+                               | Some j ->
+                                   (match (match recv with EVar (_, rs) | EVarI (_, rs, _) -> Some (prune rs.Body) | _ -> None) with
+                                    | Some (TCon (_, recvArgs)) when j < List.length recvArgs -> ofTy (List.item j recvArgs)
+                                    | _ -> None)
+                               | None -> None)
+                          | _ -> None
+                      | _ -> None))
          | t -> ofTy t)
     | EField (_, f, owner) -> (match recFieldTy st owner f with Some ty -> Some (ofName (if ty.StartsWith "&" then ty.Substring 1 else ty)) | None -> None)
     | EIndex (k, _, _) -> Some (ofName k)
@@ -13343,11 +13344,26 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
          match d with
          | DRecord (n, ps, _, isStruct) when not (List.isEmpty ps) && not isStruct -> dictSet recTyParams n (List.length ps)
          | _ -> ()
-     for d in decls0 do
+     // ephemeron-backed and other runtime-special classes have a fixed layout
+     // the collector assumes — appending witness slots corrupts them.
+     let witExcluded (n : string) =
+         let bare = let i = n.IndexOf "$<" in if i > 0 then n.Substring (0, i) else n
+         bare = "WeakReference" || bare = "ConditionalWeakTable"
+     // a class that is a BASE of another (has subclasses) cannot carry witness
+     // slots at a static offset: a base member reads self's witness where a
+     // derived object holds a derived field. Only leaf-of-hierarchy classes
+     // (no subclasses) are witnessed by Phase 1; inheritance is Phase 1b (a
+     // runtime witness-offset table). RecBase values are the base names.
+     let baseNames = dictNew<string, bool> ()
+     for _, b in dictPairs st.RecBase do dictSet baseNames b true
+     if System.Environment.GetEnvironmentVariable "FPP_NOWITCLS" <> "1" then
+      for d in decls0 do
          match d with
-         | DClass (n, None, _, _) when (dictTryFind st.RecBase n).IsNone ->
+         | DClass (n, None, _, _) when (dictTryFind st.RecBase n).IsNone && not (witExcluded n) && (dictTryFind baseNames n).IsNone ->
              (match dictTryFind recTyParams n with
-              | Some k when k > 0 -> dictSet st.WitnessedClasses n k
+              | Some k when k > 0 ->
+                  dictSet st.WitnessedClasses n k
+                  (if System.Environment.GetEnvironmentVariable "FPP_WCLS" = "1" then eprintfn "WCLS %s k=%d nf=%d" n k (match dictTryFind st.RecFields n with Some fs -> List.length fs | None -> -1))
               | _ -> ())
          | _ -> ())
     for d in decls0 do
