@@ -7457,7 +7457,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 match recFieldTy st name fnm with
                 | Some ty0 ->
                     if ty0.StartsWith "&" then RKRef
-                    elif rawScalarName ty0 then (if intStamped then RKRaw else RKGen)
+                    // a concrete scalar field is NEVER a pointer, so exclude it
+                    // from the scan (RKRaw) unconditionally: leaving it RKGen made
+                    // the WHOLE object fall to the tagged fallback, which scans it
+                    // — so an inherited node's raw `count`/`hash` int was chased
+                    // under evacuation. (Was gated on the never-set `intStamped`.)
+                    elif rawScalarName ty0 then RKRaw
                     elif ty0 <> "" && not (ty0.StartsWith "#") && not (ty0.StartsWith "'") && not (ty0.StartsWith "?") then RKRef
                     else RKGen
                 | None -> RKGen
@@ -7466,6 +7471,19 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
                 | Some e2 -> refKindOfElemC ctx e2
                 | None -> copiedKind fnm)
+        // per-slot witnesses for an inherited-class construction (a witnessed
+        // class' ctor `inherit`s its base, so it lowers HERE, not through
+        // ERecord): resolve each UPDATED generic slot from its value expr, so a
+        // node like HashLeaf<'k,'v> is built PRECISE (its int fields excluded)
+        // instead of falling to the tagged fallback that scans them — the reason
+        // moving GC chased a raw hash/count under evacuation.
+        let extWits =
+            if gc then
+                order |> List.mapi (fun i fnm ->
+                    match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
+                    | Some e2 -> slotWitness ctx e2 |> Option.map (fun w -> (i, w))
+                    | None -> None) |> List.choose id
+            else []
         // a witnessed DERIVED class appends its trailing witness slots after all
         // fields (from the ctor's hidden witness params); the base object's own
         // witnesses are dropped — the derived's cover every param.
@@ -7476,9 +7494,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 | Some r -> LGet (wReg r)
                 | None -> witnessPtrRM st 4 4 1
             let wits = [ 0 .. k - 1 ] |> List.map witVal
-            LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 (slots @ wits) (Some (kinds @ List.replicate k RKRaw)) [])
+            LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 (slots @ wits) (Some (kinds @ List.replicate k RKRaw)) extWits)
         | None ->
-            LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 slots (Some kinds) [])
+            LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 slots (Some kinds) extWits)
     // an enum case IS its raw integer value — no heap object
     | ECtor (case, _, _) when (dictTryFind st.EnumConst case).IsSome ->
         LConstW (optGet (dictTryFind st.EnumConst case))
@@ -14655,19 +14673,26 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // for each class type param that survives as a TVar in the receiver
             // type. The witness lives in the instance's trailing slot after its
             // fields (see the ERecord append above).
+            // The receiver is the FIRST PARAM's type (self), NOT sch.Body's first
+            // arg: an ABSTRACT-override method (`HashInner.AddWith`) carries the
+            // abstract signature `int -> 'k -> 'v -> …` with NO receiver, so
+            // reading sch.Body gave `int` and every node it built fell to the
+            // tagged fallback — its concrete int fields (count/hash) then chased
+            // under evacuation. selfWits only applies to methods with NO
+            // FuncWitness (the monomorphized vtable impls); a function that
+            // RECEIVES witnesses as params uses those instead.
             let selfWits =
-                match (match prune sch.Body with TFun (a, _) -> Some a | _ -> None) with
-                | Some recv ->
-                    (match prune recv with
-                     // an obj@ member: the receiver carries no type args (the
-                     // synth class is nominal), so read the enclosing type vars
-                     // it closed over off self, in ObjWit order.
-                     | TCon (cn, _) when (dictTryFind st.ObjWit cn).IsSome ->
-                         (match dictTryFind st.ObjWit cn with Some vars -> vars |> List.mapi (fun j vid -> (vid, j)) | None -> [])
-                     | TCon (cn, args) when (dictTryFind st.WitnessedClasses cn).IsSome ->
-                         args |> List.mapi (fun j a -> match prune a with TVar vv -> Some (vv.Id, j) | _ -> None) |> List.choose id
-                     | _ -> [])
-                | None -> []
+                if (dictTryFind st.FuncWitness (key v)).IsSome then []
+                else
+                    match ps with
+                    | (_, s0) :: _ ->
+                        (match prune s0.Body with
+                         | TCon (cn, _) when (dictTryFind st.ObjWit cn).IsSome ->
+                             (match dictTryFind st.ObjWit cn with Some vars -> vars |> List.mapi (fun j vid -> (vid, j)) | None -> [])
+                         | TCon (cn, args) when (dictTryFind st.WitnessedClasses cn).IsSome ->
+                             args |> List.mapi (fun j a -> match prune a with TVar vv -> Some (vv.Id, j) | _ -> None) |> List.choose id
+                         | _ -> [])
+                    | _ -> []
             // a stamped generic-class member: constant witnesses for its class
             // type params (Link forwards the enclosingSubst it already computes).
             let constWits =
