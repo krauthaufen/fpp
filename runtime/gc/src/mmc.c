@@ -1469,8 +1469,14 @@ gc_init(const struct gc_options *options, struct gc_stack_addr stack_base,
      alias stale, so compaction is off — Whippet's own ambiguous-edges mode.
      RANGE roots (the shadow stack) go the same way, through the pinned-roots
      channel — a raw scalar leaked onto the stack is validated and skipped. */
-  nofl_space_set_heap_has_ambiguous_edges(space);
-  fpprt_ranges_ambiguous_ = 1;
+  /* FPPRT_MOVING=1 turns evacuation back ON: uniform-word bodies and range
+     roots are traced PRECISELY (no conservative branch), so compaction works.
+     Only sound once nothing raw-int reaches a scanned uniform slot — the
+     witness-completeness experiment. Default (unset) keeps the safe mode. */
+  if (!getenv("FPPRT_MOVING")) {
+    nofl_space_set_heap_has_ambiguous_edges(space);
+    fpprt_ranges_ambiguous_ = 1;
+  }
 #endif
 
   gc_background_thread_start((*heap)->background_thread);
