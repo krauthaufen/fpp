@@ -63,3 +63,30 @@ shared the int/uint32 arm), with .NET truncation/sign-extension semantics
 — verified byte-for-byte against dotnet fsi, conformance suite
 `narrowconv` pins it. C3us/C4us are unblocked. NOTE: the repro header's
 "expected 232" for `uint16 70000u` was a miscalc — fsi says 4464.
+
+## 2026-09-05 (later): RESOLVED — #36 fixed on 546ba26
+
+All fpp.shader gates pass without the 512 MB pins now. One residual worth a
+look: the two LARGEST gate programs (tests/wgsl-run.sh, tests/webgl-run.sh)
+still die at the 16 MB default heap with a bare `unreachable` (fine at
+64 MB, kept there). If that is a clean out-of-memory, an "out of memory"
+message instead of the bare trap would save the next person a bisect; if it
+is a residual rooting case under extreme pressure, the repro is: strip the
+`--env FPPRT_HEAP_MB=64` from either script. uint16 (#30) confirmed fixed
+too — fpp.base is picking C3us/C4us up separately.
+
+## 2026-09-05: external command generators ADOPTED
+
+fpp.shader's reifier now runs via `generator <cmd>` in every gate project —
+pre-build step and checked-in generated files deleted; all 11 gates green.
+Protocol feedback from the adoption:
+* `fpp build -o out <proj>` (flags first) silently treats the .fppproj as a
+  SOURCE file and floods "unbound value 'name'" — a "did you mean
+  `fpp build <proj> -o out`?" diagnostic would save the next person.
+* The placement anchor (last type-declaring file) bit us once: generated
+  code that references helper LETS from a types-free file (reflected.fpp)
+  lands too early unless a type-declaring file follows. Worth a line in the
+  docs, or an optional explicit anchor on the generator directive.
+* Multi-module stdout files work — that made the single-output contract a
+  non-issue. Progress chatter must go to stderr; also fine. 120s budget:
+  our largest run uses well under half.
