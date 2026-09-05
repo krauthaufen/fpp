@@ -95,6 +95,52 @@ be different ids that unify (the `equals<'T>` case — 91373 vs 163931).
 - **Phase 4 — shadow-stack precision** (push-site audit): RANGE roots must
   carry no raw ints, or the range roots stay conservative → global flag stays.
 
+## RESULT: moving GC PROVEN for witnessed code (2026-09-05)
+
+The flip switch is `FPPRT_MOVING=1` (runtime env, default off — mmc.c gates the
+trace_one conservative branch and the ambiguous-edges init on it). With it on,
+uniform-word bodies AND range roots are traced PRECISELY and evacuation runs.
+
+Experiment (battery, 15 real HashMap/HashSet property tests, small heap to
+force GC + evacuation): **7/15 pass under MOVING** — ofList/Map agreement,
+add→tryFind, remove→absent, count, union, intersect, difference, each 200
+randomised cases = **1400 cases with evacuation active, correct**. The
+witnessed real collections move. The 8th traps.
+
+The trap is `BADROOT ... val=0x0000000a` — a raw int (10) on the SHADOW STACK.
+It is NOT a separate problem: it is the TRANSIENT push of an unwitnessed
+aggregate's raw slot (lowObjR pushes ref slots across its alloc; an unresolved
+RKGen slot holding a raw int gets pushed). So witnessing the object closes both
+its body AND its shadow-stack push. `lowGenericCons` already gates its push on
+the element witness — the model is right, it just needs every site witnessed.
+
+"No conservative retention" REQUIRES this route (Route A). Route B (pinning +
+conservative marking) inherently RETAINS: conservative marking must follow an
+ambiguous edge to avoid freeing a live object reachable only through it. So the
+only sound path to zero-retention moving is zero conservative sites.
+
+## Remaining to reach FP_WITSCAN=0 (the real work-list, by mass)
+
+Measured on the adaptive harness (real-code battery is only ~15 obj sites):
+- **generic RECORDS** (Gen, ElementOperation payload, ...): a record with type
+  params is a DRecord with NO DClass, so the population loop skips it, and its
+  construction has no type-arg thread to fill witness slots. `Gen.Draw` (8
+  battery sites) is here: `g.Draw rng : 'a` where g : Gen<'a> — the result is
+  Gen's param 0, but Gen isn't witnessed. BLOCKER: the ERecord construction
+  needs its concrete type args (buried in function-typed fields like
+  `Draw : PropRng -> 'a`, so not recoverable from field VALUES) — thread them
+  from inference, or witness records via ClassCtorWits where the enclosing fn
+  is generic and add a concrete-witness path for `Gen.int`-style sites.
+- **ValueOption / Option / ElementOperation unions** (~105 adaptive sites):
+  ECtor already witnesses via genWitsOf — these are unresolved only where no
+  witness reaches the site (the `go` harness).
+- **the `go` harness phantom markers** (`$g…`, 171 sites): inlined generic
+  tests left at `#153699`-style unresolved type vars — a monomorphization
+  completeness gap (stamp the inlined test, or thread a witness through the
+  phantom). This is the single biggest count but is TEST infrastructure; a
+  real app has no equivalent.
+- obj@ DONE (this session), cells DONE, member-accessors DONE.
+
 ## The flip: two routes, and the ordering problem (analysed 2026-09-05)
 
 `nofl_space_should_evacuate` already respects a per-object `NOFL_METADATA_BYTE_
