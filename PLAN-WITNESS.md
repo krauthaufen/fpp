@@ -95,6 +95,40 @@ be different ids that unify (the `equals<'T>` case — 91373 vs 163931).
 - **Phase 4 — shadow-stack precision** (push-site audit): RANGE roots must
   carry no raw ints, or the range roots stay conservative → global flag stays.
 
+## REAL per-object pinning SHIPPED (2026-09-05)
+
+`Array.pin`/`Array.unpin` are real temporary pinning under mmc: `fpprt_pin` sets
+the nofl PINNED bit (`should_evacuate` skips it), `fpprt_unpin` clears it so the
+object moves again at the next collection. `pin-gate.sh` proves it under
+FPPRT_MOVING: a pinned array keeps its address across a compacting GC while
+everything else evacuates, then MOVES after unpin — data intact throughout.
+"Stop moving while pinned, resume when unpinned" — done. Inert (no-op) in the
+default conservative mode, where nothing moves anyway.
+
+## The surface count OVERCOUNTS the moving blockers
+
+`FP_WITSCAN obj` counts every RKGen slot with no witness — but a bare-`'p`
+record field gets a REF witness (`ofName "'p"`), which is SAFE and MOVABLE: a
+tagged int in a ref slot is odd, so the tracer skips it, and the object stays
+precise/evacuable. Witnessing all records to "fix" these BROKE safe-mode
+correctness (battery 15→7) because it changed the layout of every record across
+construction paths (literal/copy-update/zero-init/subclass) that don't append
+the slots — REVERTED. The real blockers are only the sites that hold RAW
+stamped ints; the empirical ground truth is the actual FPPRT_MOVING traps, not
+the count.
+
+## Next concrete moving blocker (battery test 8, HashSet)
+
+`BADROOT val=0xa` — a raw int key pushed to the shadow stack from inside
+`filter$int$int`'s fold lambda calling `add k v acc` (HashMap.filter, prelude
+5027). HashMap's DIRECT add works under moving (tests 1-7 green); the failure is
+a LIFTED fold-lambda inside a stamped clone losing the stamped-int witness, so
+`add`'s node construction is unwitnessed and pushes the raw int. Fix is in the
+stamped-clone/lambda-lift/witness interaction (does a lambda lifted out of
+`filter$int$int` get int constWits / stampedClassWits?) — systematic, not
+per-site: it would close every stamped-fn-calls-generic-helper-via-lifted-lambda
+site at once. THIS is the highest-leverage next step for real-code moving.
+
 ## RESULT: moving GC PROVEN for witnessed code (2026-09-05)
 
 The flip switch is `FPPRT_MOVING=1` (runtime env, default off — mmc.c gates the
