@@ -95,7 +95,38 @@ be different ids that unify (the `equals<'T>` case — 91373 vs 163931).
 - **Phase 4 — shadow-stack precision** (push-site audit): RANGE roots must
   carry no raw ints, or the range roots stay conservative → global flag stays.
 
-## MOVING-GC NODE CONSTRUCTION FIXED — 3 of 4 type combos move (2026-09-05)
+## MOVING-GC WORKS FOR ALL COLLECTION TYPES + SAFE ROBUST AT ALL SCALES (2026-09-05, done)
+
+The witnessed-node construction is now correct end to end. Under FPPRT_MOVING,
+ALL HashMap/HashSet type combos (int→int, string→int, int→string,
+string→string) and HashSet EVACUATE correctly — verified at small heaps that
+force compaction, with correct values after eviction. The five fixes:
+
+1. `selfWits` reads the receiver from the first PARAM (`ps[0]`), not `sch.Body`
+   (abstract-override methods carry the abstract signature, no receiver).
+2. `ERecordExt` computes per-slot witnesses from its update exprs (inherited
+   classes lower here, and had none).
+3. `copiedKind` marks a concrete scalar field RKRaw unconditionally (a scalar
+   is never a pointer; the old `intStamped` gate was never set).
+4. `WitOff` uses the FULL inherited field count (chainFields), fixing the
+   off-by-one for no-own-field derived classes (HashEmpty) whose base `count`
+   made selfWits read the 2nd param's witness one slot early.
+5. UNKNOWN-witness sentinel (refMask 2): a witness the compiler can't resolve
+   forces the CONSERVATIVE tagged tid instead of a wrong `ref` default; and —
+   the keystone — under the conservative collector FK_STRUCT bodies are traced
+   CONSERVATIVELY too (gc_object_conservative_body), so a mis-resolved witness
+   is VALIDATED, not chased. This fixed a PRE-EXISTING large-map SAFE trap
+   (>~30k elems trapped before; now correct at 100k+), and kept moving precise.
+
+STATE: SAFE (default) is robust at every scale; FPPRT_MOVING gives precise,
+compacting GC with zero conservative tracing for fully-witnessed code (real
+collections). Real per-object pinning works under both. What still blocks
+FLIPPING moving to the DEFAULT: the test harnesses (Gen property generators,
+the adaptive `go` phantom-var constructions) still have unresolved-witness
+sites that become tagged-conservative — safe in SAFE mode, but chased under
+moving (the residual). Real app code without those generators moves cleanly.
+
+## MOVING-GC NODE CONSTRUCTION FIXED — 3 of 4 type combos move (2026-09-05, superseded)
 
 Root-caused why witnessed generic CLASSES (the HashMap/HashSet node machinery)
 were traced conservatively, and fixed three layers so their constructions are
