@@ -5705,10 +5705,13 @@ let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
     | EApp (ELam (_, body), _) -> slotWitness ctx body
     // a builtin conversion/op: classify by the result type its name implies —
     // int/char/bool are raw scalars, string/substring/cell/float build a ref
-    | EApp (EUnknown u, _) ->
+    | EApp (EUnknown u, args) ->
         let baseU = (let i = u.IndexOf '#' in if i >= 0 then u.Substring (0, i) else u)
         if baseU = "int" || baseU = "char" || baseU = "bool" || baseU = "byte" then Some (witnessPtrRM st 4 4 0)
         elif baseU = "string" || baseU.StartsWith "$str" || baseU = "$cellof" || baseU = "float" || baseU = "int64" then Some (witnessPtrRM st 4 4 1)
+        // reading a cell yields its CONTENT — the same witness as the cell's
+        // element type; recurse into the cell reference.
+        elif baseU = "$cellget" then (match args with [ inner ] -> slotWitness ctx inner | _ -> None)
         else None
     | EApp (((EVar (_, s) | EVarI (_, s, _)) as hd), ar) ->
         let rec pl t n = if n <= 0 then t else (match prune t with TFun (_, r) -> pl r (n - 1) | _ -> t)
