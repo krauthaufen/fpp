@@ -135,6 +135,14 @@ static inline size_t gc_object_conservative_body(struct gc_ref ref) {
     uintptr_t len = ((uintptr_t *)gc_ref_heap_object(ref))[1];
     return 2 * sizeof(uintptr_t) + len * sizeof(uintptr_t);
   }
+  case FPPRT_EMB_KIND_STRUCT:
+    // In the conservative (non-moving) configuration, trace FK_STRUCT bodies
+    // CONSERVATIVELY too: a witness the compiler resolved WRONG (a raw scalar
+    // slot marked as a pointer in refoffs) would otherwise be chased precisely
+    // and crash. Validated conservative tracing skips it. This is only reached
+    // when fpprt_ranges_ambiguous_ is set (see trace_one); under moving the
+    // precise refoffs path runs and the witnesses must be exact.
+    return t->size;
   default:
     return 0;
   }

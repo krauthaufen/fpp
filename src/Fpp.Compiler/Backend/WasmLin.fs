@@ -5676,11 +5676,18 @@ let private witnessPtr (st : St) (t : Type) : LExpr =
 // - concrete: a 1-word element, ref iff the name is not a raw scalar (int/bool/
 //   char are unboxed → refMask 0; everything else is a pointer → refMask 1).
 //   Multi-word inline struct elements are a later step.
+// refMask 2 is the UNKNOWN sentinel: a witness the compiler could not resolve
+// (a `#`-marker naming a var not in scope). A slot carrying it must stay
+// CONSERVATIVE (the tagged fallback), NOT precise — defaulting it to `ref`
+// (refMask 1) made a raw scalar in that slot get scanned and chased once the
+// node was built precise (int-valued maps trapped at scale under GC).
+let private witnessUnknown (st : St) : LExpr = witnessPtrRMK st 4 4 2 5
+
 let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
     if nm.Length > 0 && nm.[0] = '#' then
         match dictTryFind ctx.Witness (int (nm.Substring 1)) with
         | Some reg -> LGet (wReg reg)
-        | None -> witnessPtrRM ctx.LSt 4 4 1
+        | None -> witnessUnknown ctx.LSt
     else
         let bare = layStripGen nm
         witnessPtrRMK ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
@@ -7430,7 +7437,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                     | None -> List.tryItem j ctx.ClassCtorWits |> Option.bind (fun (wid, _) -> dictTryFind ctx.Witness wid)
                 match fromWid with
                 | Some r -> LGet (wReg r)
-                | None -> witnessPtrRM st 4 4 1
+                | None -> witnessUnknown st  // unresolved trailing witness -> conservative, not a wrong `ref`
             let wits = [ 0 .. k - 1 ] |> List.map witVal
             lowObjR ctx (cidRec st name) 0 (baseSlots @ wits) (Some (baseKinds @ List.replicate k RKRaw)) baseWits
         | None ->
@@ -7492,7 +7499,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             let witVal j =
                 match List.tryItem j ctx.ClassCtorWits |> Option.bind (fun (wid, _) -> dictTryFind ctx.Witness wid) with
                 | Some r -> LGet (wReg r)
-                | None -> witnessPtrRM st 4 4 1
+                | None -> witnessUnknown st  // unresolved trailing witness -> conservative, not a wrong `ref`
             let wits = [ 0 .. k - 1 ] |> List.map witVal
             LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 (slots @ wits) (Some (kinds @ List.replicate k RKRaw)) extWits)
         | None ->
@@ -9871,13 +9878,28 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
             if cid >= CID_FIRST_USER || cid = CID_LIST then vecAdd st.TidCid (t, cid)
             t
         let tidTmp = freshTmp ctx
+        // an UNKNOWN witness (refMask bit 1 set — the sentinel for a slot the
+        // compiler could not resolve) forces the CONSERVATIVE tagged tid: the
+        // object's scanned words are then VALIDATED (not chased) under the
+        // conservative collector, so a raw scalar in an unresolved slot is safe.
+        // Building it PRECISE with a default `ref` witness scanned that raw
+        // scalar and the collector chased it (int-valued maps trapped at scale).
+        let taggedTid = gcTid st ("s:" + string cid + ":" + string n + ":" + string raw) (HDR + 4 * n) FK_TAGGED (1 + raw)
+        (if cid >= CID_FIRST_USER || cid = CID_LIST then vecAdd st.TidCid (taggedTid, cid))
+        let anyUnknownExpr =
+            genIdx |> List.fold (fun acc i -> LPrim (OrW, [ acc; LPrim (AndW, [ refMaskOf (optGet (witOf i)); LConstW 2 ]) ])) (LConstW 0)
         let rec selTid (j : int) (accMask : int) : LStmt list =
             if j = g then [ LSet (wReg tidTmp, LConstW (tidForMask accMask)) ]
             else
                 let w = optGet (witOf (List.item j genIdx))
-                [ LIf (LPrim (EqW, [ refMaskOf w; LConstW 0 ]),
+                // an unknown witness (refMask 2) takes the ELSE arm here (bit-set),
+                // but the object-level anyUnknown guard below overrides tidTmp with
+                // the tagged tid, so this precise pick is only used when EVERY
+                // witness is a clean 0/1.
+                [ LIf (LPrim (EqW, [ LPrim (AndW, [ refMaskOf w; LConstW 1 ]); LConstW 0 ]),
                        selTid (j + 1) accMask,
                        selTid (j + 1) (accMask ||| (1 <<< j))) ]
+        let selTidGuarded = [ LIf (anyUnknownExpr, [ LSet (wReg tidTmp, LConstW taggedTid) ], selTid 0 0) ]
         let idx = slots |> List.mapi (fun i v -> i, v)
         let tempOf = idx |> List.map (fun (i, v) -> i, (if isConst v then None else Some (freshTmp ctx)))
         let tregOf i = match List.tryPick (fun (j, t) -> if j = i then Some t else None) tempOf with Some (Some tr) -> tr | _ -> freshTmp ctx
@@ -9911,7 +9933,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
                            gcPopInto (LGet (wReg b)) (HDR + 4 * i)) ]
                 else [ LStore (W, LGet (wReg b), HDR + 4 * i, tval i) ])
         let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), HDR + 4 * i, v))
-        LDo (evalAndPush @ selTid 0 0
+        LDo (evalAndPush @ selTidGuarded
              @ [ LSet (wReg b, LCall ("$fpalloc", [ LGet (wReg tidTmp) ])) ]
              @ popsAndStores @ consts, LGet (wReg b))
     elif gc then
