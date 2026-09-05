@@ -346,6 +346,14 @@ let mutable intStamped = false
 /// chased the raw stage value (fpp.base #36 — the GLSL assembler's AsmState
 /// trapped mid-collection at default heap). Reset per emission.
 let mutable private enumTypeSet : Dict<string, bool> = dictNew ()
+/// FPP_WITSCAN=1: count sites that emit a conservative-dependent scanned slot
+/// (an unwitnessed RKGen object body, or an unwitnessed generic cell) so the
+/// witness-completeness surface can be scoped. Keyed by category|fn.
+let private witScan : Dict<string, int> = dictNew ()
+let private witBump (cat : string) (fn : string) =
+    if System.Environment.GetEnvironmentVariable "FPP_WITSCAN" = "1" then
+        let k = cat + "|" + fn
+        dictSet witScan k ((match dictTryFind witScan k with Some n -> n | None -> 0) + 1)
 // preload linking (wasmtime --preload fpprt=reactor.wasm): the mutator
 // re-exports the imported memory as "memory" so WASI finds it on the main
 // module. OFF under wasm-merge — the merged file would carry two exports.
@@ -9676,6 +9684,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
         match refKinds with
         | Some ks when List.length ks = n -> [ 0 .. n - 1 ] |> List.exists (fun i -> List.item i ks = RKGen && (witOf i).IsNone)
         | _ -> false
+    (if gc && unresolvedGen then witBump "obj" curFnDbg)
     if gc && cid = CID_ARRAY then
         // [tag][len][elems]: fpprt_alloc_array writes tag@0 and len@4; we store
         // the elements from offset 8. Each element is pushed to the shadow stack
@@ -10766,6 +10775,7 @@ and private lowMkCellW (ctx : LowCtx) (wreg : int) (v : LExpr) : LExpr =
          LGet (wReg b))
 
 and private lowMkCell (ctx : LowCtx) (kind : RefKind) (v : LExpr) : LExpr =
+    (if gc && kind = RKGen then witBump "cell" curFnDbg)
     let b = freshTmp ctx
     if gc then
         if kind = RKRaw then
@@ -14765,6 +14775,14 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         for (k, _) in dictPairs st.Funcs do
             for h in [ "2034791193"; "658953085"; "2143567545"; "1381067340"; "1380175341" ] do
                 if string (abs (strHash k)) = h then eprintfn "FNMAP f%s = %s name=%s" h k (match dictTryFind nameOf k with Some n -> n | None -> "?")
+    (if System.Environment.GetEnvironmentVariable "FPP_WITSCAN" = "1" then
+        let byCat = dictNew<string, int> ()
+        for k, v in dictPairs witScan do
+            let cat = k.Substring(0, k.IndexOf "|")
+            dictSet byCat cat ((match dictTryFind byCat cat with Some n -> n | None -> 0) + v)
+        for cat, v in dictPairs byCat do eprintfn "WITSCAN total %s = %d sites" cat v
+        eprintfn "WITSCAN distinct fns: %d" (dictPairs witScan |> List.length)
+        for k, v in (dictPairs witScan |> List.sortBy (fun (_, v) -> 0 - v)) do eprintfn "WITSCANFN %d %s" v k)
     linWarnings <- vecToList st.Warnings
     bytes, vecToList st.Errors
 
