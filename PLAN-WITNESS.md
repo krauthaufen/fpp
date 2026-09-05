@@ -117,7 +117,40 @@ the slots — REVERTED. The real blockers are only the sites that hold RAW
 stamped ints; the empirical ground truth is the actual FPPRT_MOVING traps, not
 the count.
 
-## Next concrete moving blocker (battery test 8, HashSet)
+## ROOT CAUSE of the real-code moving bug: canonical-vtable ↔ stamped raw/tagged boundary (2026-09-05)
+
+Narrowed empirically. Under FPPRT_MOVING, at a small heap (forcing evacuation):
+- direct `HashMap.add` of 5000 int values: WORKS.
+- `HashMap.fold (+)` sum: WORKS (reads values fine).
+- `HashMap.filter (fun k v -> k%2=0)` (rebuilds ~2500): WORKS.
+- `HashMap.filter (fun _ _ -> true)` (rebuilds 5001): TRAPS.
+- `HashMap.map (fun k v -> v)` (rebuilds 5001): TRAPS.
+- `BADROOT val=0x3988` — a raw int VALUE on the shadow stack.
+
+So it is NOT map-vs-filter and NOT the `'w` output var — it is the REBUILD
+path (`fold (fun acc k v -> add k v acc) (hmEmpty()) n`) once it does enough
+allocation to evacuate. The value is read through the CANONICAL vtable
+`FoldWith` (all-anyref → uniform/tagged), threaded through a stamped fold
+lambda, and re-added through stamped `add_…$int$int`, which dispatches to
+CANONICAL `AddWith` (uniform) and stores the value in a uniform leaf slot. A
+raw int ends up in that uniform slot and the evacuator chases it.
+
+The boundary: generic-class VTABLE methods (`AddWith`, `FoldWith`) keep the
+canonical all-anyref (uniform/tagged) signature and are NEVER stamped
+(CLAUDE.md "A generic class that implements an interface is monomorphized"),
+while `add`/`map`/`filter` module functions and their lambdas ARE stamped
+(raw int ABI). A value crossing canonical→stamped needs untag, stamped→
+canonical needs tag; one of those conversions is missing on the rebuild path,
+so a raw int reaches a uniform (scanned, movable) slot. Under the conservative
+default it is harmless (validated + skipped); under evacuation it is chased.
+
+THE FIX is on that ABI boundary — ensure a scalar entering a canonical
+(uniform) vtable slot is tagged, and one leaving it is untagged — not in the
+witness machinery. This is the real blocker for moving-by-default on rebuild-
+heavy real code (map/filter/collect over persistent collections). Real pinning
+and non-rebuild real code already move correctly.
+
+## Earlier lead (superseded by the boundary finding above)
 
 `BADROOT val=0xa` — a raw int key pushed to the shadow stack from inside
 `filter$int$int`'s fold lambda calling `add k v acc` (HashMap.filter, prelude
