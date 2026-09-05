@@ -5765,7 +5765,7 @@ let private exprTag (e : Expr) : string =
     match e with
     | EVar _ -> "EVar" | EVarI _ -> "EVarI" | EApp (EUnknown u, _) -> "EApp/" + u
     | EApp (EVar (v,_),_) | EApp (EVarI (v,_,_),_) -> "call:" + v.Name
-    | EApp _ -> "EApp?" | EField (_,f,_) -> "EField." + f | EIf _ -> "EIf"
+    | EApp (h, _) -> "EApp?/" + (match h with EApp _ -> "app" | EField (_,f,_) -> "field:"+f | ELam _ -> "lam" | EMatch _ -> "match" | EIf _ -> "if" | ELet _ -> "let" | _ -> "?") | EField (_,f,_) -> "EField." + f | EIf _ -> "EIf"
     | EMatch _ -> "EMatch" | ELet _ -> "ELet" | ECtor (c,_,_) -> "ECtor:" + c
     | ELit _ -> "ELit" | ETuple _ -> "ETuple" | EPrim (o,_) -> "EPrim:" + o
     | ECast (t,_,_) -> "ECast:" + t | _ -> "other"
