@@ -23,9 +23,18 @@ remove the conservative mode, re-enable evacuation.
 body with an unwitnessed RKGen slot, or an unwitnessed generic cell), grouped
 by category and function. It is the scoping + progress tool.
 
-    baseline (before witness work)   851 obj sites
+    baseline (before witness work)   851 obj sites (adaptive test HARNESS)
     after Phase 1 (leaf classes)     652
-    after Phase 1b (base classes)    471   <- CURRENT
+    after Phase 1b (base classes)    471
+    + member-accessor/$cellget/etc   458   <- CURRENT (adaptive harness)
+
+REAL-CODE surface is FAR lower: the battery (real HashMap/HashSet) is **30
+obj + 7 cell sites**, and those are property-test GENERATORS (`.Draw`) and
+cells, NOT the collections — the data structures are essentially fully
+witnessed. The adaptive harness's 458 is dominated by ONE function (`go`, the
+100-tests-inlined runner, ~277 sites) building `constant<int, #153699>`-style
+objects where `#153699` is an UNRESOLVED/phantom stamping marker. Those are an
+inference/monomorphization artifact of the harness, not representative.
 
 Perf note: compaction-off costs NOTHING measurable on the benchmark suite
 (all 9 within 1.5x of the compaction-ON baseline, warm). The justification is
@@ -85,6 +94,35 @@ be different ids that unify (the `equals<'T>` case — 91373 vs 163931).
   generic, not a param/class var).
 - **Phase 4 — shadow-stack precision** (push-site audit): RANGE roots must
   carry no raw ints, or the range roots stay conservative → global flag stays.
+
+## The flip: two routes, and the ordering problem (analysed 2026-09-05)
+
+`nofl_space_should_evacuate` already respects a per-object `NOFL_METADATA_BYTE_
+PINNED` bit — so evacuating some objects while pinning others is POSSIBLE in
+the collector. Two routes to turn moving back on:
+
+- **Route A — FP_WITSCAN=0 everywhere, then remove the global flag.** Clean.
+  Blocked by: (a) the harness phantom-var sites (`#153699` — need the
+  monomorphizer to concretise or drop the unused param); (b) obj-expr /
+  interface-impl members (no tyParams — must capture ENCLOSING witnesses as
+  fields); (c) genuinely-unconstrained type vars, where defaulting the slot to
+  "ref" is UNSOUND if it could ever hold a raw int. (c) may be irreducible.
+- **Route B — per-object pinning (partial moving), keep the conservative net.**
+  Pin FK_TAGGED objects + everything reached via a conservative edge; evacuate
+  the precise (FK_STRUCT) rest. THE ORDERING PROBLEM: a precise edge can
+  evacuate an object BEFORE a conservative FK_TAGGED-body edge reaches it, and
+  the conservative slot (which can't be updated) then dangles. `mark_conservative_
+  ref` only marks, does not pin. Single-pass tracing can't guarantee
+  "pin-before-evacuate" for heap edges — which is exactly why Whippet's
+  ambiguous-edges mode is GLOBAL. Fixing it needs a conservative-first pass:
+  enumerate FK_TAGGED objects (a remembered set at alloc, or a heap walk at GC
+  start), trace them conservatively (pinning referents) in the pinned-roots
+  phase, THEN the evacuating precise trace. That is real vendored-Whippet work.
+
+Recommendation: Route A for real programs is close (the collections are done);
+the harness artifacts and obj-expr are the remaining compiler work. Route B is
+the robust fallback if the phantom-var/unconstrained cases prove irreducible,
+but it is a careful GC-internals change, not a quick flip.
 
 ## The flip (Phase 5)
 
