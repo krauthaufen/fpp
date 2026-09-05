@@ -5757,6 +5757,19 @@ let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
                           | _ -> None
                       | _ -> None))
          | t -> ofTy t)
+    // a call through a function-typed field that returns a bare record param
+    // (`g.Draw rng : 'a`, Draw : _ -> 'a, g : Gen<vA>): the field type is
+    // "?>N", so map the result to the receiver's N-th type argument and resolve
+    // THAT (a witnessed var in scope, or a concrete static) — closes the
+    // generator (`Gen`) sites without witnessing the record itself.
+    | EApp (EField (recv, f, owner), _) ->
+        (match recFieldTy st owner f with
+         | Some ty when ty.StartsWith "?>" ->
+             let j = int (ty.Substring 2)
+             (match (match recv with EVar (_, rs) | EVarI (_, rs, _) -> Some (prune rs.Body) | _ -> None) with
+              | Some (TCon (_, recvArgs)) when j < List.length recvArgs -> ofTy (List.item j recvArgs)
+              | _ -> None)
+         | _ -> None)
     | EField (_, f, owner) -> (match recFieldTy st owner f with Some ty -> Some (ofName (if ty.StartsWith "&" then ty.Substring 1 else ty)) | None -> None)
     | EIndex (k, _, _) -> Some (ofName k)
     | ECast (t, _, _) -> Some (ofName t)

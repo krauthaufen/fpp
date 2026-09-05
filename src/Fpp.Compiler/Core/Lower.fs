@@ -4896,7 +4896,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      | Some t when List.contains t.Text tyParams -> "'" + t.Text
                      | Some t -> t.Text
                      | None -> "?")
-                else "?"     // functions, tuples, arrays: uniform REFS
+                elif tn.NodeKind = FunType then
+                    // a function field is a uniform REF ("?"), BUT if it RETURNS
+                    // a bare record type param (`Draw : _ -> 'a`), record which
+                    // one as "?>N": a call `g.Draw x : 'a` then recovers 'a's
+                    // witness through g's instantiation (slotWitness). Keeps the
+                    // "?" prefix so kind derivation is unchanged.
+                    (match argNodes |> List.tryLast with
+                     | Some res when res.NodeKind = VarType ->
+                         (match Green.tokens (GNode res) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                          | Some t -> (match List.tryFindIndex (fun p -> p = t.Text) tyParams with Some j -> "?>" + string j | None -> "?")
+                          | None -> "?")
+                     | _ -> "?")
+                else "?"     // tuples, arrays: uniform REFS
             renderTy tn0
 
         let fieldKind (f : GreenNode) : string =
