@@ -2012,6 +2012,37 @@ nofl_allocate_slabs(size_t nslabs) {
   return gc_platform_acquire_memory(nslabs * NOFL_SLAB_SIZE, NOFL_SLAB_SIZE);
 }
 
+#ifdef __wasm__
+/* THE HEAP MAY NOT EAT THE ADDRESS SPACE.
+ *
+ * wasm32 has a 2 GB linear memory and nothing is ever returned to it: a block
+ * released by the collector stays inside the module's memory, and the memory
+ * itself only grows. The growable sizer does not know that, so it kept
+ * expanding — a self-hosted compile with 156 MB live ratcheted the heap up in
+ * eleven steps (108, 115, 122, 129, 159, 166, 187, 190, 193, 199, 214 MB) to
+ * 1.78 GB, and then a 320 KB request died at the ceiling with "we have the
+ * space but mmap didn't work". It looked random: which heap sizes survived was
+ * only ever how much churn happened to fit underneath.
+ *
+ * So growth is bounded here, leaving the rest of the address space for large
+ * objects, the C allocator and the static regions. Refusing is SAFE and
+ * already handled — nofl_space_expand keeps the heap at its current size and
+ * collects more often, which is the correct response to a full address space.
+ * FPPRT_HEAP_MAX_MB overrides the bound. */
+#define FPPRT_WASM_ADDRESS_SPACE ((size_t)2 * 1024 * 1024 * 1024)
+static size_t nofl_wasm_heap_cap(void) {
+  static size_t cap = 0;
+  if (!cap) {
+    const char *s = getenv("FPPRT_HEAP_MAX_MB");
+    long mb = s ? atol(s) : 0;
+    /* three quarters, so a quarter of linear memory is always left over */
+    cap = mb > 0 ? (size_t)mb * 1024 * 1024
+                 : FPPRT_WASM_ADDRESS_SPACE - (FPPRT_WASM_ADDRESS_SPACE / 4);
+  }
+  return cap;
+}
+#endif
+
 static void
 nofl_space_add_slabs(struct nofl_space *space, struct nofl_slab *slabs,
                      size_t nslabs) {
@@ -2077,6 +2108,10 @@ nofl_space_expand(struct nofl_space *space, size_t bytes) {
   to_acquire *= (1 + overhead);
   size_t reserved = align_up(to_acquire, NOFL_SLAB_SIZE);
   size_t nslabs = reserved / NOFL_SLAB_SIZE;
+#ifdef __wasm__
+  if ((space->nslabs + nslabs) * NOFL_SLAB_SIZE > nofl_wasm_heap_cap())
+    return;
+#endif
   struct nofl_slab *slabs = nofl_allocate_slabs(nslabs);
   /* fpprt: the platform may REFUSE — on wasm, linear memory is capped at 2 GB
    * and a region is never returned to the system, so a large contiguous
