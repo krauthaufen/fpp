@@ -7016,9 +7016,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match c with
                     | GNode t -> t.NodeKind = TyParams
                     | _ -> false)
+            // An ANNOTATION with free type variables is the same promise a
+            // `<'k,'v>` makes: `let empty : HashNode<'k,'v> = hmEmpty ()` is a
+            // GENERIC VALUE, so it is exempt from the value restriction exactly
+            // as an explicitly-parameterized one is. Without this the RHS being
+            // an application (`hmEmpty ()`) left it MONOMORPHIC with free body
+            // variables — one shared instance whose type-parameter witnesses
+            // default, so under the moving collector every HashMap node built
+            // from it was traced against the wrong GC nature. The level check
+            // in generalizeBinding still refuses an outer-bound variable, so a
+            // `let x : 'a = ...` inside a generic body stays mono.
+            // only a TOP-LEVEL binding (letDepth = 0) is a generic value: a
+            // LOCAL `let dkeys : 'k[] = Array.zeroCreate n` names the enclosing
+            // function's variable, which generalizeBinding must NOT quantify —
+            // its body is emitted once, inside the enclosing substitution.
+            let annotationGeneric =
+                letDepth = 0
+                && (match ascription with
+                    | Some a -> not (List.isEmpty (freeVars (prune a)))
+                    | None -> false)
             let expansiveValue =
                 paramPats.IsEmpty
                 && not declaresTyParams
+                && not annotationGeneric
                 && (let body =
                         match vecToList after, hasIn with
                         | b :: _, true -> Some b
