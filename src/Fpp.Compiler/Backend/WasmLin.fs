@@ -5722,6 +5722,10 @@ let private stampWitness (st : St) (j : int) : LExpr =
     | Some nm ->
         let bare = layStripGen nm
         witnessPtrRMK st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
+    // the stamp does not name this class parameter, so it did not determine it;
+    // likewise a context with no witness channel cannot supply one. Either way
+    // the slot is an ordinary uniform word.
+    | None when not (List.isEmpty curStampArgs) || curNoWitnessChannel -> witnessPtrRMK st 4 4 1 5
     | None -> (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then eprintfn "WITSRC stamp %s" curFnDbg); witnessUnknown st
 
 let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
@@ -5732,7 +5736,7 @@ let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
             if curNoWitnessChannel then witnessPtrRMK ctx.LSt 4 4 1 5
             else
                 (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then
-                    eprintfn "WITSRC callarg#%s %s" (nm.Substring 1) curFnDbg)
+                    eprintfn "WITSRC callarg#%s %s chan=%b stamp=%d" (nm.Substring 1) curFnDbg curNoWitnessChannel (List.length curStampArgs))
                 witnessUnknown ctx.LSt
     else
         let bare = layStripGen nm
@@ -12655,6 +12659,14 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<st
 // from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
 // the env, register 1 the argument.
 let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (psch : Scheme) (body : Expr) : unit =
+    // A LIFTED LAMBDA has no witness channel: it takes no hidden witness
+    // parameters and its captures reach it through the closure environment,
+    // which is a heap object of uniform slots. So a type variable its enclosing
+    // definition was generic in — correctly left symbolic there — cannot be
+    // forwarded here. It does not need to be: everything crossing the closure
+    // ABI is a tagged scalar or a pointer, so the uniform witness is the answer.
+    curNoWitnessChannel <- true
+    curStampArgs <- []
     // FPP_LAM_DUMP=<$blamN>: the CORE body of one lifted lambda, for finding
     // which construct in it lowered to a trap
     if System.Environment.GetEnvironmentVariable "FPP_LAM_DUMP" = lamName then
@@ -14852,6 +14864,12 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, vsch, rhs0) ->
+            // A GENERIC VALUE has no witness channel either: it is initialised
+            // ONCE, so it takes no parameters and there is no caller to forward
+            // from — and being emitted once it serves every instantiation, so
+            // nothing stamped its slots and they hold uniform words.
+            curNoWitnessChannel <- gc && not (List.isEmpty vsch.Quantified)
+            curStampArgs <- []
             // an ANNOTATED binding widens: `let x : obj = 1` keeps the rhs's
             // own int type, so the value has to be boxed on the way into the
             // slot the annotation declared
