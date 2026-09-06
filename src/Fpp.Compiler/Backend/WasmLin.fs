@@ -5770,7 +5770,11 @@ let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
         // parameter). A variable nothing observes was never stamped, and only a
         // stamp puts a raw scalar in a slot, so what crosses here is a tagged
         // scalar or a pointer. The uniform witness is that answer.
-        | None -> uniformWitness ctx.LSt
+        | None ->
+            (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then
+                eprintfn "UNIFVAR %s kind=%s var=%s have=[%s]" curFnDbg curChannelKind nm
+                    (dictPairs ctx.Witness |> List.map (fst >> string) |> List.sort |> String.concat ","))
+            uniformWitness ctx.LSt
     else
         let bare = layStripGen nm
         witnessPtrRMKT ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm
