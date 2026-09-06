@@ -101,6 +101,20 @@ let instanceKey (cls : string) (memberName : string) (heads : string list) : str
 /// whole of it: `StructTuple2$<bool.SetNode$<#42>>` is the struct a generic
 /// body builds, and a clone that only replaced whole-name variables would
 /// keep the `#42` and name a record that is never declared.
+/// the type variables an instantiation name MENTIONS ("list$<#42>" -> ["#42"])
+let private varsIn (t : string) : string list =
+    let acc = vecNew<string> ()
+    let mutable i = 0
+    while i < t.Length do
+        if t.[i] = '#' then
+            let start = i
+            let mutable j = i + 1
+            while j < t.Length && t.[j] >= '0' && t.[j] <= '9' do j <- j + 1
+            if j > start + 1 then vecAdd acc (t.Substring (start, j - start))
+            i <- j
+        else i <- i + 1
+    vecToList acc
+
 let private substName (subst : Dict<string, string>) (n : string) =
     if not (n.Contains "#") then n
     else
@@ -691,6 +705,13 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                     cappedWarned <- true
                     ewarn ("mono: instantiation depth capped (" + substr t 0 (min 60 (strLen t)) + "...) — a scheme is poisoned, see CLAUDE.md")
                 "$ref"
+            // A STAMP MUST BE GROUND. A clone named after a type VARIABLE
+            // (`show_317610$#103190$#103191`) is generic in that variable, yet
+            // being a stamp it takes no witness parameters and has no caller to
+            // forward one — so every use of it inside fell back to the UNKNOWN
+            // witness. Nothing observes such an argument's layout either, which
+            // is exactly what the uniform name means.
+            elif t.Contains "#" then "$ref"
             else t)
 
     // rewrite EVarI uses: struct instantiations point at the stamped clone,
@@ -793,6 +814,15 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                         | None -> false))
             up cls 0)
 
+    /// is the definition being rewritten GENERIC in this type variable? Only
+    /// then is there a witness in scope to forward for it.
+    let ownerQuantifies (ok : string * int) (t : string) : bool =
+        match dictTryFind bodies ok with
+        | Some (_, _, sch, _) ->
+            sch.Quantified
+            |> List.exists (fun qv -> t = "#" + string qv.Id || t = "#" + string (prunedId qv))
+        | None -> false
+
     let rewrite (owner : string) (ownerKey : string * int) (subst : Dict<string, string>) (isTemplate : bool) (e : Expr) : Expr =
         e |> mapExpr (fun x ->
             match x with
@@ -820,7 +850,24 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                                 // KEEP naming it so the backend forwards the
                                 // caller's witness — collapsing it to "obj" gave
                                 // a ref witness and scanned raw scalars as refs.
-                                if isTemplate || stampScalars then t else "obj"
+                                //
+                                // But only a variable THIS DEFINITION IS GENERIC
+                                // IN can be forwarded. One it does not quantify
+                                // is observed by nothing, and keeping it symbolic
+                                // asked the backend for a witness that does not
+                                // exist — it emitted the UNKNOWN sentinel, which
+                                // drops the whole object onto the uniform tagged
+                                // shape. Nothing stamped such a slot, so nothing
+                                // put a raw scalar in it: it holds an ordinary
+                                // uniform word, and `obj` names that honestly.
+                                if isTemplate then t
+                                elif not stampScalars then "obj"
+                                else
+                                    let sb = dictNew<string, string> ()
+                                    for mv in varsIn t do
+                                        if not (ownerQuantifies ownerKey mv) then dictSet sb mv "obj"
+                                    let r2 = substName sb t
+                                    if r2.Contains "#" then t else r2
                         else t)
                 // a TUPLE argument stamps by its elements only where a class
                 // CONSTRAINT observes that variable — element names are what
