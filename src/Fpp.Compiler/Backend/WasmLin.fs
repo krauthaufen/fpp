@@ -428,6 +428,13 @@ let mutable private gcArrIterTid = 0
 // refMask: RAW head (scan tail only) vs REF head (scan head+tail). Both map to
 // CID_LIST so $isBuiltinSeq still recognises them.
 let mutable private curFnDbg = "?"
+/// The type arguments of the STAMPED CLONE currently being emitted, read off
+/// its mangled name ("HashLeaf$string$int" -> ["string"; "int"]; a stamped
+/// member spells the class' parameters first). A stamped function has no
+/// hidden ctor witness parameters, so this is where its constructions get the
+/// constant witnesses their trailing slots must hold. Empty for anything that
+/// is not a stamp.
+let mutable private curStampArgs : string list = []
 let mutable private chkSite = 0
 let mutable private gcConsRawTid = 0
 let mutable private gcConsRefTid = 0
@@ -5683,6 +5690,19 @@ let private witnessPtr (st : St) (t : Type) : LExpr =
 // node was built precise (int-valued maps trapped at scale under GC).
 let private witnessUnknown (st : St) : LExpr = witnessPtrRMK st 4 4 2 5
 
+/// The witness for the j-th class type parameter inside a STAMPED clone: its
+/// argument is concrete and spelled in the clone's own name, so the answer is
+/// a compile-time constant. Without this a stamped construction stored the
+/// UNKNOWN sentinel — and a generic method reached on that object by virtual
+/// dispatch then read a "refMask" of 2 (or, with no slots stored at all, the
+/// object's header) and compared a string by IDENTITY.
+let private stampWitness (st : St) (j : int) : LExpr =
+    match List.tryItem j curStampArgs with
+    | Some nm ->
+        let bare = layStripGen nm
+        witnessPtrRMK st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
+    | None -> witnessUnknown st
+
 let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
     if nm.Length > 0 && nm.[0] = '#' then
         match dictTryFind ctx.Witness (int (nm.Substring 1)) with
@@ -7437,7 +7457,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                     | None -> List.tryItem j ctx.ClassCtorWits |> Option.bind (fun (wid, _) -> dictTryFind ctx.Witness wid)
                 match fromWid with
                 | Some r -> LGet (wReg r)
-                | None -> witnessUnknown st  // unresolved trailing witness -> conservative, not a wrong `ref`
+                | None -> stampWitness st j
             let wits = [ 0 .. k - 1 ] |> List.map witVal
             lowObjR ctx (cidRec st name) 0 (baseSlots @ wits) (Some (baseKinds @ List.replicate k RKRaw)) baseWits
         | None ->
@@ -7499,7 +7519,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             let witVal j =
                 match List.tryItem j ctx.ClassCtorWits |> Option.bind (fun (wid, _) -> dictTryFind ctx.Witness wid) with
                 | Some r -> LGet (wReg r)
-                | None -> witnessUnknown st  // unresolved trailing witness -> conservative, not a wrong `ref`
+                | None -> stampWitness st j
             let wits = [ 0 .. k - 1 ] |> List.map witVal
             LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 (slots @ wits) (Some (kinds @ List.replicate k RKRaw)) extWits)
         | None ->
@@ -13506,6 +13526,26 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
      if System.Environment.GetEnvironmentVariable "FPP_NOWITCLS" <> "1" then
       for d in decls0 do
          match d with
+         // A STAMPED CLONE OF A WITNESSED CLASS IS ITSELF WITNESSED.
+         // It was excluded here, so its construction stored NO trailing witness
+         // slots and its cid got no WitOff entry. Its methods are stamped and
+         // do not care — but a GENERIC method reached on it through the VTABLE
+         // does: it recovers `'k`/`'v` off self at WitOff[cid], read 0, and so
+         // took the object's own HEADER for a witness pointer. The "refMask"
+         // that came back meant RAW, so `k = key` compared two strings by
+         // IDENTITY and HashMap lost every lookup whose key was not the very
+         // object inserted (148 of 201). The clone's arguments are concrete, so
+         // its slots hold CONSTANT witnesses (stampWitness); the layout is the
+         // base's, since a clone declares no fields of its own.
+         | DClass (n, _, _, _) when isStampedClone n && not (witExcluded n) ->
+             (match dictTryFind st.RecBase n with
+              | Some b ->
+                  (match dictTryFind recTyParams b, dictTryFind st.ClassId n with
+                   | Some k, Some cid when k > 0 ->
+                       dictSet st.WitnessedClasses n k
+                       dictSet st.WitOff cid (HDR + 4 * List.length (chainFields [] n))
+                   | _ -> ())
+              | None -> ())
          | DClass (n, _, _, _) when not (isStampedClone n) && not (witExcluded n) ->
              (match dictTryFind recTyParams n, dictTryFind st.ClassId n with
               | Some k, Some cid when k > 0 ->
@@ -14711,6 +14751,17 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // under evacuation. selfWits only applies to methods with NO
             // FuncWitness (the monomorphized vtable impls); a function that
             // RECEIVES witnesses as params uses those instead.
+            // Link mints every stamp in its own offset zone (stampNext), and
+            // mangles the instantiation onto the name; a stamped member spells
+            // the CLASS' parameters first.
+            curStampArgs <-
+                (if v.Offset >= 800000000 then
+                    match v.Name.IndexOf '$' with
+                    | i when i > 0 ->
+                        (v.Name.Substring (i + 1)).Split '$' |> Array.toList
+                        |> List.filter (fun x -> x <> "")
+                    | _ -> []
+                 else [])
             let selfWits =
                 if (dictTryFind st.FuncWitness (key v)).IsSome then []
                 else
