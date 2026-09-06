@@ -1094,12 +1094,8 @@ static inline void
 nofl_space_set_heap_has_ambiguous_edges (struct nofl_space *space)
 {
   if (!nofl_space_heap_has_ambiguous_edges (space)) {
-#ifndef FPPRT_UNIFORM_CONSERVATIVE
-    /* fpprt sets this mode DELIBERATELY at init (uniform-word bodies trace
-       conservatively); the warning is only interesting when it is a surprise */
     fprintf (stderr,
              "warning: conservatively-traced allocation disables compaction\n");
-#endif
     gc_atomic_store_relaxed(&space->heap_has_ambiguous_edges, 1);
 
     // FIXME: We need to repurpose the pinned bit to indicate objects that
