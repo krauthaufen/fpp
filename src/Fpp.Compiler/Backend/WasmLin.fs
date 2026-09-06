@@ -5688,7 +5688,18 @@ let private witnessPtr (st : St) (t : Type) : LExpr =
 // CONSERVATIVE (the tagged fallback), NOT precise — defaulting it to `ref`
 // (refMask 1) made a raw scalar in that slot get scanned and chased once the
 // node was built precise (int-valued maps trapped at scale under GC).
-let private witnessUnknown (st : St) : LExpr = witnessPtrRMK st 4 4 2 5
+/// how many UNKNOWN witnesses were actually emitted this compile. A witness is
+/// derivable in every legitimate case — the instantiation is ground, so the
+/// witness is a constant, or the enclosing function is itself generic and was
+/// handed one to forward. There is no third case, so a sentinel here is a GAP
+/// in that discipline, not a fact about the program. Counted so it can be
+/// driven to zero and gated (FPP_WITSTRICT=1 makes it an error).
+let mutable private witUnknownCount = 0
+let private witnessUnknown (st : St) : LExpr =
+    witUnknownCount <- witUnknownCount + 1
+    (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then
+        eprintfn "WITUNK %s" curFnDbg)
+    witnessPtrRMK st 4 4 2 5
 
 /// The witness for the j-th class type parameter inside a STAMPED clone: its
 /// argument is concrete and spelled in the clone's own name, so the answer is
@@ -5701,13 +5712,13 @@ let private stampWitness (st : St) (j : int) : LExpr =
     | Some nm ->
         let bare = layStripGen nm
         witnessPtrRMK st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
-    | None -> witnessUnknown st
+    | None -> (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then eprintfn "WITSRC stamp %s" curFnDbg); witnessUnknown st
 
 let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
     if nm.Length > 0 && nm.[0] = '#' then
         match dictTryFind ctx.Witness (int (nm.Substring 1)) with
         | Some reg -> LGet (wReg reg)
-        | None -> witnessUnknown ctx.LSt
+        | None -> (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then eprintfn "WITSRC callarg#%s %s" (nm.Substring 1) curFnDbg); witnessUnknown ctx.LSt
     else
         let bare = layStripGen nm
         witnessPtrRMK ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
@@ -15070,6 +15081,8 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         for cat, v in dictPairs byCat do eprintfn "WITSCAN total %s = %d sites" cat v
         eprintfn "WITSCAN distinct fns: %d" (dictPairs witScan |> List.length)
         for k, v in (dictPairs witScan |> List.sortBy (fun (_, v) -> 0 - v)) do eprintfn "WITSCANFN %d %s" v k)
+    (if System.Environment.GetEnvironmentVariable "FPP_WITSCAN" = "1" then
+        eprintfn "WITUNKNOWN emitted = %d" witUnknownCount)
     linWarnings <- vecToList st.Warnings
     bytes, vecToList st.Errors
 
