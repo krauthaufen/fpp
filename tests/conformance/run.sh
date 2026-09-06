@@ -58,7 +58,13 @@ for f in "$here"/suites/*.fpp; do
   # 128 MB heap: the ported originals allocate at .NET scale (forexpression
   # builds ~500k cons cells live), and the default 16 MB is a self-host
   # tuning choice, not a language limit
-  if ! timeout 180 "$wt" run -W gc=y,exceptions=y --env FPPRT_HEAP_MB=128 "$out/$b.wasm" >"$out/$b.act" 2>"$out/$b.trap"; then
+  # forward the runtime knobs (wasmtime does NOT inherit the host environment),
+  # so the whole suite can be gated under FPPRT_MOVING=1 as well
+  envfwd=()
+  for k in FPPRT_MOVING FPPRT_CONSERVATIVE FPPRT_TRACEDBG FPPRT_ROOTCHECK FPP_GC_LOG; do
+    if [ -n "${!k+x}" ]; then envfwd+=(--env "$k=${!k}"); fi
+  done
+  if ! timeout 180 "$wt" run -W gc=y,exceptions=y --env FPPRT_HEAP_MB=128 "${envfwd[@]}" "$out/$b.wasm" >"$out/$b.act" 2>"$out/$b.trap"; then
     echo "TRAP    $b"; tail -4 "$out/$b.trap"; fail=$((fail+1)); continue
   fi
   if diff -q "$here/expected/$b.out" "$out/$b.act" >/dev/null; then
