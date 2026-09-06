@@ -11,6 +11,10 @@
 # one of these shapes answered correctly while quietly allocating. The heap is
 # sized so that one small object per iteration cannot possibly fit.
 set -e
+envfwd=()
+for k in FPPRT_MOVING FPPRT_CONSERVATIVE FPP_GC_LOG; do
+  if [ -n "${!k+x}" ]; then envfwd+=(--env "$k=${!k}"); fi
+done
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 fpp="$root/src/Fpp.Cli/bin/Release/net10.0/fpp"
@@ -21,7 +25,7 @@ trap 'rm -rf "$out"' EXIT
     echo "NOALLOC BUILD FAILED"; head -5 "$out/build.log"; exit 1; }
 
 log="$out/run.log"
-wasmtime run -W exceptions=y,gc=y --env FPPRT_HEAP_MB=64 \
+wasmtime run -W exceptions=y,gc=y "${envfwd[@]}" --env FPPRT_HEAP_MB=64 \
     "$out/noalloc.wasm" > "$out/stdout" 2> "$log" || {
     echo "NOALLOC RUN FAILED"; tail -5 "$log"; exit 1; }
 
