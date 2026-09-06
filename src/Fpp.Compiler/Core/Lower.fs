@@ -2090,6 +2090,39 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // instead of building a closure for the receiver
                       | EIfaceCall (iface, mname, recv, []), _ when head.NodeKind = DotExpr ->
                           EIfaceCall (iface, mname, recv, loweredArgs)
+                      // The SAME fold for the ETA-EXPANDED form. A member
+                      // access of arity > 0 lowers to `fun _eta0 … -> recv.M
+                      // _eta0 …` (a method referenced as a VALUE needs that),
+                      // and the arm above matched only the zero-arity shape —
+                      // so `recv.M a b c` built that closure and immediately
+                      // called it. Beta-reduce it here.
+                      //
+                      // It is not just the allocation and the indirect call
+                      // per invocation. An eta parameter is typed `?`, which
+                      // the backend's ref-kind classifier reads as a
+                      // REFERENCE, so every argument was pushed onto the
+                      // SCANNED shadow stack to be rooted across the call —
+                      // and an int-stamped scalar rides there RAW. The moving
+                      // collector then chased that even word as a pointer:
+                      // `HashMap.add` at scale died precisely here, since a
+                      // recursive `left.AddWith h k v` went through one of
+                      // these closures at every level of the trie.
+                      | ELam (ps, EIfaceCall (iface, mname, recv, callArgs)), _ when
+                            head.NodeKind = DotExpr
+                            && List.length callArgs = List.length ps
+                            && List.length loweredArgs >= List.length ps
+                            && (List.zip ps callArgs
+                                |> List.forall (fun (p, ca) ->
+                                    let pv = fst p
+                                    match ca with
+                                    | EVar (av, _) -> av.Path = pv.Path && av.Offset = pv.Offset
+                                    | _ -> false)) ->
+                          let n = List.length ps
+                          let direct = EIfaceCall (iface, mname, recv, List.truncate n loweredArgs)
+                          // OVER-application (the method answers a function)
+                          // keeps the remaining arguments as an ordinary apply
+                          if List.length loweredArgs = n then direct
+                          else EApp (direct, List.skip n loweredArgs)
                       // `T.M args` where the STATIC member access already
                       // applied its synthesized unit: the explicit arguments
                       // REPLACE it — keeping both called M(unit, args...)
