@@ -466,9 +466,19 @@ trace_one(struct gc_ref ref, struct gc_heap *heap,
           struct gc_trace_worker *worker) {
   struct gc_trace_plan plan = trace_plan(heap, ref);
   switch (plan.kind) {
-    case GC_TRACE_PRECISELY:
-      gc_trace_object(ref, tracer_visit, heap, worker);
+    case GC_TRACE_PRECISELY: {
+      /* fpprt: uniform-word bodies (FK_TAGGED / ref arrays) may hold raw
+         scalars in generic slots; trace them conservatively (validated,
+         marked in place) so a raw even int is never chased or rewritten.
+         Evacuation is disabled at init (heap_has_ambiguous_edges). */
+      size_t cons_sz = fpprt_ranges_ambiguous_ ? gc_object_conservative_body(ref) : 0;
+      if (GC_UNLIKELY(cons_sz != 0)) {
+        uintptr_t addr = gc_ref_value(ref);
+        trace_conservative_edges(addr, addr + cons_sz, 0, heap, worker);
+      } else
+        gc_trace_object(ref, tracer_visit, heap, worker);
       break;
+    }
     case GC_TRACE_NONE:
       break;
     case GC_TRACE_CONSERVATIVELY: {
@@ -825,6 +835,13 @@ enqueue_pinned_roots(struct gc_heap *heap) {
   GC_ASSERT(!heap_nofl_space(heap)->evacuating);
   int has_pinned_roots = enqueue_mutator_conservative_roots(heap);
   has_pinned_roots |= enqueue_global_conservative_roots(heap);
+#ifdef FPPRT_UNIFORM_CONSERVATIVE
+  /* fpprt: the embedder routes RANGE roots through the ambiguous channel */
+  if (fpprt_ranges_ambiguous_ && heap->roots) {
+    gc_tracer_add_root(&heap->tracer, gc_root_heap_pinned_roots(heap));
+    has_pinned_roots = 1;
+  }
+#endif
   return has_pinned_roots;
 }
 
@@ -1452,11 +1469,22 @@ gc_init(const struct gc_options *options, struct gc_stack_addr stack_base,
   gc_stack_init(&(*mut)->stack, stack_base);
   add_mutator(*heap, *mut);
 
-  /* Tracing is PRECISE, always. Every uniform slot is either a heap pointer
-     or an odd tagged scalar, and every generic slot's GC nature is carried by
-     a witness — so "is this word an edge?" has an exact answer and the
-     collector evacuates and compacts unconditionally. There is no
-     conservative mode and no way to ask for one. */
+#ifdef FPPRT_UNIFORM_CONSERVATIVE
+  /* the embedder's uniform-word bodies (FK_TAGGED / ref arrays) are traced
+     CONSERVATIVELY (see trace_one): validated, marked in place, raw scalars
+     skipped. Mixing that with evacuation would leave a conservatively-marked
+     alias stale, so compaction is off — Whippet's own ambiguous-edges mode.
+     RANGE roots (the shadow stack) go the same way, through the pinned-roots
+     channel — a raw scalar leaked onto the stack is validated and skipped. */
+  /* FPPRT_MOVING=1 turns evacuation back ON: uniform-word bodies and range
+     roots are traced PRECISELY (no conservative branch), so compaction works.
+     Only sound once nothing raw-int reaches a scanned uniform slot — the
+     witness-completeness experiment. Default (unset) keeps the safe mode. */
+  if (!getenv("FPPRT_MOVING")) {
+    nofl_space_set_heap_has_ambiguous_edges(space);
+    fpprt_ranges_ambiguous_ = 1;
+  }
+#endif
 
   gc_background_thread_start((*heap)->background_thread);
   

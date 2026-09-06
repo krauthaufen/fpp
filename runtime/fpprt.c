@@ -29,6 +29,7 @@ static struct gc_heap *heap_;
 static _Thread_local struct gc_mutator *mut_;
 static _Thread_local struct gc_mutator_roots roots_;
 static struct gc_heap_roots heap_roots_;
+int fpprt_ranges_ambiguous_ = 0;
 
 /* ---- identity-hash table ----------------------------------------------
  * Buckets of ephemeron chains, keyed by object ADDRESS. Addresses go stale
