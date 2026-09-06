@@ -450,6 +450,7 @@ let mutable private curStampArgs : string list = []
 /// the correct answer for whatever `self` could not supply — the UNKNOWN
 /// sentinel was only ever an admission that nobody had worked this out.
 let mutable private curNoWitnessChannel = false
+let mutable private curChannelKind = "?"
 let mutable private chkSite = 0
 let mutable private gcConsRawTid = 0
 let mutable private gcConsRefTid = 0
@@ -5741,7 +5742,7 @@ let mutable private witUniformCount = 0
 let private uniformWitness (st : St) : LExpr =
     witUniformCount <- witUniformCount + 1
     (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then
-        eprintfn "WITUNIFORM %s chan=%b stamp=%d" curFnDbg curNoWitnessChannel (List.length curStampArgs))
+        eprintfn "WITUNIFORM %s kind=%s" curFnDbg curChannelKind)
     witnessPtrRMK st 4 4 1 5
 
 /// The witness for the j-th class type parameter inside a STAMPED clone: its
@@ -8340,6 +8341,19 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                           LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
         LDo (stmts, LGet (wReg bs))
     | EApp (EUnknown n, _) when n.StartsWith "$zero" -> lowInt 0
+    // `sizeof<T>` — the size the witness records. Reached the emitter as an
+    // unsupported unknown before, so it was stubbed and TRAPPED for every type,
+    // concrete ones included: accepted at compile time, dead at run time. For a
+    // concrete T the layout answers statically; for a type PARAMETER the
+    // witness this body was handed carries it, which is the whole point of
+    // passing witnesses that say what the type is.
+    | EUnknown n when n.StartsWith "$sizeof:" ->
+        let tn = n.Substring 8
+        if tn.Length > 1 && tn.[0] = '#' then
+            match dictTryFind ctx.Witness (int (tn.Substring 1)) with
+            | Some r -> LLoad (W, LGet (wReg r), 0)
+            | None -> LConstW (layoutOf ctx.LSt (TCon ("obj", []))).Size
+        else LConstW (layoutOf ctx.LSt (TCon (tn, []))).Size
     | EUnknown n when n.StartsWith "$zero" -> lowInt 0
     | EApp (EUnknown "fixed6", [ a ]) -> LCall ("$ftoa6", [ coreToLowE ctx a ])
     // OUT of a half: widen the bits, then narrow to the target
@@ -12705,6 +12719,7 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     // forwarded here. It does not need to be: everything crossing the closure
     // ABI is a tagged scalar or a pointer, so the uniform witness is the answer.
     curNoWitnessChannel <- true
+    curChannelKind <- "lambda"
     curStampArgs <- []
     // FPP_LAM_DUMP=<$blamN>: the CORE body of one lifted lambda, for finding
     // which construct in it lowered to a trap
@@ -14860,6 +14875,10 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 gc && not (List.isEmpty sch.Quantified)
                 && (dictTryFind st.FuncWitness (key v)).IsNone
                 && v.Offset < 800000000
+            curChannelKind <- (if v.Offset >= 800000000 then "stamp"
+                               elif (dictTryFind st.FuncWitness (key v)).IsSome then "has-params"
+                               elif List.isEmpty sch.Quantified then "monomorphic"
+                               else "vtable-impl")
             curStampArgs <-
                 (if v.Offset >= 800000000 then
                     match v.Name.IndexOf '$' with
@@ -14908,6 +14927,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // from — and being emitted once it serves every instantiation, so
             // nothing stamped its slots and they hold uniform words.
             curNoWitnessChannel <- gc && not (List.isEmpty vsch.Quantified)
+            curChannelKind <- "generic-value"
             curStampArgs <- []
             // an ANNOTATED binding widens: `let x : obj = 1` keeps the rhs's
             // own int type, so the value has to be boxed on the way into the
