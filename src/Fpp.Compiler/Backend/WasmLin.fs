@@ -435,6 +435,16 @@ let mutable private curFnDbg = "?"
 /// constant witnesses their trailing slots must hold. Empty for anything that
 /// is not a stamp.
 let mutable private curStampArgs : string list = []
+/// The function being emitted is GENERIC but has no witness channel: it is a
+/// vtable implementation, so it cannot take hidden witness parameters (the row's
+/// signature is fixed) and `self` carries witnesses only for the CLASS' own type
+/// parameters — never for a method-level one like `FoldWith`'s `'s`, and never
+/// at all when the receiver is a union. There is still no third case: a virtual
+/// call goes through the vtable's UNIFORM ABI, so every value crossing it is a
+/// tagged scalar or a pointer, never a raw one. The uniform witness is therefore
+/// the correct answer for whatever `self` could not supply — the UNKNOWN
+/// sentinel was only ever an admission that nobody had worked this out.
+let mutable private curNoWitnessChannel = false
 let mutable private chkSite = 0
 let mutable private gcConsRawTid = 0
 let mutable private gcConsRefTid = 0
@@ -5718,7 +5728,12 @@ let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
     if nm.Length > 0 && nm.[0] = '#' then
         match dictTryFind ctx.Witness (int (nm.Substring 1)) with
         | Some reg -> LGet (wReg reg)
-        | None -> (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then eprintfn "WITSRC callarg#%s %s" (nm.Substring 1) curFnDbg); witnessUnknown ctx.LSt
+        | None ->
+            if curNoWitnessChannel then witnessPtrRMK ctx.LSt 4 4 1 5
+            else
+                (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then
+                    eprintfn "WITSRC callarg#%s %s" (nm.Substring 1) curFnDbg)
+                witnessUnknown ctx.LSt
     else
         let bare = layStripGen nm
         witnessPtrRMK ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
@@ -14790,6 +14805,10 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // Link mints every stamp in its own offset zone (stampNext), and
             // mangles the instantiation onto the name; a stamped member spells
             // the CLASS' parameters first.
+            curNoWitnessChannel <-
+                gc && not (List.isEmpty sch.Quantified)
+                && (dictTryFind st.FuncWitness (key v)).IsNone
+                && v.Offset < 800000000
             curStampArgs <-
                 (if v.Offset >= 800000000 then
                     match v.Name.IndexOf '$' with
