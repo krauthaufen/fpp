@@ -7469,7 +7469,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 match fromWid with
                 | Some r -> LGet (wReg r)
                 | None -> stampWitness st j
-            let wits = [ 0 .. k - 1 ] |> List.map witVal
+            // STORED TAGGED (odd). A witness points into immortal static data,
+            // never the heap, so it must not be an edge — and declaring the
+            // slot RKRaw only keeps it out of a PRECISE refoffs map. When a
+            // construction falls back to the uniform FK_TAGGED shape (any slot
+            // whose witness could not be resolved), that tracer scans every
+            // even word and followed the witness pointer straight out of the
+            // heap. Odd words are skipped by every tracer there is; the
+            // recovery off `self` untags.
+            let wits = [ 0 .. k - 1 ] |> List.map (fun j -> LPrim (AddW, [ witVal j; LConstW 1 ]))
             lowObjR ctx (cidRec st name) 0 (baseSlots @ wits) (Some (baseKinds @ List.replicate k RKRaw)) baseWits
         | None ->
             lowObjR ctx (cidRec st name) 0 baseSlots (Some baseKinds) baseWits
@@ -7531,7 +7539,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 match List.tryItem j ctx.ClassCtorWits |> Option.bind (fun (wid, _) -> dictTryFind ctx.Witness wid) with
                 | Some r -> LGet (wReg r)
                 | None -> stampWitness st j
-            let wits = [ 0 .. k - 1 ] |> List.map witVal
+            // STORED TAGGED (odd). A witness points into immortal static data,
+            // never the heap, so it must not be an edge — and declaring the
+            // slot RKRaw only keeps it out of a PRECISE refoffs map. When a
+            // construction falls back to the uniform FK_TAGGED shape (any slot
+            // whose witness could not be resolved), that tracer scans every
+            // even word and followed the witness pointer straight out of the
+            // heap. Odd words are skipped by every tracer there is; the
+            // recovery off `self` untags.
+            let wits = [ 0 .. k - 1 ] |> List.map (fun j -> LPrim (AddW, [ witVal j; LConstW 1 ]))
             LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 (slots @ wits) (Some (kinds @ List.replicate k RKRaw)) extWits)
         | None ->
             LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObjR ctx (cidRec st name) 0 slots (Some kinds) extWits)
@@ -12280,10 +12296,19 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<st
             let tblPtr = LLoad (W, LGetGlobal "$roots", 4 * gcWitOffSlot)
             let wbInit = LSet (wReg wbReg, LLoad (W, LPrim (AddW, [ tblPtr; LPrim (MulW, [ lowHeaderCid (wReg selfReg); LConstW 4 ]) ]), 8))
             wbInit ::
-            (selfWits |> List.map (fun (vid, j) ->
+            (selfWits |> List.collect (fun (vid, j) ->
                 let r = freshTmp ctx
                 dictSet ctx.Witness vid r
-                LSet (wReg r, LLoad (W, LPrim (AddW, [ LGet (wReg selfReg); LPrim (AddW, [ LGet (wReg wbReg); LConstW (4 * j) ]) ]), 0))))
+                // The slot holds the witness TAGGED (see the construction), so no
+                // tracer ever follows it; untag to get the pointer back. ZERO
+                // means the receiver carries no witness area after all — a class
+                // whose cid has a WitOff entry but whose construction stored
+                // none — and the honest answer there is the UNKNOWN witness, not
+                // a wild pointer computed from 0.
+                [ LSet (wReg r, LLoad (W, LPrim (AddW, [ LGet (wReg selfReg); LPrim (AddW, [ LGet (wReg wbReg); LConstW (4 * j) ]) ]), 0))
+                  LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]),
+                       [ LSet (wReg r, witnessPtrRMK ctx.LSt 4 4 2 5) ],
+                       [ LSet (wReg r, LPrim (SubW, [ LGet (wReg r); LConstW 1 ])) ]) ]))
         | _ -> []
     // a STAMPED generic-class member: its class type param is concrete here, so
     // seed a CONSTANT static witness for it (the receiver is fully concrete, so
