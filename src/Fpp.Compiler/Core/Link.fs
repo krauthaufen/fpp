@@ -409,6 +409,59 @@ let stampedClassWits = dictNew<string * int, (int * string) list> ()
 let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (instanceFns : Dict<string, VarId * bool * bool>)
                      (decls : Decl list) : Decl list * string list =
     let errors = vecNew<string> ()
+    // ---- generic VALUE bindings become nullary FUNCTIONS ------------------
+    // A top-level generic value — `let empty : HashNode<'k,'v> = hmEmpty ()` —
+    // is initialised ONCE at module load, with no arguments. So its body's
+    // type-parameter witnesses have nowhere to come from and default to the
+    // UNKNOWN sentinel; under the moving collector that sentinel forces the
+    // conservative tagged tid, whose raw ints are then chased as pointers
+    // (t100, the adaptive suite and the self-host all trapped once evacuation
+    // actually ran). F# compiles a generic value as a METHOD re-evaluated per
+    // use — no caching — so do the same: `let v = e` becomes the nullary
+    // function `let v () = e`, and every use `v` becomes `v ()`. The existing
+    // generic-FUNCTION witness machinery (a Canon body takes a runtime witness
+    // per type param, a scalar stamp specialises) then threads the concrete
+    // witness the value never could. Only under the wasm-linear witness ABI
+    // (stampScalars); the C backend tags its scalars and is left unchanged.
+    // Only the EXPANSIVE case — a body that is an application, `hmEmpty ()` —
+    // is thunked: that is the shape whose witnesses the value cannot thread,
+    // and exactly the one the value restriction newly generalized. A
+    // NON-expansive generic value (`let empty : 'a list = []`, a nullary union
+    // case, a marker) carries no type-parameter data to witness and already
+    // worked as a shared Canon global — thunking those re-evaluates a lazy or
+    // recursive one per use and can diverge (the `patterns` suite hung). A
+    // `rec` binding is excluded for the same divergence reason.
+    let genericValues = dictNew<string * int, bool> ()
+    let mutable anyGV = false
+    (if stampScalars then
+        for d in decls do
+            match d with
+            | DLet (rc, v, sch, e) when not rc && not (List.isEmpty sch.Quantified) ->
+                (match e with EApp _ -> dictSet genericValues (v.Path, v.Offset) true; anyGV <- true | _ -> ())
+            | _ -> ())
+    let isGV (v : VarId) = (dictTryFind genericValues (v.Path, v.Offset)) = Some true
+    let unitTy = TCon ("unit", [])
+    let thunkScheme (sch : Scheme) = { sch with Body = TFun (unitTy, sch.Body) }
+    let rec rwGV (e : Expr) : Expr =
+        match e with
+        // produce the application and do NOT recurse into the head we just
+        // built — the value is never applied in source, so this is terminal
+        | EVarI (v, sch, inst) when isGV v -> EApp (EVarI (v, thunkScheme sch, inst), [ ELit LUnit ])
+        | EVar (v, sch) when isGV v -> EApp (EVar (v, thunkScheme sch), [ ELit LUnit ])
+        | _ -> mapChildren rwGV e
+    let decls =
+        if not anyGV then decls
+        else
+            decls |> List.map (fun d ->
+                match d with
+                | DLet (rc, v, sch, e) when isGV v ->
+                    // an unreferenced unit param, in a zone disjoint from every
+                    // other synthetic-offset family (stamps 800M, Lower <=632M,
+                    // alphaRename 1G+ — this sits above them all)
+                    let up = { Path = v.Path; Offset = v.Offset + 1500000000; Name = "_gvthunk" }
+                    DLet (rc, v, thunkScheme sch, ELam ([ (up, mono unitTy) ], rwGV e))
+                | DLet (rc, v, sch, e) -> DLet (rc, v, sch, rwGV e)
+                | other -> other)
     let bodies = dictNew<string * int, bool * VarId * Scheme * Expr> ()
     for d in decls do
         match d with
