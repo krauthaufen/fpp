@@ -7481,12 +7481,19 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             // ctor's hidden witness params (ClassCtorWits).
             let objVars = dictTryFind st.ObjWit name
             let witVal j =
+                // an OBJECT EXPRESSION captures its enclosing type variables
+                // through the closure environment — uniform slots — so where the
+                // enclosing witness is out of scope (a nested obj@ inside another
+                // one's member, as in `Seq.collect`) the value crossing that
+                // boundary is a tagged scalar or a pointer, never a raw one
+                let objUniform = objVars.IsSome
                 let fromWid =
                     match objVars with
                     | Some vars -> List.tryItem j vars |> Option.bind (fun vid -> dictTryFind ctx.Witness vid)
                     | None -> List.tryItem j ctx.ClassCtorWits |> Option.bind (fun (wid, _) -> dictTryFind ctx.Witness wid)
                 match fromWid with
                 | Some r -> LGet (wReg r)
+                | None when objUniform -> witnessPtrRMK st 4 4 1 5
                 | None -> stampWitness st j
             // STORED TAGGED (odd). A witness points into immortal static data,
             // never the heap, so it must not be an edge — and declaring the
