@@ -85,7 +85,12 @@ type private St =
       /// interned value-witness tables: a "size:align:refMask" key -> its BYTE
       /// offset in the static g_witnesses pool. Deduped, emitted at startup.
       Witnesses : Dict<string, int>
-      WitnessData : Vec<int * int * int * int * int>   // (offset, size, align, refMask, cmpKind)
+      WitnessData : Vec<int * int * int * int * int * int>   // (offset, size, align, refMask, cmpKind, typeId)
+      /// a stable id per TYPE NAME, so a witness says WHICH type it is and not
+      /// merely how it is represented. 0 is "not known here" — the residue the
+      /// uniform fallbacks leave, and countable because of it.
+      TypeIds : Dict<string, int>
+      mutable TypeIdNext : int
       mutable WitnessCur : int
       /// top-level non-lambda bindings: a mutable global each
       Globals : Dict<string, bool>       // "path:offset" -> unit
@@ -5665,18 +5670,42 @@ let private cmpKindOfName (nm : string) : int =
     | "uint64" -> 4
     | _ -> 5
 
-let private witnessPtrRMK (st : St) (size : int) (align : int) (refMask : int) (cmpKind : int) : LExpr =
-    let k = string size + ":" + string align + ":" + string refMask + ":" + string cmpKind
+/// the id of a TYPE NAME — stable within a compile, and the same for every
+/// witness of that type however it is represented. `typeIdOf ""` is 0, which
+/// reads as "this witness does not know what it is".
+let private typeIdOf (st : St) (nm : string) : int =
+    if nm = "" then 0
+    else
+        match dictTryFind st.TypeIds nm with
+        | Some i -> i
+        | None ->
+            let i = st.TypeIdNext
+            st.TypeIdNext <- i + 1
+            dictSet st.TypeIds nm i
+            i
+
+/// A witness carries WHAT THE TYPE IS (`tyName`, interned to an id at offset
+/// 16) as well as how it is represented (size/align/refMask/cmpKind). The
+/// representation alone cannot tell `Leaf<'K,int>` from `Leaf<'K,obj>`, and
+/// cannot tell two reference types apart at all; the id can.
+let private witnessPtrRMKT (st : St) (size : int) (align : int) (refMask : int) (cmpKind : int) (tyName : string) : LExpr =
+    let tid = typeIdOf st tyName
+    let k = string size + ":" + string align + ":" + string refMask + ":" + string cmpKind + ":" + string tid
     let off =
         match dictTryFind st.Witnesses k with
         | Some o -> o
         | None ->
             let o = st.WitnessCur
-            st.WitnessCur <- o + 16
+            // 20 bytes: the first four words keep their offsets, so the
+            // runtime's refMask read at +8 is untouched
+            st.WitnessCur <- o + 20
             dictSet st.Witnesses k o
-            vecAdd st.WitnessData (o, size, align, refMask, cmpKind)
+            vecAdd st.WitnessData (o, size, align, refMask, cmpKind, tid)
             o
     LPrim (AddW, [ LGetGlobal "$witnesses"; LConstW off ])
+
+let private witnessPtrRMK (st : St) (size : int) (align : int) (refMask : int) (cmpKind : int) : LExpr =
+    witnessPtrRMKT st size align refMask cmpKind ""
 
 let private witnessPtrRM (st : St) (size : int) (align : int) (refMask : int) : LExpr =
     // an unnamed witness: raw words order SIGNED, pointers structurally
@@ -5686,7 +5715,7 @@ let private witnessPtrRM (st : St) (size : int) (align : int) (refMask : int) : 
 let private witnessPtr (st : St) (t : Type) : LExpr =
     let l = layoutOf st t
     let kind = match prune t with TCon (n, _) -> cmpKindOfName n | _ -> (if int l.RefMask = 0 then 0 else 5)
-    witnessPtrRMK st l.Size l.Align (int l.RefMask) kind
+    witnessPtrRMKT st l.Size l.Align (int l.RefMask) kind (match prune t with TCon (n, _) -> n | _ -> "")
 
 // the witness a call must pass for one type-arg NAME (from EVarI.inst):
 // - "#N": forward the enclosing function's witness param for type-var N
@@ -5712,7 +5741,7 @@ let mutable private witUniformCount = 0
 let private uniformWitness (st : St) : LExpr =
     witUniformCount <- witUniformCount + 1
     (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then
-        eprintfn "WITUNIFORM %s" curFnDbg)
+        eprintfn "WITUNIFORM %s chan=%b stamp=%d" curFnDbg curNoWitnessChannel (List.length curStampArgs))
     witnessPtrRMK st 4 4 1 5
 
 /// The witness for the j-th class type parameter inside a STAMPED clone: its
@@ -5725,7 +5754,7 @@ let private stampWitness (st : St) (j : int) : LExpr =
     match List.tryItem j curStampArgs with
     | Some nm ->
         let bare = layStripGen nm
-        witnessPtrRMK st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
+        witnessPtrRMKT st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm
     // nothing here determines this class parameter — same conclusion
     | None -> uniformWitness st
 
@@ -5743,7 +5772,7 @@ let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
         | None -> uniformWitness ctx.LSt
     else
         let bare = layStripGen nm
-        witnessPtrRMK ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
+        witnessPtrRMKT ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm
 
 // A witness LExpr for a GENERIC aggregate slot, so lowObjR takes the precise
 // refoffs path (a raw element excluded, a ref included) rather than the tagged
@@ -5756,7 +5785,7 @@ let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
     let st = ctx.LSt
     let ofName (nm : string) =
         let bare = layStripGen nm
-        witnessPtrRMK st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
+        witnessPtrRMKT st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm
     let ofTy (t : Type) : LExpr option =
         match prune t with
         | TVar tv -> (match dictTryFind ctx.Witness tv.Id with Some r -> Some (LGet (wReg r)) | None -> None)
@@ -13460,7 +13489,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     tblIdx m "$novt" |> ignore
     let st =
         { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew (); StmtInits = dictNew ()
-          Funcs = dictNew (); FuncSig = dictNew (); FuncWitness = dictNew (); Witnesses = dictNew (); WitnessData = vecNew (); WitnessCur = 0; Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
+          Funcs = dictNew (); FuncSig = dictNew (); FuncWitness = dictNew (); Witnesses = dictNew (); WitnessData = vecNew (); WitnessCur = 0; TypeIds = dictNew (); TypeIdNext = 1; Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; TailApp = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew (); LamWits = dictNew ()
@@ -14858,7 +14887,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 | Some pairs ->
                     pairs |> List.map (fun (vid, nm) ->
                         let bare = layStripGen nm
-                        vid, witnessPtrRMK st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare))
+                        vid, witnessPtrRMKT st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm)
                 | None -> []
             // a tupled member's PARAMETERS are the destructured binders, and
             // its body is the match's arm — the tuple never exists
@@ -14949,11 +14978,12 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         // value-witness pool: point $witnesses at it and write each interned
         // {size,align,refMask} triple (static metadata the generic ABI passes).
         callf rf "$witnessbase"; gs rf "$witnesses"
-        for off, size, align, refMask, cmpKind in vecToList st.WitnessData do
+        for off, size, align, refMask, cmpKind, tyId in vecToList st.WitnessData do
             gg rf "$witnesses"; ic rf off; ins rf "i32.add"; ic rf size; mem rf "i32.store"
             gg rf "$witnesses"; ic rf (off + 4); ins rf "i32.add"; ic rf align; mem rf "i32.store"
             gg rf "$witnesses"; ic rf (off + 8); ins rf "i32.add"; ic rf refMask; mem rf "i32.store"
             gg rf "$witnesses"; ic rf (off + 12); ins rf "i32.add"; ic rf cmpKind; mem rf "i32.store"
+            gg rf "$witnesses"; ic rf (off + 16); ins rf "i32.add"; ic rf tyId; mem rf "i32.store"
         // the tid->cid table is a FIXED static array in fpprt-wasm-shim.c
         // (FPPRT_WASM_NTIDS). Writing past it corrupts the static memory that
         // follows AND leaves those shapes reading class-id 0, so a dispatch on
@@ -15154,7 +15184,10 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         eprintfn "WITSCAN distinct fns: %d" (dictPairs witScan |> List.length)
         for k, v in (dictPairs witScan |> List.sortBy (fun (_, v) -> 0 - v)) do eprintfn "WITSCANFN %d %s" v k)
     (if System.Environment.GetEnvironmentVariable "FPP_WITSCAN" = "1" then
-        eprintfn "WITUNKNOWN emitted = 0 (uniform fallbacks = %d)" witUniformCount)
+        eprintfn "WITUNKNOWN emitted = 0 (uniform fallbacks = %d)" witUniformCount
+        let ws = vecToList st.WitnessData
+        let known = ws |> List.filter (fun (_, _, _, _, _, t) -> t <> 0) |> List.length
+        eprintfn "WITTYPES %d witnesses, %d carry a type id, %d do not" (List.length ws) known (List.length ws - known))
     linWarnings <- vecToList st.Warnings
     bytes, vecToList st.Errors
 
