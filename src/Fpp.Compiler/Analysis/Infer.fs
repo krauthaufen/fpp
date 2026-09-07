@@ -1250,9 +1250,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // defaults are reference semantics (a constant hash is
                 // legal — all-equal — and Equals is identity), marked for
                 // lowering by a sentinel owner.
-                if (name = "GetHashCode" || name = "Equals") && (dictTryFind knownTypes tn).IsSome then
+                if (name = "GetHashCode" || name = "Equals" || name = "ToString")
+                   && (dictTryFind knownTypes tn).IsSome then
                     (match name with
                      | "GetHashCode" -> unifyMemberAt offset result (TFun (tUnit, tInt))
+                     // ToString ANSWERS FOR EVERY OBJECT, as in .NET. Without
+                     // it, `x.ToString ()` on a receiver whose type declares
+                     // none — an INTERFACE, typically: `(AVal.map f a)
+                     // .ToString ()` — type-checked and reached the backend
+                     // unlowered, which is a trap at run time with nothing
+                     // reported (~/claude/fpp-base-snags.md #46). It lowers to
+                     // the dynamic renderer, which dispatches to the object's
+                     // OWN ToString through its vtable row.
+                     | "ToString" -> unifyMemberAt offset result (TFun (tUnit, tString))
                      | _ -> unifyMemberAt offset result (TFun (TCon ("obj", []), tBool)))
                     vecAdd memberSitesRaw (offset, "$object")
                     true

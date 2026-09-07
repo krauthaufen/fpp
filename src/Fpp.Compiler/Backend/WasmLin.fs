@@ -1787,7 +1787,7 @@ let private emitShowv (m : Mod) : unit =
 // renders as ITSELF — `string` is not `%A`.
 let private emitStrv (m : Mod) : unit =
     let f = beginFn m [ "$v" ]
-    local f "$c" "i32"; local f "$msz" "i32"
+    local f "$c" "i32"; local f "$msz" "i32"; local f "$vt" "i32"
     localsDone f
     let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
     memSizeIns f; ic f 16; ins f "i32.shl"; ls f "$msz"
@@ -1805,6 +1805,29 @@ let private emitStrv (m : Mod) : unit =
     ifE f; lg f "$v"; callf f "$ltoa_s"; ret f; endB f
     lg f "$c"; ic f (hv CID_STRING gcStrTid); ins f "i32.eq"
     ifE f; lg f "$v"; ret f; endB f
+    // A CLASS THAT OVERRIDES ToString ANSWERS FOR ITSELF. Slot 3 of its
+    // vtable row (0 = not declared), the same dispatch $cmpv uses for
+    // Equals/CompareTo — and what makes `x.ToString ()` through an INTERFACE,
+    // or `string x` in a generic body, reach the object's own rendering
+    // instead of the "?" below (~/claude/fpp-base-snags.md #46).
+    if vtNSlots > 0 then
+        let cidOfHdr () =
+            if gc then (lg f "$c"; ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"; gg f "$t2c"; ins f "i32.add"; mem f "i32.load")
+            else lg f "$c"
+        cidOfHdr (); ic f CID_FIRST_USER; ins f "i32.ge_s"
+        ifE f
+        (if gc then (gg f "$roots"; ic f (4 * vtRootSlot); ins f "i32.add"; mem f "i32.load"; ic f 8; ins f "i32.add")
+         else ic f vtBaseConst)
+        cidOfHdr ()
+        ic f vtNSlots; ins f "i32.mul"; ic f 3; ins f "i32.add"; ic f 4; ins f "i32.mul"; ins f "i32.add"
+        mem f "i32.load"; ls f "$vt"
+        lg f "$vt"
+        ifE f
+        // the member takes (self, unit) — the unit argument is the 0 every
+        // other two-argument row call passes
+        lg f "$v"; ic f 0; lg f "$vt"; callIndirect f "$lfn2"; ins f "return"
+        endB f
+        endB f
     ic f 63; callf f "$str_of_char"
     endFn f
 
@@ -9000,7 +9023,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // `string x` with NO static kind (a generic body's `string x.V`): decide
     // at RUNTIME from the representation. Answering $str_of_int printed the
     // POINTER of a boxed float.
-    | EApp (EUnknown ("string#" | "string"), [ a ]) -> LCall ("$strv", [ coreToLowE ctx a ])
+    | EApp (EUnknown ("string#" | "string" | "$strv"), [ a ]) -> LCall ("$strv", [ coreToLowE ctx a ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
     // a call to an `extern` host import: no host env yet, so answer the null
     // default (readTextRaw null -> None), letting the pipeline RUN instead of
@@ -14332,12 +14355,15 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             match d with
             | DMembers (n, own) -> own |> List.map (fun (mn, _) -> bareIfaceOf n, mn)
             | _ -> [])
-    // slots 0/1/2 of EVERY row are the identity trio: a class' own Equals,
-    // GetHashCode and CompareTo. $cmpv/$hashv dispatch through them, so a
+    // slots 0/1/2/3 of EVERY row are the identity members: a class' own
+    // Equals, GetHashCode, CompareTo and ToString. $cmpv/$hashv dispatch through them, so a
     // type that defines content equality (Map/HashMap over an AVL/patricia
     // tree, whose SHAPE differs for equal contents) compares by its own rule
     // instead of the structural word fold. 0 = not declared.
-    let identitySlots = [ "$id", "Equals"; "$id", "GetHashCode"; "$id", "CompareTo" ]
+    // ... and slot 3 is ToString, for the same reason: `x.ToString ()` on a
+    // receiver whose static type declares none (an INTERFACE) has to reach the
+    // object's own override, and the dynamic renderer is where that happens.
+    let identitySlots = [ "$id", "Equals"; "$id", "GetHashCode"; "$id", "CompareTo"; "$id", "ToString" ]
     let vtableSlots =
         identitySlots
         @ (((interfaceDecls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn)))
@@ -14801,7 +14827,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             (match dictTryFind slotImplKeys slot with
              | Some ks -> if not (List.contains k2 ks) then dictSet slotImplKeys slot (ks @ [ k2 ])
              | None -> dictSet slotImplKeys slot [ k2 ])
-         let trioNames = [ 0, "Equals"; 1, "GetHashCode"; 2, "CompareTo" ]
+         let trioNames = [ 0, "Equals"; 1, "GetHashCode"; 2, "CompareTo"; 3, "ToString" ]
          for d in decls0 do
             match d with
             | DMembers (_, own) ->
@@ -14824,7 +14850,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // DIFFERENT counts have no common ordering, so that slot goes back
             // to 0 for everyone.
             let k =
-                if slot < 3 then 0
+                if slot < 4 then 0
                 else
                     // a filler that already takes FuncWitness params declares
                     // an arity of its own; the slot cannot also prescribe one
@@ -15193,7 +15219,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     let fillIdentity (owner : string) (own : (string * VarId) list) =
         match dictTryFind st.ClassId owner with
         | Some cid when st.NSlots > 0 ->
-            [ 0, "Equals"; 1, "GetHashCode"; 2, "CompareTo" ]
+            [ 0, "Equals"; 1, "GetHashCode"; 2, "CompareTo"; 3, "ToString" ]
             |> List.iter (fun (slot, mn) ->
                 match own |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None) with
                 | Some v when (dictTryFind st.Funcs (key v)) = Some 2 ->
@@ -15235,7 +15261,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             if st.NSlots > 0 then
                 vtRows.[cid * st.NSlots + 0] <- tblIdx m "$clseq"
                 vtRows.[cid * st.NSlots + 1] <- tblIdx m "$clshash"
-            [ 0, "Equals"; 1, "GetHashCode"; 2, "CompareTo" ]
+            [ 0, "Equals"; 1, "GetHashCode"; 2, "CompareTo"; 3, "ToString" ]
             |> List.iter (fun (slot, mn) ->
                 match ownMemberNamed cn mn with
                 | Some v when (dictTryFind st.Funcs (key v)) = Some 2 ->

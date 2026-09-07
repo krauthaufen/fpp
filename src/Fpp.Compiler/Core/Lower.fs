@@ -229,6 +229,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     for off, tn in strTypes do dictSet strTypeAt off tn
     let memberIndex = dictNew<string, Resolve.Definition> ()
     for k, d in dictPairs projectMembers do dictSet memberIndex k d
+    /// The `ToString` OVERRIDE of a type, if it declares one. A GENERIC type
+    /// is recorded at a use site under its INSTANTIATION (`Box$<int>`), and
+    /// the member index is keyed by the declared name — so the lookup missed
+    /// for every generic class and `string x` fell through to a Show instance
+    /// that does not exist: an unresolved `$class:Show:str:Box$<int>`, which
+    /// is a stub, which is a trap when reached
+    /// (~/claude/fpp-base-snags.md #46). The concrete case always worked,
+    /// which is what made it look like a scale bug.
+    let overrideToString (tn : string) : Resolve.Definition option =
+        match dictTryFind memberIndex (tn + ".ToString") with
+        | Some d -> Some d
+        | None ->
+            if tn.Contains "$<" then dictTryFind memberIndex (tn.Substring (0, tn.IndexOf "$<") + ".ToString")
+            else None
     if System.Environment.GetEnvironmentVariable "FPP_MEMBER_DUMP" = "1" then
         for k, _ in dictPairs projectMembers do
             if k.Contains "ToString" then eprintfn "MEMBER %s" k
@@ -1528,8 +1542,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // (KNOWN-ISSUES #8). The override is an ordinary member,
                       // so the project-wide member index finds it by owner.
                       | None, Some tn when
-                            cname = "string" && (dictTryFind memberIndex (tn + ".ToString")).IsSome ->
-                          (match dictTryFind memberIndex (tn + ".ToString") with
+                            cname = "string" && (overrideToString tn).IsSome ->
+                          (match overrideToString tn with
                            | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ arg; ELit LUnit ])
                            | None -> EApp (EUnknown ("$class:Show:str:" + tn), [ arg ]))
                       | None, Some tn when cname = "string" ->
@@ -4112,6 +4126,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               let u = { Path = path; Offset = offsetOf n + 24000000; Name = "_u" }
                               let anon2 = mono (TCon ("?", []))
                               ELam ([ u, anon2 ], EApp (EUnknown "$idhash", [ lowerExpr (GNode lhs) ]))
+                          elif owner = "$object" && name.Text = "ToString" then
+                              // the DYNAMIC renderer: it reads the object's
+                              // own ToString out of its vtable row, which is
+                              // what makes `x.ToString ()` through an
+                              // interface answer the class' override
+                              let u = { Path = path; Offset = offsetOf n + 27000000; Name = "_u" }
+                              let anon2 = mono (TCon ("?", []))
+                              ELam ([ u, anon2 ], EApp (EUnknown "$strv", [ lowerExpr (GNode lhs) ]))
                           elif owner = "$object" && name.Text = "Equals" then
                               let o2 = { Path = path; Offset = offsetOf n + 25000000; Name = "_o" }
                               let anon2 = mono (TCon ("?", []))

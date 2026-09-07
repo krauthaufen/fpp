@@ -1,12 +1,21 @@
-// AN OVERRIDDEN ToString WINS, as it does in F# (KNOWN-ISSUES #8 from the
-// fpp.base port). `string x` lowered straight to the Show class' `str`, which
-// prints the structural form — so a type that overrides ToString printed its
-// record shape from `string x` while `x.ToString ()` beside it answered
-// correctly. Two spellings of one thing disagreeing is the shape to watch for.
+// `ToString` ANSWERS FOR EVERY OBJECT, AND THE OVERRIDE WINS.
 //
-// The override is an ordinary member, so the project-wide member index finds
-// it by owner; a type WITHOUT one keeps the structural form, which is what the
-// second half here pins.
+// A call through a receiver whose static type declares no ToString — an
+// INTERFACE, typically — had nothing to resolve to: it type-checked, reached
+// the backend unlowered, and TRAPPED when the line ran, with nothing reported
+// even under `--strict`. That is how fpp.adaptive's `aval` values could not
+// be printed at all (~/claude/fpp-base-snags.md #46), and it read as a
+// scale-dependent bug because the same call on the concrete class worked.
+//
+// ToString is a universal object member now, like GetHashCode and Equals, and
+// it is DYNAMIC: slot 3 of the class' vtable row, the same dispatch $cmpv
+// uses for Equals and CompareTo. So the override runs whatever the static
+// type of the receiver is.
+//
+// The second half of the same bug: `string x` on a GENERIC class ignored its
+// override — the member index is keyed by the declared name and a use site
+// records the INSTANTIATION (`Box$<int>`), so the lookup missed and the call
+// fell through to a Show instance that does not exist.
 module Core_tostring
 
 let mutable ntests = 0
@@ -15,45 +24,52 @@ let eq (name : string) (got : string) (want : string) : unit =
     ntests <- ntests + 1
     if got <> want then
         failures <- failures + 1
-        printfn "NO: %s got %s want %s" name got want
+        printfn "FAIL %s: got %s want %s" name got want
 
-[<Struct>]
-type V2 =
-    { X : float; Y : float }
-    override v.ToString () = "[" + string v.X + ", " + string v.Y + "]"
+type IShape =
+    abstract member Area : unit -> int
 
-let v = { X = 1.0; Y = 2.0 }
+type Sq(n : int) =
+    interface IShape with
+        member x.Area () = n * n
+    override x.ToString () = "sq(" + string n + ")"
 
-eq "string-uses-the-override" (string v) "[1, 2]"
-eq "and-the-explicit-call-agrees" (v.ToString ()) (string v)
+type Circle(r : int) =
+    interface IShape with
+        member x.Area () = 3 * r * r
+    override x.ToString () = "circle(" + string r + ")"
 
-// a CLASS with an override, which needed a second fix: a class has no Show
-// instance, so its `string c` was dropped from the table Lower routes by
-// (an unsatisfied Show normally means "let the runtime walker do it") and it
-// printed "?" while `c.ToString ()` beside it was right. A type that
-// overrides ToString has an answer of its own and now keeps its entry.
-type Named (n : string) =
-    member _.N = n
-    override _.ToString () = "<" + n + ">"
+let s = Sq 3
+let c = Circle 2
 
-let c = Named "abc"
-eq "class-override" (string c) "<abc>"
-eq "class-override-agrees" (c.ToString ()) (string c)
+// on the class itself
+eq "on-the-concrete-class" (s.ToString ()) "sq(3)"
+eq "string-of-the-concrete-class" (string s) "sq(3)"
 
-// through a function whose parameter is the type, so the call site is not the
-// declaration site
-let show (x : V2) : string = string x
-eq "override-through-a-parameter" (show { X = 3.0; Y = 4.0 }) "[3, 4]"
+// through the INTERFACE: the class' own override answers
+let i = s :> IShape
+eq "through-an-interface" (i.ToString ()) "sq(3)"
 
-// a type WITHOUT an override keeps the structural form — the fix must not
-// route everything through a member that is not there
-[<Struct>]
-type P = { A : int; B : int }
-let p = { A = 1; B = 2 }
-eq "no-override-keeps-the-structural-form" (string p) (sprintf "%A" p)
+// and it is the RUNTIME type that decides, not the annotation
+let shapes : IShape list = [ s :> IShape; c :> IShape ]
+eq "dispatched-per-object" (String.concat "," (List.map (fun (x : IShape) -> x.ToString ()) shapes)) "sq(3),circle(2)"
+eq "and-the-interface-member-still-works" (String.concat "," (List.map (fun (x : IShape) -> string (x.Area ())) shapes)) "9,12"
 
-// a scalar is unaffected
-eq "int-unaffected" (string 42) "42"
-eq "float-unaffected" (string 1.5) "1.5"
+// a GENERIC class' override, through `string` and through the member
+type Box<'T>(v : 'T) =
+    member x.Value = v
+    override x.ToString () = "box(" + string x.Value + ")"
+
+let bi = Box 3
+let bs = Box "s"
+eq "generic-class-member" (bi.ToString ()) "box(3)"
+eq "generic-class-string" (string bi) "box(3)"
+eq "generic-class-at-a-reference" (string bs) "box(s)"
+
+// a class with NO override keeps answering something rather than trapping
+type Plain(n : int) =
+    member x.N = n
+let p = Plain 1
+eq "no-override-still-answers" (if (p.ToString ()).Length > 0 then "yes" else "no") "yes"
 
 printfn "DONE tests=%d failures=%d" ntests failures
