@@ -726,30 +726,33 @@ members) is exactly the world it is for. `[<Struct>]` records refuse
 optional fields (an option is a reference). Sources using `?fields` are NOT
 compilable by fsc — keep them out of dual-compiled files.
 
-## Mixing implicit and explicit yields in a CE is an ERROR
+## A bare value beside an explicit `yield` IS yielded
 
-F#: `b { 1; yield 2 }` compiles with warning FS0020 — a body that names a
-value anywhere reads its other bare expressions as STATEMENTS, so the `1`
-is evaluated and discarded.
-F++: it is an error (`a computation expression may not mix implicit and
-explicit yields`).
+F#: `b { 1; yield 2 }` yields only 2. A body that names a value anywhere
+reads its other bare expressions as STATEMENTS, so the `1` is evaluated
+and discarded, with warning FS0020.
+F++: both are yielded, in order.
 
-**Reason.** The two compilers agree on the meaning; they disagree about
-whether it is worth saying out loud, and this one has no warnings to say
-it with. A value the author wrote disappearing from the result with
-nothing reported is the failure this repo refuses to ship — and it is not
-hypothetical: it folded fpp.dom's scene CE to an empty Shader, and cost
-that milestone more debugging than anything else in it. The same shape
-had already cost the wombat.dom port once.
+**Reason.** The warning is the whole of F#'s defence, and this compiler
+emits none — so under F#'s reading a value the author wrote disappears
+from the result with nothing said anywhere. That is not hypothetical: it
+folded fpp.dom's scene CE to an empty Shader and cost that milestone more
+debugging than anything else in it, after the same shape had already cost
+the wombat.dom port once. Between two readings, the one taken is the one
+the writer meant — the same rule as `expr[i]` above.
 
-A bare expression that is a STATEMENT (unit-valued — `printfn`, an
-assignment) is unaffected: it is a statement in both readings, and CE
-bodies are full of them.
+A bare expression the probe typed as a STATEMENT (unit-valued — `printfn`,
+an assignment) is untouched: it is a statement under both readings, and CE
+bodies are full of them. So is an item the probe never typed, which is
+every body under a `for`, an `if` or a `match`: unknown is not a value.
 
-The negative-conformance case
-`tests/conformance/neg/ce-implicit-explicit-yield-mix.fpp` asserts our
-behaviour directly (`//? fsc-accepts` excludes it from the fsi oracle
-run, per rule 1 above).
+The one genuine ambiguity F#'s rule buys is a bare `()` — Zero, or a Yield
+of the unit value? That is decided by the BUILDER here: it yields where
+some `Yield` overload accepts unit (the seed a custom-operation builder
+declares as `Yield (u : unit)`), and stays a statement where none does.
+
+`tests/tooling/ce-yieldmix-gate.sh` pins both. It cannot be a conformance
+suite: the fsi oracle answers F#'s reading by construction.
 
 ## An unknown uppercase pattern identifier is an ERROR
 

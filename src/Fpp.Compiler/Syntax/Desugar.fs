@@ -107,6 +107,12 @@ type CeBuilder =
       HasRun : bool
       HasDelay : bool
       HasReturn : bool
+      /// does some `Yield` overload accept UNIT? A bare `()` in a body is
+      /// otherwise ambiguous between Zero and Yield — the one thing F#'s ban
+      /// on mixing implicit and explicit yields really disambiguates — so it
+      /// yields where the builder can take it and stays a statement where it
+      /// cannot
+      YieldsUnit : bool
       HasBindReturn : bool
       HasBind2 : bool
       HasBind3 : bool
@@ -129,7 +135,7 @@ let unknownBuilder (name : string) : CeBuilder =
     // other way would turn a file that does not type check into a pile of
     // missing-method errors that vanish once it does.
     { Name = name; At = 0; Has = (fun _ -> true)
-      HasRun = false; HasDelay = false; HasReturn = true
+      HasRun = false; HasDelay = false; HasReturn = true; YieldsUnit = false
       HasBindReturn = false; HasBind2 = false; HasBind3 = false
       HasBind2Return = false; HasBind3Return = false
       HasMergeSources = false; HasMergeSources3 = false
@@ -667,17 +673,26 @@ and private item1 (b : CeBuilder) (explicit : bool) (item : GreenNode) (rest : G
                     | _ -> false))
         if isRange then combine (call b "YieldFrom" [ walk (GNode item) ])
         else combine (call b "Yield" [ walk (GNode item) ])
-    // A VALUE beside an explicit `yield`. F# reads it as a statement and
-    // DISCARDS it (warning FS0020), so `div { "bare"; yield "x" }` silently
-    // loses "bare" — this compiler has no warnings, and losing a value the
-    // author wrote is exactly the shape it refuses to ship. A DIVERGENCE,
-    // deliberately: fsc accepts the program. It cost fpp.dom the most
-    // debugging time of its milestone, twice (~/claude/fpp-base-snags.md #51),
-    // and it is the historic wombat.dom scar repeating.
+    // A bare `()`. Unit is the one item whose reading is genuinely
+    // ambiguous — Zero, or Yield of the unit value — and it is what F#'s ban
+    // on mixing implicit and explicit yields buys, at the price of the
+    // silent drop above. Decided by the BUILDER: a Yield that accepts unit
+    // takes it, anything else leaves it the statement it has always been.
+    | ParenExpr when b.YieldsUnit && List.isEmpty (nodesOf item) ->
+        combine (call b "Yield" [ unitExpr () ])
+    // A VALUE beside an explicit `yield` IS a yield. F# reads it as a
+    // statement and DISCARDS it (warning FS0020), so `div { "bare"; yield
+    // "x" }` loses "bare" — and with no warnings to say so, that is a value
+    // the author wrote vanishing from the result in silence. It folded
+    // fpp.dom's scene CE to an empty Shader and cost that milestone more
+    // debugging than anything else in it, the historic wombat.dom scar
+    // repeating (~/claude/fpp-base-snags.md #51). A DIVERGENCE, deliberately:
+    // the reading taken is the one the writer meant.
+    //
+    // Only where the probe TYPED the item and found it HAS a value: an item
+    // it never typed (a branch body, a loop body) is unknown rather than a
+    // value, and CE bodies are full of genuine statements.
     | _ when explicit && valueAt (offsetOf item) ->
-        vecAdd ceDiags
-            (offsetOf item,
-             "a computation expression may not mix implicit and explicit yields: this value would be discarded — write `yield` before it")
         combine (call b "Yield" [ walk (GNode item) ])
     | _ when List.isEmpty rest -> Green.node BlockExpr [ walk (GNode item); call b "Zero" [] ]
     | _ -> sequential ()

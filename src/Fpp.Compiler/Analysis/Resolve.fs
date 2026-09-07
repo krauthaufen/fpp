@@ -1187,6 +1187,18 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             outer <- Map.add t.Text d outer
             outer <- Map.add (typeKey t.Text) d outer
             if exportHere then exportAcc d
+            // A PRIMARY constructor is registered under the type name's own
+            // offset (that is the key inference records for it), and until now
+            // only an EXPLICIT `new` reached the member table — so a class in
+            // another file had no constructor entry a use site could resolve
+            // through. Direct uses of the class name survived on another path;
+            // a use through a type ABBREVIATION (`type cval<'T> =
+            // ChangeableValue<'T>`) did not, and the construction lowered as a
+            // read of the alias NAME. That is what dropped a whole consumer
+            // file's init in the fpp.adaptive port (~/claude/fpp-base-snags.md
+            // #42); it is an error today and resolves properly now.
+            if n.Children |> List.exists (fun c -> match c with GNode p2 -> p2.NodeKind = ParenPat | _ -> false) then
+                dictSet memberDefs (typeName + ".new@" + string t.Offset) d
         | _ -> ()
         for c in n.Children do
             match c with

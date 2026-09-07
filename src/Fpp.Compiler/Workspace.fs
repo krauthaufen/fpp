@@ -708,10 +708,16 @@ type Workspace() =
                         let b0 = Analysis.Resolve.resolve path imports raw.Root
                         let members0 = BuiltinCache.copyDict members
                         for k, d in b0.Members do dictSet members0 k d
+                        // the probe's own copy of the field table: it is
+                        // what the probe FILLS with this file's members, and
+                        // the builder's `Yield` overloads are read back off
+                        // it below (the outer table has not seen this file
+                        // yet — the real inference pass comes after)
+                        let fields0 = BuiltinCache.copyDict fields
                         let inf0 =
                             Analysis.Infer.infer path raw.Root b0
                                 (BuiltinCache.copyDict schemes) (BuiltinCache.copyDict aliases)
-                                (BuiltinCache.copyDict fields) (BuiltinCache.copyDict ifaces)
+                                fields0 (BuiltinCache.copyDict ifaces)
                                 (BuiltinCache.copyDict bases) (BuiltinCache.copyDict impls)
                                 (BuiltinCache.copyDict implTys)
                                 (BuiltinCache.copyDict structTypes) (BuiltinCache.copyDict ctors)
@@ -740,6 +746,21 @@ type Workspace() =
                                   HasRun = has "Run"
                                   HasDelay = has "Delay"
                                   HasReturn = has "Return"
+                                  YieldsUnit =
+                                    // any Yield overload declaring a unit
+                                    // parameter (the seed a custom-operation
+                                    // builder writes as `Yield (u : unit)`)
+                                    [ ""; "#2"; "#3"; "#4" ]
+                                    |> List.exists (fun ord ->
+                                        match dictTryFind fields0 (tyName + ".Yield" + ord) with
+                                        | Some fi ->
+                                            (match Analysis.Types.prune fi.FieldType with
+                                             | Analysis.Types.TFun (d, _) ->
+                                                 (match Analysis.Types.prune d with
+                                                  | Analysis.Types.TCon ("unit", []) -> true
+                                                  | _ -> false)
+                                             | _ -> false)
+                                        | None -> false)
                                   HasBindReturn = has "BindReturn"
                                   HasBind2 = has "Bind2"
                                   HasBind3 = has "Bind3"

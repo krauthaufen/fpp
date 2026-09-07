@@ -2453,10 +2453,14 @@ let parseSeeded (apSeed : ApDef list) (src : string) : ParseResult =
                               && (s.SameLine || s.CurCol > mcol) do
                             vecAdd cons (s.Bump ())
                         vecAdd acc (Green.node WhenDecl (vecToList cons))
-            if s.IsKw "with"
-               && (let p = s.Peek 1 in
-                   p.Text = "get" || p.Text = "set" || p.Text = "inline"
-                   || p.Text = "private" || p.Text = "internal" || p.Text = "public") then
+            // does an accessor keyword follow the current `and`/`with`?
+            let accessorFollows () =
+                let p1 = s.Peek 1
+                p1.Text = "get" || p1.Text = "set"
+                || ((p1.Text = "inline" || p1.Text = "private"
+                     || p1.Text = "internal" || p1.Text = "public")
+                    && (let p2 = s.Peek 2 in p2.Text = "get" || p2.Text = "set"))
+            if s.IsKw "with" && accessorFollows () then
                 // property accessors: `member x.P with get() = ... and set v = ...`
                 vecAdd acc (s.Bump ())   // with
                 let mutable more = true
@@ -2480,8 +2484,20 @@ let parseSeeded (apSeed : ApDef list) (src : string) : ParseResult =
                         // `and` between WRITTEN accessors, a comma between
                         // DECLARED ones: `abstract member Tag : obj with
                         // get, set` names the two slots and gives neither a
-                        // body
-                        if s.IsKw "and" then vecAdd acc (s.Bump ())
+                        // body.
+                        //
+                        // The keyword is AMBIGUOUS: it also opens the next
+                        // type of a `type … and …` group. Taken
+                        // unconditionally, a property written `with get () =
+                        // v and set nv = …` swallowed the `and` of the
+                        // FOLLOWING type declaration, so a type abbreviation
+                        // after such a property (`and cval<'T> =
+                        // ChangeableValue<'T>`, the fpp.adaptive shape) was
+                        // left behind as a stray expression — "unbound value
+                        // 'cval'", at the abbreviation's own line
+                        // (~/claude/fpp-base-snags.md #42). Only an `and`
+                        // followed by an accessor is this property's.
+                        if s.IsKw "and" && accessorFollows () then vecAdd acc (s.Bump ())
                         elif s.Is Comma then vecAdd acc (s.Bump ())
                         else more <- false
                     else
@@ -2501,7 +2517,7 @@ let parseSeeded (apSeed : ApDef list) (src : string) : ParseResult =
                     let mutable moreAcc = true
                     while moreAcc && s.Is Ident && (s.Cur.Text = "get" || s.Cur.Text = "set") do
                         vecAdd acc (Green.node AccessorDecl [ s.Bump () ])
-                        if s.Is Comma || s.IsKw "and" then vecAdd acc (s.Bump ())
+                        if s.Is Comma || (s.IsKw "and" && accessorFollows ()) then vecAdd acc (s.Bump ())
                         else moreAcc <- false
         Green.node MemberDecl (vecToList acc)
 
