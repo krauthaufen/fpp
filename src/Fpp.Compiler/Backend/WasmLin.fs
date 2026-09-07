@@ -5768,6 +5768,9 @@ let private witnessPtr (st : St) (t : Type) : LExpr =
 /// out" and dropped the whole object onto the conservative tagged shape.
 /// Counted anyway, so the sites stay visible (FPP_WITSCAN / FPP_WITSTRICT).
 let mutable private witUniformCount = 0
+/// every witness ARGUMENT a call site emits, resolved or not — the denominator
+/// the fallback count only means something against
+let mutable private witArgCount = 0
 /// how many hidden witness params a function declares — FuncWitness (an
 /// ordinary generic) or SlotWitness (a vtable row filler), never both
 let private hiddenWitCount (st : St) (k : string) : int =
@@ -5777,6 +5780,7 @@ let private hiddenWitCount (st : St) (k : string) : int =
 
 let private uniformWitnessWhy (st : St) (why : string) : LExpr =
     witUniformCount <- witUniformCount + 1
+    witArgCount <- witArgCount + 1
     (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then
         eprintfn "WITUNIFORM %s kind=%s why=%s" curFnDbg curChannelKind why)
     witnessPtrRMK st 4 4 1 5
@@ -5803,9 +5807,10 @@ let private stampWitness (st : St) (j : int) : LExpr =
 let private witnessArgOfNameOpt (ctx : LowCtx) (nm : string) : LExpr option =
     if nm.Length > 0 && nm.[0] = '#' then
         match dictTryFind ctx.Witness (int (nm.Substring 1)) with
-        | Some reg -> Some (LGet (wReg reg))
+        | Some reg -> witArgCount <- witArgCount + 1; Some (LGet (wReg reg))
         | None -> None
     else
+        witArgCount <- witArgCount + 1
         let bare = layStripGen nm
         Some (witnessPtrRMKT ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm)
 
@@ -15712,7 +15717,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         eprintfn "WITSCAN distinct fns: %d" (dictPairs witScan |> List.length)
         for k, v in (dictPairs witScan |> List.sortBy (fun (_, v) -> 0 - v)) do eprintfn "WITSCANFN %d %s" v k)
     (if System.Environment.GetEnvironmentVariable "FPP_WITSCAN" = "1" then
-        eprintfn "WITUNKNOWN emitted = 0 (uniform fallbacks = %d)" witUniformCount
+        eprintfn "WITUNKNOWN emitted = 0 (uniform fallbacks = %d of %d witness arguments)" witUniformCount witArgCount
         let ws = vecToList st.WitnessData
         let known = ws |> List.filter (fun (_, _, _, _, _, t) -> t <> 0) |> List.length
         eprintfn "WITTYPES %d witnesses, %d carry a type id, %d do not" (List.length ws) known (List.length ws - known))
