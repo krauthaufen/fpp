@@ -949,7 +949,13 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                  | Unclassifiable why ->
                      if not isTemplate || nameless then
                          vecAdd errors ("cannot specialize '" + v.Name + "' in " + owner + ": " + why)
-                     EVar (v, sch)
+                     // KEEP THE INSTANTIATION. No clone will be made, so the call
+                     // goes to the shared body — which under the witness ABI is
+                     // GENERIC and takes one witness per type variable. Dropping
+                     // the names left the caller with nothing to forward, and
+                     // every such call passed a uniform witness that knows no
+                     // type. `EVar` here is the wasm-GC shape (no witnesses).
+                     if stampScalars then EVarI (v, sch, inst) else EVar (v, sch)
                  | Stamp i0 ->
                      let i = capInst i0
                      let mangled = mangleFor v i

@@ -2103,9 +2103,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          // instantiation rides the head token (a plain EVar
                          // here called the SHARED body, whose element
                          // representation disagrees with every concrete use)
+                         // An UNNAMED slot ("") used to drop the WHOLE
+                         // instantiation, and with it every witness the
+                         // construction could have forwarded — one type
+                         // argument inference could not name cost the call all
+                         // of them. `obj` names an unobserved slot honestly,
+                         // which is the rule Link applies to a variable the
+                         // definition does not quantify.
                          (match dictTryFind instSites ht.Offset with
-                          | Some inst when not (List.isEmpty inst) && inst |> List.forall (fun i -> i <> "") ->
-                              EApp (EVarI (varIdOf cd, schemeOf cd, inst), loweredArgs)
+                          | Some inst when not (List.isEmpty inst) ->
+                              EApp (EVarI (varIdOf cd, schemeOf cd,
+                                           inst |> List.map (fun i -> if i = "" then "obj" else i)), loweredArgs)
                           | _ -> EApp (EVar (varIdOf cd, schemeOf cd), loweredArgs))
                      | None ->
                      (match f, loweredArgs with
