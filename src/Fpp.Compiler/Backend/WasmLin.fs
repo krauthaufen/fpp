@@ -12942,6 +12942,11 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     // ABI is a tagged scalar or a pointer, so the uniform witness is the answer.
     curNoWitnessChannel <- true
     curChannelKind <- "lambda"
+    // a lifted lambda has no scheme of its own: what it can forward is exactly
+    // what the enclosing body captured into its env (LamWits), so the enclosing
+    // list stays. Cleared rather than left STALE from the last top-level
+    // function, which made the diagnostic name the wrong owner's variables.
+    curFnQuantIds <- []
     curStampArgs <- []
     // FPP_LAM_DUMP=<$blamN>: the CORE body of one lifted lambda, for finding
     // which construct in it lowered to a trap
@@ -15436,6 +15441,9 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // nothing stamped its slots and they hold uniform words.
             curNoWitnessChannel <- gc && not (List.isEmpty vsch.Quantified)
             curChannelKind <- "generic-value"
+            curFnQuantIds <-
+                (vsch.Quantified |> List.map (fun q -> q.Id))
+                @ (vsch.Quantified |> List.map prunedId)
             curStampArgs <- []
             // an ANNOTATED binding widens: `let x : obj = 1` keeps the rhs's
             // own int type, so the value has to be boxed on the way into the
