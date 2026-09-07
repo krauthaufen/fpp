@@ -831,6 +831,32 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      if not emissionOwned && not preludeModule then
                          vecAdd accessErrs
                              (last.Offset, "module " + prefix + " does not export '" + last.Text + "'")
+                 // A MODULE AND A TYPE MAY SHARE A NAME. F# accepts the
+                 // companion-module pattern (`type DepthBias` beside `module
+                 // DepthBias` — checked against fsi) and reads
+                 // `DepthBias.None` as the type's static while
+                 // `DepthBias.constant` stays the module's let. Here the
+                 // module's binding shadowed the type for the whole file, no
+                 // arm above claimed the access, and the fallback below
+                 // resolved the head as a VALUE — so the module NAME reached
+                 // the backend as an unresolved variable and the program
+                 // trapped, silently without `--strict`
+                 // (~/claude/fpp-base-snags.md #39). A module is never a
+                 // value: hand the access to the TYPE of that name and let
+                 // inference bind the member by the receiver's type.
+                 | Some (head :: _ :: _) when
+                        (match Map.tryFind head.Text env with
+                         | Some d -> d.Kind = DefModule
+                         | None -> false)
+                        // a TYPE, strictly: findQualifiedType falls back to
+                        // the plain export key, which for a name that is only
+                        // a module answers the module again — and recording
+                        // that as the receiver is what the fallback below
+                        // already does
+                        && (match lookupType env head.Text with
+                            | Some td -> td.Kind = DefType
+                            | None -> false) ->
+                     record head (lookupType env head.Text).Value
                  | _ ->
                      // member access on a value: resolve the lhs, and walk
                      // any index expression (a.[i])
@@ -1145,6 +1171,13 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         // flag cannot leak onto a later type
         let isRqa = pendingRqa
         pendingRqa <- false
+        // `[<AutoOpen>]` on a TYPE brings its STATIC members into scope
+        // unqualified — F# does (checked against fsi), and the donor
+        // Aardvark.Dom auto-opens `type Dom` / `type Css`. Consumed here for
+        // the same reason as the flag above: left set, it auto-opened
+        // whatever module happened to follow.
+        let autoType = pendingAutoOpen
+        pendingAutoOpen <- false
         let exportAcc (d : Definition) : unit =
             if declAccess = Some "private" then exportOwnOnly d else exportDef d
         match nameTok with
@@ -1247,6 +1280,30 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | GNode b when b.NodeKind = BlockExpr -> local (fun () -> walkExpr inner c |> ignore)
             | GNode ty when isTypeKind ty.NodeKind -> walkType outer c
             | _ -> ()
+        if autoType && not isExtension then
+            // each STATIC member, bare in this file's scope and — the way an
+            // auto-opened module's members already are — exported under the
+            // enclosing module's path, so another file's `open` finds them
+            for c in n.Children do
+                match c with
+                | GNode m when m.NodeKind = MemberDecl
+                               && (m.Children |> List.exists (fun x ->
+                                       match x with
+                                       | GToken t -> t.Kind = Keyword && t.Text = "static"
+                                       | _ -> false)) ->
+                    (match firstIdentToken m.Children with
+                     | Some mt ->
+                         (match dictTryFind memberDefs (typeName + "." + mt.Text) with
+                          | Some d ->
+                              outer <- Map.add mt.Text d outer
+                              // exportUnder prepends the module path itself,
+                              // so the member lands beside a module-level
+                              // `let` of the same name — which is what makes
+                              // another file's `open` find it
+                              if exportHere && declAccess <> Some "private" then exportUnder mt.Text d
+                          | None -> ())
+                     | None -> ())
+                | _ -> ()
         outer
 
     /// `class C<'a>` — the class name lives in the type namespace, and its
