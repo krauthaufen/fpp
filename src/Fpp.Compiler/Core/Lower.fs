@@ -4148,6 +4148,27 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              let sch = mono (TCon (tn, []))
                              Some (ELet (false, tmp, sch, elem, structLetElems (structElems sp) tn (EVar (tmp, sch)) bodyE))
                          | None -> None
+                     // A STRUCT-TUPLE ELEMENT PATTERN OVER A CONS WALK.
+                     // `lowerPat` has no struct form, so `for struct(k, v) in
+                     // xs` lowered its element to PWild — an irrefutable
+                     // pattern that binds NOTHING — and the body then named `k`
+                     // and `v`, which nothing bound. The array path already
+                     // works around this with `structBindElem`; the list and
+                     // materialized-range paths did not, and the result was a
+                     // body referencing unbound names (only visible once the
+                     // function was reachable: `HashMap.OfList` came out
+                     // stubbed as soon as anything demanded it).
+                     //
+                     // Bind the head to a temp and destructure it exactly as
+                     // the array path does. Its own path, never the source's —
+                     // a synthetic local at a source offset collides with a
+                     // real top-level function in a big enough file.
+                     let consHead (p : Pat) (bodyE : Expr) : Pat * Expr =
+                         let anon = mono (TCon ("?", []))
+                         let hv = { Path = synPath; Offset = offsetOf n + 7000000; Name = "_head" }
+                         match structBindElem (EVar (hv, anon)) bodyE with
+                         | Some destructured -> PVar (hv, anon), destructured
+                         | None -> p, bodyE
                      (match lowerPat ip, lowerExpr (GNode range) with
                       // `for _ in 1 .. n do` counts without naming the
                       // counter; the loop still needs one, so a wildcard
@@ -4209,11 +4230,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
                           ELet (false, restV, anon, rangeMaterializeStep (rangeElem rop1).Value lo st hi,
                             EWhile (notNull (EVar (restV, anon)),
-                              EMatch (EVar (restV, anon),
-                                [ PCons (pat, PVar (tailV, anon)), None,
-                                    ESeq [ loopBody body
-                                           EAssign (restV, EVar (tailV, anon)) ]
-                                  PWild, None, ELit LUnit ])))
+                              (let hp, hb = consHead pat (loopBody body)
+                               EMatch (EVar (restV, anon),
+                                 [ PCons (hp, PVar (tailV, anon)), None,
+                                     ESeq [ hb
+                                            EAssign (restV, EVar (tailV, anon)) ]
+                                   PWild, None, ELit LUnit ]))))
                       | pat, EPrim (rop1, [ lo; hi ]) when (rangeElem rop1).IsSome ->
                           // a NON-ordinal range source (`for x in 1.0 .. 10.0`):
                           // the inline i32 count loop stepped a float's word as
@@ -4227,11 +4249,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
                           ELet (false, restV, anon, rangeMaterialize (offsetOf n) elem lo hi,
                             EWhile (notNull (EVar (restV, anon)),
-                              EMatch (EVar (restV, anon),
-                                [ PCons (pat, PVar (tailV, anon)), None,
-                                    ESeq [ loopBody body
-                                           EAssign (restV, EVar (tailV, anon)) ]
-                                  PWild, None, ELit LUnit ])))
+                              (let hp, hb = consHead pat (loopBody body)
+                               EMatch (EVar (restV, anon),
+                                 [ PCons (hp, PVar (tailV, anon)), None,
+                                     ESeq [ hb
+                                            EAssign (restV, EVar (tailV, anon)) ]
+                                   PWild, None, ELit LUnit ]))))
                       | pat, coll when (dictTryFind arrKinds (offsetOf range)) = Some "list" ->
                           // for x in xs (a LIST): a cons walk. The binder may
                           // destructure, so the element binds through the
@@ -4243,11 +4266,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
                           ELet (false, restV, anon, coll,
                             EWhile (notNull (EVar (restV, anon)),
-                              EMatch (EVar (restV, anon),
-                                [ PCons (pat, PVar (tailV, anon)), None,
-                                    ESeq [ loopBody body
-                                           EAssign (restV, EVar (tailV, anon)) ]
-                                  PWild, None, ELit LUnit ])))
+                              (let hp, hb = consHead pat (loopBody body)
+                               EMatch (EVar (restV, anon),
+                                 [ PCons (hp, PVar (tailV, anon)), None,
+                                     ESeq [ hb
+                                            EAssign (restV, EVar (tailV, anon)) ]
+                                   PWild, None, ELit LUnit ]))))
                       | pat, coll when
                             (dictTryFind arrKinds (offsetOf range)).IsSome
                             // arrKinds also holds plain application results,
@@ -5063,6 +5087,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                    && (dictTryFind tyAliases ("$arity:" + t.Text + ":" + string baseWrittenArity)).IsSome
                 then t.Text + "`" + string baseWrittenArity
                 else t.Text)
+        let baseInst =
+            inheritNode |> Option.bind baseTypeNode
+            |> Option.bind (fun tn -> Green.tokens (GNode tn) |> List.tryHead)
+            |> Option.bind (fun t -> dictTryFind fieldOwners t.Offset)
+            |> Option.bind (fun o ->
+                if o.StartsWith "$baseinst:" then Some ((o.Substring 10).Split '@' |> Array.toList)
+                else None)
         let baseCtorCall =
             match inheritNode, baseName with
             | Some i, Some bn ->
@@ -5375,13 +5406,6 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let bound = ms |> List.collect liftMember
                 for row in ifaceRowsFor iname bound do vecAdd implemented row
             currentClass <- ""
-            let baseInst =
-                inheritNode |> Option.bind baseTypeNode
-                |> Option.bind (fun tn -> Green.tokens (GNode tn) |> List.tryHead)
-                |> Option.bind (fun t -> dictTryFind fieldOwners t.Offset)
-                |> Option.bind (fun o ->
-                    if o.StartsWith "$baseinst:" then Some ((o.Substring 10).Split '@' |> Array.toList)
-                    else None)
             (match baseInst with
              | Some inst when isClass -> vecAdd decls (DBaseInst (name, inst))
              | _ -> ())
