@@ -1294,6 +1294,14 @@ let private rtDeclsLin (m : Mod) : unit =
     rtDeclsHalf m
     declFn m "$atof" "$lt_i2d"
     declFn m "$novt" "$lt_ii2i"
+    // ... and one per WIDER slot shape. A vtable slot that carries witness
+    // parameters is entered through a call_indirect of its own type, and a
+    // 0 row is index 0 — `$novt`, whose type is the two-argument one. The
+    // check then fails BEFORE the trap, and the engine says "indirect call
+    // type mismatch" with nothing to name. Each width has its own trap now,
+    // so a missing row is a NAMED frame again (~/claude/fpp-base-snags.md #48).
+    declFn m "$novt3" "$lt_iii2i"
+    declFn m "$novt4" "$lt_iiii2i"
     declFn m "$clseq" "$lt_ii2i"
     declFn m "$clshash" "$lt_ii2i"
     declFn m "$showv" "$lt_i2i"
@@ -1731,6 +1739,19 @@ let private emitMemcopy (m : Mod) : unit =
 // index 0 for a trap turns a missing row into an immediate, locatable failure.
 let private emitNoVt (m : Mod) : unit =
     let f = beginFn m [ "$a"; "$b" ]
+    localsDone f
+    ins f "unreachable"
+    endFn f
+
+/// the same trap at the WIDER slot shapes (a slot that passes witnesses)
+let private emitNoVt3 (m : Mod) : unit =
+    let f = beginFn m [ "$a"; "$b"; "$c" ]
+    localsDone f
+    ins f "unreachable"
+    endFn f
+
+let private emitNoVt4 (m : Mod) : unit =
+    let f = beginFn m [ "$a"; "$b"; "$c"; "$d" ]
     localsDone f
     ins f "unreachable"
     endFn f
@@ -15200,6 +15221,23 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // slotImpl (walking its inheritance chain); every impl function joins the
     // call table here. Rows for types with no impls stay 0.
     let vtRows = Array.zeroCreate (nCid * st.NSlots)
+    // EVERY row starts as the trap OF ITS SLOT'S WIDTH. A row of 0 is table
+    // index 0 — `$novt`, which takes two arguments — so a slot that passes
+    // witnesses failed its call_indirect TYPE CHECK before reaching the trap,
+    // and the engine reported "indirect call type mismatch" with nothing to
+    // name. That is how fpp.dom's adaptive-attribute reader failed, and the
+    // rows it went through are the ones nothing fills: a cid that is not a
+    // class at all (an unmapped tid reads cid 0) never reached the filling
+    // loop below (~/claude/fpp-base-snags.md #48).
+    (if st.NSlots > 0 then
+        let novtOf (slot : int) =
+            match dictTryFind st.SlotWitN slot with
+            | Some 1 -> tblIdx m "$novt3"
+            | Some 2 -> tblIdx m "$novt4"
+            | _ -> 0
+        for cid in 0 .. nCid - 1 do
+            for slot in 0 .. st.NSlots - 1 do
+                vtRows.[cid * st.NSlots + slot] <- novtOf slot)
     let vtdbg = System.Environment.GetEnvironmentVariable "FPP_VTDBG" = "1"
     // the identity trio, by NAME, from anywhere in the class' own chain. An
     // arity check keeps a same-named member of a different shape out: Equals
@@ -15278,10 +15316,67 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                     // THE ROW'S ARITY IS THE SLOT'S. A filler whose hidden
                     // witness params do not match k would be entered through a
                     // call_indirect of another type — a runtime "indirect call
-                    // type mismatch" with nothing to point at. Say it here.
-                    vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn v)
-                | Some v -> (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s MISS-func %s" cn cid slot ifn mn v.Name)
-                | None -> (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s no-impl" cn cid slot ifn mn))
+                    // type mismatch" with nothing to point at, which is exactly
+                    // how fpp.dom's adaptive-attribute reader failed
+                    // (~/claude/fpp-base-snags.md #48). Say it HERE, where the
+                    // class, the slot and the filler are all in hand, and leave
+                    // the row a width-matched trap rather than a call that
+                    // cannot type.
+                    let kSlot = match dictTryFind st.SlotWitN slot with Some x -> x | None -> 0
+                    if hiddenWitCount st (key v) <> kSlot then
+                        // QUIET: the row may never be dispatched, and most
+                        // are not — twelve of them exist in fpp.dom's build
+                        // and none is the one that traps, so making this
+                        // `--strict`-fatal would reject working programs. It
+                        // rides the quiet channel; `FPP_VTDBG=1` prints the
+                        // same numbers per row.
+                        vecAdd st.Warnings
+                            ("quietstub vtable row " + cn + "." + ifn + "." + mn + " (takes "
+                             + string (hiddenWitCount st (key v)) + " witness parameter(s) where slot "
+                             + string slot + " passes " + string kSlot + ")")
+                        (match kSlot with
+                         | 1 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt3"
+                         | 2 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt4"
+                         | _ -> ())
+                    else vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn v)
+                | Some v ->
+                    // The impl exists as a DECLARATION but no function was
+                    // emitted for it: a STAMPED class whose members were only
+                    // ever stamped at the CONCRETE instantiations, so the
+                    // canonical (all-obj) copy names a stamp nobody made. The
+                    // shared TEMPLATE is the implementation for exactly that
+                    // case — it takes its type arguments as witnesses, which is
+                    // what this slot passes — so the row takes it when the
+                    // widths agree. Without it the row stayed empty and the
+                    // dispatch trapped, which is how fpp.dom's adaptive
+                    // attribute reader failed (~/claude/fpp-base-snags.md #48).
+                    (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s MISS-func %s" cn cid slot ifn mn v.Name)
+                    let kSlot = match dictTryFind st.SlotWitN slot with Some x -> x | None -> 0
+                    let template =
+                        match dictTryFind st.RecBase cn with
+                        | Some b when b <> cn ->
+                            (match slotImpl b ifn mn with
+                             | Some tv when (dictTryFind st.Funcs (key tv)).IsSome
+                                            && hiddenWitCount st (key tv) = kSlot -> Some tv
+                             | _ -> None)
+                        | _ -> None
+                    (match template with
+                     | Some tv ->
+                         (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s -> TEMPLATE %s" cn cid slot ifn mn tv.Name)
+                         vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn tv)
+                     | None ->
+                         (match kSlot with
+                          | 1 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt3"
+                          | 2 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt4"
+                          | _ -> ()))
+                | None ->
+                    // no implementation at all: the row stays a trap, but at
+                    // THIS SLOT'S WIDTH for the reason above
+                    (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s no-impl" cn cid slot ifn mn)
+                    (match dictTryFind st.SlotWitN slot with
+                     | Some 1 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt3"
+                     | Some 2 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt4"
+                     | _ -> ()))
         | None -> (if vtdbg then eprintfn "VT %s NO-CID" cn)
     // intern all string constants FIRST, so the heap starts after them
     for d in decls do
@@ -15372,6 +15467,8 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     rtCoreHalf m
     emitAtof m
     emitNoVt m
+    emitNoVt3 m
+    emitNoVt4 m
     emitClsEq m
     emitClsHash m
     emitShowv m

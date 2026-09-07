@@ -20,9 +20,12 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
 ~/.wasmtime/bin/wasmtime run -W gc=y,exceptions=y /tmp/x.wasm
 ```
 
-This directory currently holds NO open issues — only this README. The last
-entry (`let-rec-and-group-self-host.fpp`) was root-caused and is covered by
-`suites/letrecand.fpp`; see the bottom of this file.
+One open issue: `canonical-class-vtable-row.fpp` — a generic class that is
+CONSTRUCTED canonically (all-obj) has no vtable row, because its members were
+only stamped at the concrete instantiations and the shared template did not
+survive. The file cannot hold its own repro (every small program stamps what
+it uses); it holds the diagnosis, the living repro's recipe, and what was
+already ruled out.
 
 Fixed and removed (see git history for the repros):
 `module-abbreviation` (`module Ab = Inner` parsed as a module with an EMPTY

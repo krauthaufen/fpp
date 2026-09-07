@@ -73,6 +73,65 @@ The C backend TAGS its scalars, so there `$box`/`$unbox` are the identity.
 That is why the coercion is a Core PRIM rather than something the middle end
 resolves: it says "coerce to obj" and each backend answers in its own model.
 
+## An inline struct field's LEAVES travel together
+
+A record's `[<Struct>]` field is laid out inline — its leaves occupy their own
+bytes inside the record, which is what makes `s.Turn.X` one load. Every path
+that MOVES such a field has to move the leaves, and copy-update moved one
+uniform word instead: `{ s with Turn = v }` stored a pointer over the first
+four bytes of an inline value and left the rest as it found it, so the
+assigned field came back as a bit pattern and every OTHER struct field of the
+record read zero. Nothing was reported, because nothing was missing — the
+wrong bytes were written. It shipped a broken demo (a camera controller whose
+state was wiped on every update while its Enabled flag stayed true).
+
+A leaf need not be a scalar. `{ Name : string; Key : int }` contributes a
+POINTER at its offset, and the paths that moved leaves asked for the leaf's
+scalar storage type and UNWRAPPED the answer — so a struct holding a string
+or an option crashed the compiler outright (`optGet: None`, naming a load).
+`podLeafTy` is the single answer now: a scalar rides its own width, anything
+else is one uniform word the pod builder roots across its allocation.
+
+`suites/structcopyupd.fpp` and `suites/structrefleaf.fpp` pin both, under the
+semi shakeout collector as well.
+
+## ToString answers for every object, and it is vtable SLOT 3
+
+`x.ToString ()` on a receiver whose static type declares none — an INTERFACE,
+typically — had nothing to resolve to: it type-checked, reached the backend
+unlowered, and TRAPPED when the line ran, with nothing said even under
+`--strict`. It is a universal object member now (beside GetHashCode and
+Equals) and it is DYNAMIC: slot 3 of the class' vtable row, the same dispatch
+`$cmpv` uses for Equals and CompareTo, reached through `$strv`. So the
+override runs whatever the receiver's static type is.
+
+Adding the slot means four places have to agree — `identitySlots`,
+`trioNames`, the `slot < 4` arity rule and `fillIdentity` — and a row is only
+ever filled with an arity-2 member, because the runtime call passes
+`(self, 0)`.
+
+The other half of the same bug: `string x` on a GENERIC class ignored its
+override. The member index is keyed by the DECLARED name and a use site
+records the INSTANTIATION (`Box$<int>`), so the lookup missed and the call
+fell through to a Show instance that does not exist.
+
+## A vtable row is only as wide as its slot
+
+A row of 0 is table index 0 — `$novt`, which takes TWO arguments. A slot that
+passes witnesses is entered through a call_indirect of its own type, so an
+empty row failed the TYPE CHECK before reaching the trap and the engine said
+"indirect call type mismatch" with nothing to name. Every row now starts as
+the trap of its slot's width (`$novt`/`$novt3`/`$novt4`), which turns that
+into a named frame — and it is how fpp.dom's adaptive-attribute trap was
+finally located (`tests/known-issues/canonical-class-vtable-row.fpp`).
+
+Two more rules came out of the same hunt. A STAMPED class whose own stamp was
+never made falls back to its base's TEMPLATE when the widths agree (893 rows
+in that program). And a filler whose hidden witness count differs from its
+slot's `k` is recorded as a quiet stub rather than installed: it could only be
+entered at the wrong arity. Quiet, not `--strict`-fatal — most such rows are
+never dispatched, and rejecting them would reject working programs.
+
 ## Never ship a silently wrong answer
 
 Documentation is for MISSING things. A construct this compiler accepts and
