@@ -79,7 +79,12 @@ type Expr =
     /// anyone outside the compiler having to know the element's layout
     | EArrayBytes of string * Expr
     /// interface name, method name, receiver, arguments — dispatched
-    /// through the receiver's vtable, not bound to any one implementation
+    /// through the receiver's vtable, not bound to any one implementation.
+    /// The method name may carry the call's INSTANTIATION (`MapTo$<int.int>`,
+    /// the member scheme's quantified order, class parameters first): a
+    /// generic vtable member has no other channel for its own type arguments,
+    /// since the row's signature is fixed and `self` carries only the class'.
+    /// Every consumer keys its slot by `bareMemberOf`.
     | EIfaceCall of string * string * Expr * Expr list
     /// target type, operand, isDowncast (`:?>` checks the class id at
     /// runtime; `:>` is a static widening and checks nothing)
@@ -191,6 +196,14 @@ type Decl =
     /// map (raw scalar excluded, ref traced) instead of the tagged fallback
     /// that chases the raw even int. Never for float/struct stamps (unchanged).
     | DFieldSubst of string * (string * string) list
+
+/// An `EIfaceCall` method name without its instantiation suffix — the SLOT
+/// key. The declaration, the impl clause and the dispatch site spell a
+/// member's type arguments differently, and all three mean one row.
+let bareMemberOf (n : string) : string =
+    match n.IndexOf "$<" with
+    | i when i > 0 -> n.Substring (0, i)
+    | _ -> n
 
 type LowerResult =
     { Decls : Decl list

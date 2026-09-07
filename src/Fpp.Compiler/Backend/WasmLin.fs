@@ -9575,8 +9575,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             let nm = rawScalarNameOfExpr e2
             lowBoxW ctx (scalarKindOf (if nm = "" then "int" else nm)) (coreToLowE ctx e2)
         else coreToLowE ctx e2
-    | EIfaceCall (iface, method, recv, args) ->
+    | EIfaceCall (iface, method0, recv, args) ->
         let bi = bareIfaceOf iface
+        // the name may carry the call's instantiation; the SLOT is the bare one
+        let method = bareMemberOf method0
         let t = freshTmp ctx
         // dispatch through the vtable: the receiver's class-id header indexes a
         // row, the slot the column; the word there is the impl's table index.

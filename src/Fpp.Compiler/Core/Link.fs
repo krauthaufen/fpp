@@ -793,7 +793,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
             mapExpr
                 (fun x ->
                     (match x with
-                     | EIfaceCall (_, mn, _, _) -> dictSet dispatchedNames mn true
+                     | EIfaceCall (_, mn, _, _) -> dictSet dispatchedNames (bareMemberOf mn) true
                      | _ -> ())
                     x)
                 e |> ignore
@@ -1157,6 +1157,10 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                       | None -> EUnknown ("$class:" + cls + ":" + memberName + ":" + tn))
                  | _ -> EUnknown n)
             | ERecord (n, fs) -> ERecord (substName subst n, fs)
+            // the dispatch name carries the call's instantiation, which is
+            // symbolic in the enclosing definition's variables until a stamp
+            // settles them — the same rewrite ERecord and ECast take
+            | EIfaceCall (i, mn, r2, xs) -> EIfaceCall (i, substName subst mn, r2, xs)
             | ECast (t, x, d) -> ECast (substName subst t, x, d)
             | ETypeTest (t, x) -> ETypeTest (substName subst t, x)
             | EMatch (sc, cs) ->

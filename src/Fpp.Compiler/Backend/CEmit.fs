@@ -2400,7 +2400,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
             match iface.IndexOf "`" with
             | i when i > 0 -> iface.Substring (0, i)
             | _ -> iface
-        (match dictTryFind st.VSlot (bare, memberName) with
+        (match dictTryFind st.VSlot (bare, bareMemberOf memberName) with
          | Some vslot ->
              let r = emitE st f recv
              let xs = args |> List.map (emitE st f)

@@ -577,6 +577,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | _ -> ()
         vecToList rows
 
+    /// The dispatch name for an interface/abstract method call: the member
+    /// name, plus the call's INSTANTIATION when inference recorded one.
+    ///
+    /// A row's signature is fixed and `self` carries only the CLASS' type
+    /// arguments, so a member generic BEYOND them (`FoldWith<'s>`) had no
+    /// channel for its own — every such parameter fell back to a witness that
+    /// says "uniform" and knows no type. Inference already instantiates the
+    /// member scheme at each use (`InstSites`, class parameters first), and
+    /// the name is the one part of an `EIfaceCall` that Link substitutes, so
+    /// a still-symbolic argument (`#123`) is rewritten at a stamp like any
+    /// other. Consumers key their slot by `bareMemberOf`.
+    ///
+    /// Recorded only when EVERY argument is named: a "" is inference saying it
+    /// could not name that type, and a partial list has no positions.
+    let ifaceMethodName (t : Token) : string =
+        match dictTryFind instSites t.Offset with
+        | Some inst when not (List.isEmpty inst) && inst |> List.forall (fun i -> i <> "") ->
+            t.Text + "$<" + String.concat "." inst + ">"
+        | _ -> t.Text
+
     let synthCall (base_ : int) (fo : int) (name : string) (recv : Expr) (withUnit : bool) : Expr option =
         let t = { Kind = Ident; Text = name; Leading = []; Trailing = []; Offset = base_ + fo }
         // a TYPECLASS dot-member resolved at the synthetic offset: apply
@@ -594,7 +614,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let args = if withUnit then [ ELit LUnit ] else []
             match dictTryFind ifaces owner with
             | Some ms when ms |> List.exists (fun (m, _) -> m = name) ->
-                Some (EIfaceCall (owner, name, recv, args))
+                Some (EIfaceCall (owner, ifaceMethodName t, recv, args))
             | _ -> Some (EApp (memberFn t d, recv :: args))
 
     /// `dst.[lo..hi]` as an assignment TARGET: the array, the element kind
@@ -3822,6 +3842,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | None -> false) ->
                 let t = Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.last
                 let iface = (dictTryFind memberSites t.Offset).Value
+                let mname = ifaceMethodName t
                 (match nodesOf n |> List.tryHead with
                  | Some lhs ->
                      // a METHOD referenced as a VALUE (`|> x.Apply`) must
@@ -3853,8 +3874,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              List.init arity (fun k ->
                                  { Path = synPath; Offset = t.Offset + 670000 + k; Name = "_eta" + string k })
                          ELam (ps |> List.map (fun v -> v, sch),
-                               EIfaceCall (iface, t.Text, recv, ps |> List.map (fun v -> EVar (v, sch))))
-                     else EIfaceCall (iface, t.Text, lowerExpr (GNode lhs), [])
+                               EIfaceCall (iface, mname, recv, ps |> List.map (fun v -> EVar (v, sch))))
+                     else EIfaceCall (iface, mname, lowerExpr (GNode lhs), [])
                  | None -> note (offsetOf n) "interface call without a receiver")
             | DotExpr when
                 (match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
@@ -4261,7 +4282,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   let args = if withUnit then [ ELit LUnit ] else []
                                   match dictTryFind ifaces owner with
                                   | Some ms when ms |> List.exists (fun (m, _) -> m = t.Text) ->
-                                      Some (EIfaceCall (owner, t.Text, recv, args))
+                                      Some (EIfaceCall (owner, ifaceMethodName t, recv, args))
                                   // a concrete member of a GENERIC class is
                                   // stamped per instantiation like any other
                                   // generic function; the protocol's call has
