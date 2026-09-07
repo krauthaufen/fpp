@@ -4013,6 +4013,10 @@ let rec private scanConsts (st : St) (e : Expr) : unit =
 // return_call skips every pop between here and the epilogue, so the emitter
 // restores $sp wholesale first
 let mutable private tailFnName : string = ""
+/// the KEY of the function being emitted, beside its emitted name. A self-tail
+/// call must be decided on identity, not on a spelling: `fn v` is a name, and a
+/// name is exactly the thing that can be shared by two definitions.
+let mutable private tailFnKey : string = ""
 let mutable private tailFnRet : LTy = W
 let mutable private tailSpReg : int = -1
 
@@ -9393,7 +9397,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // function, so the signature matches by construction. The result
         // needs no re-boxing — it IS this function's result.
         let isSelfTail =
-            fn v = tailFnName && tailFnName <> ""
+            key v = tailFnKey && tailFnKey <> ""
             && (match refMapTryFind st.TailApp e with Some true -> true | _ -> false)
         // a TUPLED member takes its ELEMENTS: a literal tuple argument is
         // spelled out (so the tuple is never built), a tuple VALUE is read
@@ -12744,6 +12748,9 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<st
     // entry $sp is saved (gc) so the transfer can discharge every
     // outstanding shadow-stack push in one restore.
     tailFnName <- (if isInit || not (isNull (System.Environment.GetEnvironmentVariable "FPP_NO_TAILCALL")) then "" else dbgName)
+    // the KEY is set by the caller (it has the VarId); clear it wherever the
+    // name is cleared, so the two never disagree
+    if tailFnName = "" then tailFnKey <- ""
     tailSpReg <- -1
     if tailFnName <> "" then
         markTails st body
@@ -12975,6 +12982,12 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     // ABI is a tagged scalar or a pointer, so the uniform witness is the answer.
     curNoWitnessChannel <- true
     curChannelKind <- "lambda"
+    // A LIFTED LAMBDA IS ITS OWN FUNCTION. Left as the enclosing definition's,
+    // a call to that definition in tail position here emitted `return_call` —
+    // a tail call across functions, which wasm requires to agree on the RESULT
+    // type and these need not. Cleared, so a lambda emits an ordinary call.
+    tailFnName <- ""
+    tailFnKey <- ""
     // a lifted lambda has no scheme of its own: what it can forward is exactly
     // what the enclosing body captured into its env (LamWits), so the enclosing
     // list stays. Cleared rather than left STALE from the last top-level
@@ -15460,6 +15473,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             curFnQuantIds <-
                 (sch.Quantified |> List.map (fun q -> q.Id))
                 @ (sch.Quantified |> List.map prunedId)
+            tailFnKey <- key v
             let ps2, body2 =
                 match dictTryFind st.TupleParam (key v), body with
                 | Some binds, EMatch (_, [ (_, None, inner) ]) -> binds, inner
