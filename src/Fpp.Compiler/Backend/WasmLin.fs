@@ -309,6 +309,9 @@ type private St =
       WitOff : Dict<int, int>
       /// root slots for the two descriptor arrays: tid -> index, and the flat
       /// `[n, off, kind, off, kind, …]` data
+      /// root slot of the type-NAME table: entry i is the root slot holding
+      /// the name string of type id i, so a witness's id resolves to text
+      mutable TyNameSlot : int
       mutable DescIdxSlot : int
       mutable DescDataSlot : int }
 
@@ -457,6 +460,7 @@ let mutable private gcConsRefTid = 0
 let mutable private gcCmpTblSlot = 0
 let mutable private gcCidEqSlot = 0
 let mutable private gcWitOffSlot = 0
+let mutable private gcTyNameSlot = 0
 let mutable private gcDescIdxSlot = 0
 let mutable private gcDescDataSlot = 0
 // identity dispatch ($cmpv/$hashv -> a class' own Equals/GetHashCode/CompareTo):
@@ -8351,6 +8355,21 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // concrete T the layout answers statically; for a type PARAMETER the
     // witness this body was handed carries it, which is the whole point of
     // passing witnesses that say what the type is.
+    // `typeName<T> ()` — the type's NAME. Concrete: the string constant. A type
+    // PARAMETER: the witness carries the type's id, and the id indexes a table
+    // of the root slots the name strings live in — which is what makes a
+    // witness "what it is" rather than "how it is laid out".
+    | EUnknown n when n.StartsWith "$typename:" ->
+        let tn = n.Substring 10
+        if tn.Length > 1 && tn.[0] = '#' then
+            match dictTryFind ctx.Witness (int (tn.Substring 1)) with
+            | Some r ->
+                let tbl = LLoad (W, LGetGlobal "$roots", 4 * gcTyNameSlot)
+                let id = LLoad (W, LGet (wReg r), 16)
+                let slot = LLoad (W, LPrim (AddW, [ tbl; LPrim (MulW, [ id; LConstW 4 ]) ]), 8)
+                LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LPrim (MulW, [ slot; LConstW 4 ]) ]), 0)
+            | None -> LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LConstW (4 * internStrRawGc ctx.LSt "obj") ]), 0)
+        else LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LConstW (4 * internStrRawGc ctx.LSt tn) ]), 0)
     | EUnknown n when n.StartsWith "$sizeof:" ->
         let tn = n.Substring 8
         if tn.Length > 1 && tn.[0] = '#' then
@@ -13518,7 +13537,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
           FuncRetStruct = dictNew (); FuncParamPlan = dictNew (); FuncParamByRef = dictNew (); BrParamPay = brParamPay; TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           FieldOwnerOf = dictNew ()
-          GcConstData = vecNew (); GcCloData = vecNew (); CloSlot = dictNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; CidEqSlot = 0; WitOffSlot = 0; WitOff = dictNew (); DescIdxSlot = 0; DescDataSlot = 0 }
+          GcConstData = vecNew (); GcCloData = vecNew (); CloSlot = dictNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; CidEqSlot = 0; WitOffSlot = 0; WitOff = dictNew (); TyNameSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -14362,6 +14381,9 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         st.WitOffSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
         gcWitOffSlot <- st.WitOffSlot
+        st.TyNameSlot <- st.RootNext
+        st.RootNext <- st.RootNext + 1
+        gcTyNameSlot <- st.TyNameSlot
         st.DescIdxSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
         st.DescDataSlot <- st.RootNext
@@ -15008,6 +15030,17 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             gg rf "$witnesses"; ic rf (off + 8); ins rf "i32.add"; ic rf refMask; mem rf "i32.store"
             gg rf "$witnesses"; ic rf (off + 12); ins rf "i32.add"; ic rf cmpKind; mem rf "i32.store"
             gg rf "$witnesses"; ic rf (off + 16); ins rf "i32.add"; ic rf tyId; mem rf "i32.store"
+        // the type-NAME table: entry i is the ROOT SLOT of type id i's name
+        // string. Indirecting through a root slot rather than storing the
+        // pointer keeps the table a plain int array — the strings themselves
+        // are already rooted, so a moving collection updates them there.
+        (let names = dictPairs st.TypeIds
+         let maxId = names |> List.fold (fun a (_, i) -> if i > a then i else a) 0
+         ic rf gcIntTid; ic rf (maxId + 1); callf rf "$fpallocn"; ls rf "$t"
+         gg rf "$roots"; ic rf (4 * st.TyNameSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
+         for nm, i in names do
+             let sl = internStrRawGc st nm
+             lg rf "$t"; ic rf (8 + 4 * i); ins rf "i32.add"; ic rf sl; mem rf "i32.store")
         // the tid->cid table is a FIXED static array in fpprt-wasm-shim.c
         // (FPPRT_WASM_NTIDS). Writing past it corrupts the static memory that
         // follows AND leaves those shapes reading class-id 0, so a dispatch on

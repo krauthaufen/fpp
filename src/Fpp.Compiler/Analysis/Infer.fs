@@ -3827,6 +3827,28 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    | _ -> false)
                               | _ -> false)
                          | _ -> false
+                     // `typeName<'T> ()` — the NAME of a type, which the
+                     // witness now carries as an id. Mirrors sizeof: the
+                     // written argument's instantiation name rides to
+                     // lowering, and monomorphization resolves it per stamp.
+                     // Unlike sizeof it constrains nothing — every type has a
+                     // name, managed or not.
+                     let tynameMark =
+                         match head.NodeKind with
+                         | IdentExpr when
+                               (tokensOf head |> List.tryHead |> Option.map (fun t -> t.Text)) = Some "typeName"
+                               && (tokensOf head |> List.tryHead |> Option.map (fun t -> (dictTryFind useDefs t.Offset).IsNone)) = Some true ->
+                             (match tokensOf head |> List.tryHead,
+                                    args |> List.tryFind (fun m -> m.NodeKind = TyParams) with
+                              | Some ht, Some tp ->
+                                  (match nodesOf tp |> List.filter (fun x -> isTypeKind x.NodeKind) with
+                                   | [ ta ] ->
+                                       vecAdd fieldOwnersRaw (ht.Offset, "$typename:" + instName (typeFromNode tyScope ta))
+                                       true
+                                   | _ -> false)
+                              | _ -> false)
+                         | _ -> false
+                     if tynameMark then TCon ("string", []) else
                      if sizeofMark then tInt else
                      // `nameof x` is the SOURCE NAME, decided here and never
                      // evaluated — the argument is not typed, so `nameof` of

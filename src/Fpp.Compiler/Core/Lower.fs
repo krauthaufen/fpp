@@ -1772,6 +1772,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              (match dictTryFind fieldOwners ht.Offset with
                               | Some m when m.StartsWith "$sizeof:" -> Some m
                               | _ -> None)
+                         | Some ht when ht.Text = "typeName" ->
+                             (match dictTryFind fieldOwners ht.Offset with
+                              | Some m when m.StartsWith "$typename:" -> Some m
+                              | _ -> None)
                          | _ -> None
                      // `invalidArg`/`nullArg` carry .NET's message SHAPE —
                      // the parameter name in parentheses after the text. The
