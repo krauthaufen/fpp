@@ -4329,30 +4329,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    // came back as a pointer made of a double's
                                    // bits. `ResizeArray` of any struct faulted
                                    // on the first read.
+                                   //
+                                   // RECORDED FOR EVERY GENERIC CONSTRUCTION.
+                                   // It used to be withheld unless the class was
+                                   // declared in this file or the instantiation
+                                   // carried a struct, because demanding one for
+                                   // all of them "asked for stamps nothing can
+                                   // supply and the adaptive suite trapped".
+                                   // That reason is gone (capInst forces a stamp
+                                   // ground, and a template no longer keeps names
+                                   // its owner cannot bind), and the cost of
+                                   // withholding it is real: the instantiation is
+                                   // also what a call passes WITNESSES by, so
+                                   // `Dictionary ()` and `ChangeableValue x`
+                                   // handed their constructor a witness that
+                                   // knows no type. Re-checked against the port
+                                   // and the full gate suite.
                                    (match prune res with
-                                    | TCon (_, ras) when
-                                        not (List.isEmpty ras)
-                                        && ((dictTryFind explicitCtorTypes ht.Text).IsSome
-                                            // ... or the instantiation carries a
-                                            // STRUCT, whatever file declared the
-                                            // class. That is the case where the
-                                            // canonical constructor is not merely
-                                            // slower but WRONG: it builds the
-                                            // backing storage at the uniform
-                                            // element type while the members —
-                                            // which do stamp — read it packed.
-                                            // `ResizeArray<V>` faulted on its
-                                            // first read, a `V` coming back as a
-                                            // pointer made of a double's bits.
-                                            //
-                                            // Demanding one for EVERY generic
-                                            // construction is too much: it asks
-                                            // for stamps nothing can supply and
-                                            // the adaptive suite trapped.
-                                            || ras |> List.exists (fun t ->
-                                                   match prune t with
-                                                   | TCon (n, _) -> (dictTryFind structTypes n) = Some true
-                                                   | _ -> false)) ->
+                                    | TCon (_, ras) when not (List.isEmpty ras) ->
                                         vecAdd instRaw (ht.Offset, ras)
                                     | _ -> ())
                                    // widen per argument, not on the tuple
