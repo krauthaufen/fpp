@@ -225,6 +225,12 @@ let mutable private builderAt : int -> CeBuilder = fun _ -> unknownBuilder "?"
 /// does not.
 let mutable private statementAt : int -> bool = fun _ -> false
 
+/// Body items the probe typed and found to HAVE a value. The complement of
+/// `statementAt` only where the probe RAN: an item it never typed — a branch
+/// body, a loop body — answers false to both, and the mixed-yield rule below
+/// needs the difference (see item1).
+let mutable private valueAt : int -> bool = fun _ -> false
+
 let rec private walk (g : Green) : Green =
     match g with
     | GToken _ -> g
@@ -661,6 +667,18 @@ and private item1 (b : CeBuilder) (explicit : bool) (item : GreenNode) (rest : G
                     | _ -> false))
         if isRange then combine (call b "YieldFrom" [ walk (GNode item) ])
         else combine (call b "Yield" [ walk (GNode item) ])
+    // A VALUE beside an explicit `yield`. F# reads it as a statement and
+    // DISCARDS it (warning FS0020), so `div { "bare"; yield "x" }` silently
+    // loses "bare" — this compiler has no warnings, and losing a value the
+    // author wrote is exactly the shape it refuses to ship. A DIVERGENCE,
+    // deliberately: fsc accepts the program. It cost fpp.dom the most
+    // debugging time of its milestone, twice (~/claude/fpp-base-snags.md #51),
+    // and it is the historic wombat.dom scar repeating.
+    | _ when explicit && valueAt (offsetOf item) ->
+        vecAdd ceDiags
+            (offsetOf item,
+             "a computation expression may not mix implicit and explicit yields: this value would be discarded — write `yield` before it")
+        combine (call b "Yield" [ walk (GNode item) ])
     | _ when List.isEmpty rest -> Green.node BlockExpr [ walk (GNode item); call b "Zero" [] ]
     | _ -> sequential ()
 
@@ -933,22 +951,30 @@ let private rewriteLock = vecNew<int> ()
 /// function rather than in the lock's lambda because assigning to a
 /// module-level mutable from inside a closure is not something this compiler
 /// can compile itself.
-let private rewriteUnlocked (lookup : int -> CeBuilder) (isStatement : int -> bool) (root : GreenNode) : GreenNode =
+let private rewriteUnlocked (lookup : int -> CeBuilder) (isStatement : int -> bool) (isValue : int -> bool) (root : GreenNode) : GreenNode =
     counter <- synthBase
     builderAt <- lookup
     statementAt <- isStatement
+    valueAt <- isValue
     let r =
         match walk (GNode root) with
         | GNode n -> n
         | _ -> root
     builderAt <- (fun _ -> unknownBuilder "?")
     statementAt <- (fun _ -> false)
+    valueAt <- (fun _ -> false)
+    // FPP_CE_DUMP=1 prints what a computation expression became. The rewrite
+    // is where a CE's meaning is decided, and a wrong tree here reads as a
+    // type error at a synthetic offset or as a silently empty result — the
+    // text is the only place the shape is legible.
+    if System.Environment.GetEnvironmentVariable "FPP_CE_DUMP" = "1" then
+        eprintfn "CEDUMP %s" (Green.toText (GNode r))
     r
 
 /// Answers the rewritten tree AND what the builders could not supply. The
 /// diagnostics are drained under the SAME lock the rewrite holds — they are
 /// module state for the same reason the offset counter is.
-let desugarWithDiags (lookup : int -> CeBuilder) (isStatement : int -> bool) (root : GreenNode) : GreenNode * (int * string) list =
+let desugarWithDiags (lookup : int -> CeBuilder) (isStatement : int -> bool) (isValue : int -> bool) (root : GreenNode) : GreenNode * (int * string) list =
     // The offset counter and the probe's answers are module state — every
     // constructor above reads them, and threading them through forty call
     // sites would say nothing this does not. It has to BE a lock: two
@@ -956,11 +982,11 @@ let desugarWithDiags (lookup : int -> CeBuilder) (isStatement : int -> bool) (ro
     // symptom was a `BindReturn` that fused in one run and not the next.
     lock rewriteLock (fun () ->
         vecClear ceDiags
-        let tree = rewriteUnlocked lookup isStatement root
+        let tree = rewriteUnlocked lookup isStatement isValue root
         tree, vecToList ceDiags)
 
-let desugarWithStatements (lookup : int -> CeBuilder) (isStatement : int -> bool) (root : GreenNode) : GreenNode =
-    fst (desugarWithDiags lookup isStatement root)
+let desugarWithStatements (lookup : int -> CeBuilder) (isStatement : int -> bool) (isValue : int -> bool) (root : GreenNode) : GreenNode =
+    fst (desugarWithDiags lookup isStatement isValue root)
 
 /// Is there anything here for the rewrite to do? Files without a computation
 /// expression — which is nearly all of them, the compiler's own sources and
@@ -983,12 +1009,12 @@ let rec hasComp (g : Green) : bool =
         || List.exists hasComp n.Children
 
 let desugarWith (lookup : int -> CeBuilder) (root : GreenNode) : GreenNode =
-    desugarWithStatements lookup (fun _ -> false) root
+    desugarWithStatements lookup (fun _ -> false) (fun _ -> false) root
 
 /// The rewrite with no probe behind it: a lone file, or one whose builder
 /// could not be typed.
 let desugar (root : GreenNode) : GreenNode =
-    desugarWithStatements (fun _ -> unknownBuilder "?") (fun _ -> false) root
+    desugarWithStatements (fun _ -> unknownBuilder "?") (fun _ -> false) (fun _ -> false) root
 
 /// Does the tree contain a `lazy` keyword at all? Cheap gate for the
 /// rewrite below, mirroring hasComp.

@@ -842,7 +842,8 @@ let private encInferResult (r : Infer.InferResult) : Sx =
         L [ A "fieldowners"; eIS r.FieldOwners ]
         L [ A "compbuilders"; eIS r.CompBuilders ]
         L [ A "customops"; L (r.CustomOps |> List.map (fun (a, b, c) -> L [ S a; S b; S c ])) ]
-        L [ A "compstatements"; L (r.CompStatements |> List.map aI) ] ]
+        L [ A "compstatements"; L (r.CompStatements |> List.map aI) ]
+        L [ A "compvalues"; L (r.CompValues |> List.map aI) ] ]
 
 let private decInferResult (x : Sx) : Infer.InferResult =
     let xs = dL x
@@ -880,7 +881,8 @@ let private decInferResult (x : Sx) : Infer.InferResult =
       FieldOwners = dIS (field "fieldowners" xs)
       CompBuilders = dIS (field "compbuilders" xs)
       CustomOps = dL (field "customops" xs) |> List.choose (fun x -> match x with L [ S a; S b; S c ] -> Some (a, b, c) | _ -> None)
-      CompStatements = dL (field "compstatements" xs) |> List.map dI }
+      CompStatements = dL (field "compstatements" xs) |> List.map dI
+      CompValues = dL (field "compvalues" xs) |> List.map dI }
 
 let private encBindResult (b : Resolve.BindResult) : Sx =
     L [ L [ A "defs"; L (b.Definitions |> List.map encDefP) ]

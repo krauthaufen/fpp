@@ -755,7 +755,10 @@ type Workspace() =
                         let stmts = dictNew<int, bool> ()
                         for off in inf0.CompStatements do dictSet stmts off true
                         let isStatement (off : int) = (dictTryFind stmts off).IsSome
-                        let rewritten, ceDiags = Desugar.desugarWithDiags lookup isStatement raw.Root
+                        let vals = dictNew<int, bool> ()
+                        for off in inf0.CompValues do dictSet vals off true
+                        let isValue (off : int) = (dictTryFind vals off).IsSome
+                        let rewritten, ceDiags = Desugar.desugarWithDiags lookup isStatement isValue raw.Root
                         (if not (List.isEmpty ceDiags) then
                             let v = vecNew<int * string> ()
                             for d in ceDiags do vecAdd v d

@@ -726,6 +726,31 @@ members) is exactly the world it is for. `[<Struct>]` records refuse
 optional fields (an option is a reference). Sources using `?fields` are NOT
 compilable by fsc — keep them out of dual-compiled files.
 
+## Mixing implicit and explicit yields in a CE is an ERROR
+
+F#: `b { 1; yield 2 }` compiles with warning FS0020 — a body that names a
+value anywhere reads its other bare expressions as STATEMENTS, so the `1`
+is evaluated and discarded.
+F++: it is an error (`a computation expression may not mix implicit and
+explicit yields`).
+
+**Reason.** The two compilers agree on the meaning; they disagree about
+whether it is worth saying out loud, and this one has no warnings to say
+it with. A value the author wrote disappearing from the result with
+nothing reported is the failure this repo refuses to ship — and it is not
+hypothetical: it folded fpp.dom's scene CE to an empty Shader, and cost
+that milestone more debugging than anything else in it. The same shape
+had already cost the wombat.dom port once.
+
+A bare expression that is a STATEMENT (unit-valued — `printfn`, an
+assignment) is unaffected: it is a statement in both readings, and CE
+bodies are full of them.
+
+The negative-conformance case
+`tests/conformance/neg/ce-implicit-explicit-yield-mix.fpp` asserts our
+behaviour directly (`//? fsc-accepts` excludes it from the fsi oracle
+run, per rule 1 above).
+
 ## An unknown uppercase pattern identifier is an ERROR
 
 F#: `| C -> ...` where no case `C` exists compiles with warning FS0049 —
