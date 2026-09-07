@@ -9232,10 +9232,22 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 match e with
                 | EVar (_, s) | EVarI (_, s, _) -> Some (prune s.Body)
                 | ECast (tn, _, _) -> Some (TCon (layStripGen tn, []))
+                | ELit (LInt _) -> Some (TCon ("int", []))
+                | ELit (LFloat _) -> Some (TCon ("float", []))
+                | ELit (LString _) -> Some (TCon ("string", []))
+                | ELit (LBool _) -> Some (TCon ("bool", []))
+                | ELit (LChar _) -> Some (TCon ("char", []))
                 | EApp ((EVar (_, s) | EVarI (_, s, _)), ar) ->
                     let rec pl t k = if k <= 0 then Some (prune t) else (match prune t with TFun (_, r) -> pl r (k - 1) | _ -> None)
                     pl s.Body (List.length ar)
                 | ELet (_, _, _, _, b2) -> argTy b2
+                | ESeq xs -> (match List.tryLast xs with Some x -> argTy x | None -> None)
+                | EIf (_, a2, b2) -> (match argTy a2 with Some t -> Some t | None -> argTy b2)
+                | EMatch (_, cs) -> cs |> List.tryPick (fun (_, _, b2) -> argTy b2)
+                | ERecord (n, _) | ERecordExt (n, _, _) -> Some (TCon (layStripGen n, []))
+                | ECtor (_, s, _) ->
+                    let rec res t = match prune t with TFun (_, r) -> res r | r -> r
+                    Some (res s.Body)
                 | _ -> None
             // where does the variable sit inside the parameter's type, and what
             // does the argument have there? Positional through matching heads —
@@ -9261,7 +9273,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             List.zip (List.truncate n ptys) (List.truncate n argEs)
             |> List.tryPick (fun (pt, ae) ->
                 match prune pt with
-                | TVar pv when isTheVar pv -> slotWitness ctx ae
+                | TVar pv when isTheVar pv ->
+                    (match slotWitness ctx ae with
+                     | Some w -> Some w
+                     | None -> (match argTy ae with Some at -> ofFound at | None -> None))
                 | _ ->
                     match argTy ae with
                     | Some at -> (match locate pt at with Some found -> ofFound found | None -> None)
@@ -9292,7 +9307,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                              | None ->
                                  match witFromArgs vid pid with
                                  | Some w -> w
-                                 | None -> uniformWitnessWhy st (if List.isEmpty inst then "call-unnamed" else "call-freevar")))
+                                 | None -> uniformWitnessWhy st ((if List.isEmpty inst then "call-unnamed" else "call-freevar") + ":" + v.Name)))
             | None ->
                 // a SLOT-witness member called DIRECTLY (its concrete type was
                 // known here, so no dispatch): the hidden params are the
