@@ -9228,10 +9228,25 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              // so there is nothing to spill and nothing to reload: the
              // callee aliases the local's own slot. Exact aliasing, for
              // free.
+             //
+             // The STANDALONE module has no collector and therefore no root
+             // table: there is nothing to trace and no global to trace it
+             // with, so the reference rides the raw `$ssp` scratch stack the
+             // word payload uses. Reaching for `$roots` there emitted a
+             // global the module never declares, and every program with a
+             // byref of a reference died in the binary emitter
+             // (~/claude/fpp-base-snags.md #43).
              (match dictTryFind ctx.Slotted (key tv) with
               | Some slotAddr -> LPrim (AddW, [ slotAddr; LConstW 1 ])
               | None ->
              match dictTryFind ctx.Regs (key tv) with
+              | Some tvReg when not gc ->
+                  let slot = freshTmp ctx
+                  ctx.BrPost <-
+                      ctx.BrPost
+                      @ [ LSet (wReg tvReg, LLoad (W, LGet (wReg slot), 0)); release 8 ]
+                  LDo (reserve 8 slot @ [ LStore (W, LGet (wReg slot), 0, LGet (wReg tvReg)) ],
+                       taggedOf slot)
               | Some tvReg ->
                   let slot = freshTmp ctx
                   ctx.BrPost <-
@@ -12612,6 +12627,43 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | EIfaceCall (_, _, r, xs) -> preRecGroups ctx r; List.iter (preRecGroups ctx) xs
     | _ -> ()
 
+/// A LowIR body as text — the debug view behind FPP_TREE_DUMP. Registers are
+/// `g<id>`, a set is `s<id>=`, so a tree that names a register nothing binds
+/// (or a global the module never declares) is legible at a glance.
+let rec dumpLowE (e : LExpr) : string =
+    match e with
+    | LConstW n -> "w" + string n
+    | LConstL _ -> "l"
+    | LConstF _ -> "f"
+    | LGet r -> "g" + string r.Id
+    | LGetGlobal n -> "G(" + n + ")"
+    | LLoad (_, a, o) -> "ld[" + dumpLowE a + "+" + string o + "]"
+    | LPrim (_, xs) -> "p(" + String.concat " " (List.map dumpLowE xs) + ")"
+    | LCall (n, xs) -> "c:" + n + "(" + String.concat " " (List.map dumpLowE xs) + ")"
+    | LTailCall (n, xs) -> "tc:" + n + "(" + String.concat " " (List.map dumpLowE xs) + ")"
+    | LAlloc a -> "al(" + dumpLowE a + ")"
+    | LCallIndirect (_, a, xs) -> "ci(" + dumpLowE a + ";" + String.concat " " (List.map dumpLowE xs) + ")"
+    | LCallIdx (i, a, xs) -> "cx" + string i + "(" + dumpLowE a + ";" + String.concat " " (List.map dumpLowE xs) + ")"
+    | LDo (ss, e2) -> "do{" + String.concat "; " (List.map dumpS ss) + "}" + dumpLowE e2
+and dumpS (st2 : LStmt) : string =
+    match st2 with
+    | LStore (_, a, o, b) -> "st[" + dumpLowE a + "+" + string o + "]=" + dumpLowE b
+    | LMemFill (d, v, n) -> "fill[" + dumpLowE d + "]=" + dumpLowE v + "*" + dumpLowE n
+    | LSet (r, e2) -> "s" + string r.Id + "=" + dumpLowE e2
+    | LSetMany (rs, e2) -> "sm[" + String.concat "," (rs |> List.map (fun r -> string r.Id)) + "]=" + dumpLowE e2
+    | LSetGlobal (n, e2) -> "SG(" + n + ")=" + dumpLowE e2
+    | LEval e2 -> "ev " + dumpLowE e2
+    | LCallVoidS (n, xs) -> "cv:" + n + "(" + String.concat " " (List.map dumpLowE xs) + ")"
+    | LIf (c, a, b) -> "if(" + dumpLowE c + "){" + String.concat "; " (List.map dumpS a) + "}{" + String.concat "; " (List.map dumpS b) + "}"
+    | LWhile (c, b) -> "wh(" + dumpLowE c + "){" + String.concat "; " (List.map dumpS b) + "}"
+    | LBlock (n, b) -> "bl:" + n + "{" + String.concat "; " (List.map dumpS b) + "}"
+    | LBreakIf (n, e2) -> "bi:" + n + "(" + dumpLowE e2 + ")"
+    | LBreak n -> "br:" + n
+    | LTrap -> "trap"
+    | LReturn e2 -> "ret " + dumpLowE e2
+    | LThrow e2 -> "th " + dumpLowE e2
+    | LTryStmt (b, r1, r2, hs) -> "try{" + dumpLowE b + "}r" + string r1.Id + ",r" + string r2.Id + "{" + String.concat "; " (List.map dumpS hs) + "}"
+
 let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<string, string>) (isInit : bool) (sig_ : (LTy list * LTy) option) (structPlan : string option list) (byrefPlan : bool list) (retStruct : string option) (witnessVars : (int * int) list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
     curFnDbg <- dbgName
     (if System.Environment.GetEnvironmentVariable "FPP_FNWIT" = dbgName then
@@ -12962,48 +13014,15 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<st
         | LBreak _ | LTrap -> ()
         | LTryStmt (b, r1, r2, hs) -> seeE b; seeR r1; seeR r2; for x in hs do seeS x
     seeE bodyLow
-    let rec dumpE (e : LExpr) : string =
-        match e with
-        | LConstW n -> "w" + string n
-        | LConstL _ -> "l"
-        | LConstF _ -> "f"
-        | LGet r -> "g" + string r.Id
-        | LGetGlobal n -> "G(" + n + ")"
-        | LLoad (_, a, o) -> "ld[" + dumpE a + "+" + string o + "]"
-        | LPrim (_, xs) -> "p(" + String.concat " " (List.map dumpE xs) + ")"
-        | LCall (n, xs) -> "c:" + n + "(" + String.concat " " (List.map dumpE xs) + ")"
-        | LTailCall (n, xs) -> "tc:" + n + "(" + String.concat " " (List.map dumpE xs) + ")"
-        | LAlloc a -> "al(" + dumpE a + ")"
-        | LCallIndirect (_, a, xs) -> "ci(" + dumpE a + ";" + String.concat " " (List.map dumpE xs) + ")"
-        | LCallIdx (i, a, xs) -> "cx" + string i + "(" + dumpE a + ";" + String.concat " " (List.map dumpE xs) + ")"
-        | LDo (ss, e2) -> "do{" + String.concat "; " (List.map dumpS ss) + "}" + dumpE e2
-    and dumpS (st2 : LStmt) : string =
-        match st2 with
-        | LStore (_, a, o, b) -> "st[" + dumpE a + "+" + string o + "]=" + dumpE b
-        | LMemFill (d, v, n) -> "fill[" + dumpE d + "]=" + dumpE v + "*" + dumpE n
-        | LSet (r, e2) -> "s" + string r.Id + "=" + dumpE e2
-        | LSetMany (rs, e2) -> "sm[" + String.concat "," (rs |> List.map (fun r -> string r.Id)) + "]=" + dumpE e2
-        | LSetGlobal (n, e2) -> "SG(" + n + ")=" + dumpE e2
-        | LEval e2 -> "ev " + dumpE e2
-        | LCallVoidS (n, xs) -> "cv:" + n + "(" + String.concat " " (List.map dumpE xs) + ")"
-        | LIf (c, a, b) -> "if(" + dumpE c + "){" + String.concat "; " (List.map dumpS a) + "}{" + String.concat "; " (List.map dumpS b) + "}"
-        | LWhile (c, b) -> "wh(" + dumpE c + "){" + String.concat "; " (List.map dumpS b) + "}"
-        | LBlock (n, b) -> "bl:" + n + "{" + String.concat "; " (List.map dumpS b) + "}"
-        | LBreakIf (n, e2) -> "bi:" + n + "(" + dumpE e2 + ")"
-        | LBreak n -> "br:" + n
-        | LTrap -> "trap"
-        | LReturn e2 -> "ret " + dumpE e2
-        | LThrow e2 -> "th " + dumpE e2
-        | LTryStmt (b, r1, r2, hs) -> "try{" + dumpE b + "}r" + string r1.Id + ",r" + string r2.Id + "{" + String.concat "; " (List.map dumpS hs) + "}"
     if maxReg >= ctx.NReg then
         // corrupt-at-build sanity: a register the lowering never allocated
         // in this function's tree means state corruption (the self-host GC
         // staleness class) — fail LOUDLY, never emit a bad module
         err st ("lowered tree of " + dbgName + " names register " + string maxReg
                 + " of " + string ctx.NReg + " — corrupt lowering state; tree: "
-                + (let d = dumpE bodyLow in if d.Length > 2000 then d.Substring (0, 2000) else d))
+                + (let d = dumpLowE bodyLow in if d.Length > 2000 then d.Substring (0, 2000) else d))
     if System.Environment.GetEnvironmentVariable "FPP_TREE_DUMP" = dbgName then
-        eprintfn "TREE %s %s" dbgName (dumpE bodyLow)
+        eprintfn "TREE %s %s" dbgName (dumpLowE bodyLow)
     st.GapSink <- None
     let f = beginFn m pnames
     if vecLen sink > 0 then
@@ -13015,10 +13034,22 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (brPays : Dict<st
         let e0 = vecGet sink 0
         if not (isNull (System.Environment.GetEnvironmentVariable "FPP_GAP_DUMP")) then
             eprintfn "GAP %s (%s)" dbgName e0
+        // NAME THE SOURCE, not just the emitted symbol. `$g1450715935` is a
+        // hash of the definition's key and does not even correlate between a
+        // strict and a non-strict build, so a stub line whose message carried
+        // no path of its own was unattributable — and a gate filtering stubs
+        // by path let those through as false green (~/claude/fpp-base-snags.md
+        // #52). `keyOfName` already holds "<prefix><path>:<offset>".
+        let where =
+            match dictTryFind keyOfName dbgName with
+            | Some k ->
+                let i = k.IndexOf ':'
+                if i > 0 then " at " + (if k.StartsWith "$" then k.Substring 2 else k) else ""
+            | None -> ""
         if not (e0.Contains "$class:" && e0.Contains "#") then
-            vecAdd st.Warnings ("stubbed " + dbgName + " (" + e0 + ")")
+            vecAdd st.Warnings ("stubbed " + dbgName + where + " (" + e0 + ")")
         else
-            vecAdd st.Warnings ("quietstub " + dbgName + " (" + e0 + ")")
+            vecAdd st.Warnings ("quietstub " + dbgName + where + " (" + e0 + ")")
         localsDone f
         // a stubbed INIT (a .NET-only top-level `let`, e.g. an Encoding object)
         // must NOT trap: _start runs every init at startup, so store a harmless
@@ -13182,6 +13213,9 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
             LDo (pushes @ condPush @ [ LSet (wReg resReg, bodyLow0) ] @ condPop @ pop, LGet (wReg resReg))
     let bodyLow = if List.isEmpty witLoads then bodyLow else LDo (witLoads, bodyLow)
     let bodyLow = if gc then stripLeafRoots bodyLow else bodyLow
+    // the same view emitFuncLow offers, for a LIFTED lambda: FPP_TREE_DUMP=<lam>
+    if System.Environment.GetEnvironmentVariable "FPP_TREE_DUMP" = lamName then
+        eprintfn "TREE %s %s" lamName (dumpLowE bodyLow)
     let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]
     if vecLen sink > 0 then
         if not (isNull (System.Environment.GetEnvironmentVariable "FPP_GAP_DUMP")) then

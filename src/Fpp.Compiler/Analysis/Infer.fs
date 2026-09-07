@@ -1113,10 +1113,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              |> List.mapi (fun i x -> i, x)
                              |> List.filter (fun (i, x) ->
                                  i >= firstOpt
+                                 // WRAP where the option does not fit the
+                                 // written value but its INNER type does —
+                                 // `?flag : bool` given `true`. The test was
+                                 // NEGATED here (and only here; the two
+                                 // fills beside it have it right), so with
+                                 // more than one optional declared — the
+                                 // only shape that reaches this path — a
+                                 // positional optional was left unwrapped
+                                 // and the call failed to type: "Option<bool>
+                                 // vs bool" (~/claude/fpp-base-snags.md #50).
                                  && (match prune (List.item i ps) with
                                      | TCon ("Option", [ inner ]) ->
-                                         not ((Types.unifyTrial false (List.item i ps) x).IsSome
-                                              && (Types.unifyTrial false inner x).IsNone)
+                                         (Types.unifyTrial false (List.item i ps) x).IsSome
+                                         && (Types.unifyTrial false inner x).IsNone
                                      | _ -> false))
                              |> List.map fst
                          let filled =
@@ -1126,6 +1136,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          vecAdd fieldOwnersRaw
                              (ao, "$optargs:" + string (need - have) + ":"
                                   + String.concat "," (List.map (fun i -> string i) wraps))
+                         // FPP_OPTARG_DBG=1 shows what an omitted optional
+                         // filled to, and which written arguments were
+                         // WRAPPED — the two decisions this path makes
+                         (if not (isNull (System.Environment.GetEnvironmentVariable "FPP_OPTARG_DBG")) then
+                             eprintfn "OPTFILL ao=%d have=%d need=%d wraps=%s -> %s" ao have need
+                                 (String.concat "," (List.map string wraps))
+                                 (typeString (TFun (TTuple (filled @ List.skip have ps), dRes))))
                          TFun (TTuple (filled @ List.skip have ps), dRes)
                      else result
                  | _ -> result)

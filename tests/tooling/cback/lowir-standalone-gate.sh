@@ -39,6 +39,14 @@ let r4 = printfn "%d" (List.sum (List.map (fun x -> x * 2) [ 1; 2; 3 ]))
 // the witness recovery was emitted
 let r5 = printfn "%d" (Seq.length (Seq.filter (fun x -> x % 2 = 0) (Seq.ofList [ 1; 2; 3; 4 ])))
 let r6 = printfn "%s" (nameOf 1.5)
+// a BYREF whose payload is a REFERENCE: under GC its spill slot lives on the
+// scanned shadow stack, which is the other thing this module does not have
+let appendTo (s : byref<string>) (extra : string) : unit = s <- s + extra
+let r7 =
+    let mutable acc = "a"
+    appendTo (&acc) "b"
+    appendTo (&acc) "c"
+    printfn "%s" acc
 FPP
 
 "$fpp" build --lowir -o "$out/low.wasm" "$out/p.fpp"
@@ -54,6 +62,7 @@ int
 12
 2
 float
+abc
 EXP
 if diff -u "$out/want.txt" "$out/low.txt"; then
     echo "LOWIR-STANDALONE OK (generic class + typeName + seq, no root table)"

@@ -85,4 +85,15 @@ let h (n : int) : Node =
 eq "nested-ce-in-a-match-arm" (render (h 0)) "div[span[zero[]]]"
 eq "and-the-other-arm" (render (h 5)) "div[span[other[]]]"
 
+// a nested CE bound to a `let` INSIDE another CE, with statements after it:
+// the following statements must stay the OUTER builder's (fpp.dom had to
+// hoist its teapot helper out for this one)
+let i =
+    div {
+        let inner = span { "L" }
+        inner
+        "after"
+    }
+eq "let-bound-nested-ce-then-items" (render i) "div[span[L[]],after[]]"
+
 printfn "DONE tests=%d failures=%d" ntests failures
