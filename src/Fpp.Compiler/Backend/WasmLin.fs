@@ -998,8 +998,41 @@ let rec private tyVarIdOfExpr (e : Expr) : int option =
 let private cellOff () : int = if gc then HDR else 0
 
 let private key (v : VarId) : string = v.Path + ":" + string v.Offset
-let private fn (v : VarId) : string = "$f" + string (abs (strHash (key v)))
-let private gl (v : VarId) : string = "$g" + string (abs (strHash (key v)))
+
+// AN EMITTED NAME IS A 32-BIT HASH OF THE KEY, AND TWO KEYS CAN COLLIDE.
+// `abs (strHash …)` over ~18000 functions is a birthday problem with a real
+// probability (~7% at that count), and it landed: two distinct functions came
+// out as `$f348013614`, so the second's declaration overwrote the first's type
+// and a call went to a body with another signature. wasm-tools said "func 8556
+// failed to validate: type mismatch: expected f64, found i64" and nothing in
+// the compiler said anything at all.
+//
+// The name is now UNIQUE by construction: the first key to claim a spelling
+// keeps it, and a colliding key takes the next free suffix. Deterministic —
+// the claim order is the emission order, which is a function of the input, so
+// the self-host fixpoint still reproduces byte for byte.
+let mutable private nameOfKey : Dict<string, string> = dictNew<string, string> ()
+let mutable private keyOfName : Dict<string, string> = dictNew<string, string> ()
+let private uniqueName (prefix : string) (k : string) : string =
+    match dictTryFind nameOfKey (prefix + k) with
+    | Some n -> n
+    | None ->
+        let bare = prefix + string (abs (strHash k))
+        let mutable cand = bare
+        let mutable i = 0
+        while (match dictTryFind keyOfName cand with
+               | Some owner -> owner <> prefix + k
+               | None -> false) do
+            i <- i + 1
+            cand <- bare + "_" + string i
+        dictSet keyOfName cand (prefix + k)
+        dictSet nameOfKey (prefix + k) cand
+        cand
+let private resetNameTables () : unit =
+    nameOfKey <- dictNew<string, string> ()
+    keyOfName <- dictNew<string, string> ()
+let private fn (v : VarId) : string = uniqueName "$f" (key v)
+let private gl (v : VarId) : string = uniqueName "$g" (key v)
 
 let private err (st : St) (m : string) : unit =
     match st.GapSink with
@@ -6670,7 +6703,7 @@ let private globalStructPath (st : St) (e : Expr) : (string * string * string) o
         | _ -> None
     match walk e with
     | Some (v, path) when (dictTryFind st.Globals (key v)).IsSome ->
-        let g = "$g" + string (abs (strHash (key v)))
+        let g = uniqueName "$g" (key v)
         (match dictTryFind globalStructTy g with
          | Some tn ->
              (match structAbiOf st tn with
@@ -7841,13 +7874,13 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // reaches the arm that copies the nested leaves out.
     | EField (EVar (v, _), fname, _) when
             (dictTryFind ctx.LSt.Globals (key v)).IsSome
-            && (match dictTryFind globalStructTy ("$g" + string (abs (strHash (key v)))) with
+            && (match dictTryFind globalStructTy (uniqueName "$g" (key v)) with
                 | Some tn ->
                     (match structAbiOf st tn with
                      | Some ls -> ls |> List.exists (fun (fn2, _, _, _) -> fn2 = fname)
                      | None -> false)
                 | None -> false) ->
-        let g = "$g" + string (abs (strHash (key v)))
+        let g = uniqueName "$g" (key v)
         let tn = optGet (dictTryFind globalStructTy g)
         (match optGet (structAbiOf st tn) |> List.tryPick (fun (fn2, _, vty, kind) -> if fn2 = fname then Some (vty, kind) else None) with
          | Some (vty, kind) -> storBox ctx kind (LGetGlobal (g + "$" + fname))
@@ -8004,8 +8037,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // writing a FIELD of a by-value struct GLOBAL writes that field's global
     | EFieldSet (EVar (sv, _), fname, _, value) when
             (dictTryFind ctx.LSt.Globals (key sv)).IsSome
-            && (dictTryFind globalStructTy ("$g" + string (abs (strHash (key sv))))).IsSome ->
-        let g = "$g" + string (abs (strHash (key sv)))
+            && (dictTryFind globalStructTy (uniqueName "$g" (key sv))).IsSome ->
+        let g = uniqueName "$g" (key sv)
         let tn = optGet (dictTryFind globalStructTy g)
         (match optGet (structAbiOf st tn) |> List.tryPick (fun (fn2, _, _, kind) -> if fn2 = fname then Some kind else None) with
          | Some kind -> LDo ([ LSetGlobal (g + "$" + fname, storUnbox kind (coreToLowE ctx value)) ], lowInt 0)
@@ -10876,7 +10909,7 @@ and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
         | _ ->
             match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
             | Some _ ->
-                let g = "$g" + string (abs (strHash k))
+                let g = uniqueName "$g" k
                 (match dictTryFind globalStructTy g, dictTryFind globalScalarTy g with
                  // the WHOLE value of a by-value struct global: build an object
                  // from the field globals (the one place it costs anything)
@@ -11078,8 +11111,8 @@ and private lowStructBind (ctx : LowCtx) (k : string) (tn : string) (rhs : Expr)
     // a module-level `Box3d.Invalid` paid.
     | (EVar (sv, _) | EVarI (sv, _, _)) when
             (dictTryFind ctx.LSt.Globals (key sv)).IsSome
-            && (dictTryFind globalStructTy ("$g" + string (abs (strHash (key sv))))).IsSome ->
-        let g = "$g" + string (abs (strHash (key sv)))
+            && (dictTryFind globalStructTy (uniqueName "$g" (key sv))).IsSome ->
+        let g = uniqueName "$g" (key sv)
         fields |> List.map (fun (fn, _, vty, _) ->
             LSet (regOfField fn vty, LGetGlobal (g + "$" + fn)))
     // an ELEMENT of a POD array. The element is raw bytes inside the array, so
@@ -13625,6 +13658,10 @@ let private brOffPrepass (decls0 : Decl list) : Decl list * Dict<string, Dict<st
     out, paramPay
 
 let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
+    // FIRST: emitted names are claimed as they are first asked for, and a name
+    // claimed by the PREVIOUS emission would otherwise be handed to a different
+    // key in this one.
+    resetNameTables ()
     let decls0pre = inlinePrimWrappers decls1
     // byref-as-stack-offset: MUST run before cellScan (inside the St
     // construction below) — dropping a view before the scan is what keeps
