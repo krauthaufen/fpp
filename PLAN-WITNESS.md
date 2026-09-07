@@ -323,3 +323,141 @@ collect, unpin, collect, assert the object MOVED.
 - Battery (`/tmp/battery.fpp`, 15 property tests) is the sharpest regression
   detector here — it structurally compares HashMap/HashSet, which is exactly
   what the witness slots perturb.
+
+# The residue: every site that still answers `obj`, and what each needs
+
+Written 2026-09-07, against the 1 MB FSharp.Data.Adaptive port. Reproduce with:
+
+    python3 tests/port-adaptive.py ~/projects/FSharp.Data.Adaptive/src/FSharp.Data.Adaptive lib.fpp
+    cat lib.fpp tests/adaptive-suite/Tests.fpp > adaptive.fpp
+    FPP_WITSCAN=1  fpp build -o adaptive.wasm adaptive.fpp     # the two totals
+    FPP_WITSTRICT=1 fpp build -o adaptive.wasm adaptive.fpp    # one line per site
+    FPP_WITSTRICT=1 FPP_FUNC_DUMP=1 ...                        # join to map $fNNN -> source name
+
+`-o` must come BEFORE the input or the CLI prints usage.
+
+    WITUNKNOWN emitted = 0 (uniform fallbacks = 210 of 12839 witness arguments)
+    WITTYPES 630 witnesses, 627 carry a type id, 3 do not
+
+## THE INVARIANT: the program is grounded, so `obj` is never a fact
+
+Top level is monomorphic and nothing introduces a type variable, so by
+induction every type argument at every call is determined — statically at the
+site, or by a witness the caller was handed, which is itself ground one frame
+up, all the way to `_start`. **A uniform fallback therefore always marks
+information the compiler dropped, never a property of the program.** Do not
+"resolve" one by assuming; find where the name was lost.
+
+## THE CHANNEL THAT MADE THIS FIXABLE
+
+`EVarI.inst` meant two things at once — *what types this call passes* and
+*please build me a specialized copy* — so every attempt to give a call its type
+arguments changed which stamps exist, and something downstream broke. A leading
+`Ir.witnessOnly` (`"$witonly"`) marker separates them: Link strips it, keeps the
+names, classifies the call Canon, and no later pass sees the marker. Supplying
+names is now safe. **Use it for anything added below.**
+
+## The sites
+
+`FPP_WITSTRICT` tags each fallback `kind=<what the enclosing is> why=<what failed>`.
+
+| count | kind | why | what it is |
+|---|---|---|---|
+| 111 | stamp | call-unnamed | a call inside a stamped clone that carries no instantiation |
+| 38 | has-params | call-unnamed | same, from a function that does take witness params |
+| 17 | vtable-impl | call-nochannel | the enclosing IS generic in it; the vtable slot has k=0 |
+| 14 | lambda | call-unnamed | same, from a lifted lambda |
+| 10 | stamp | slot-unnamed | slot-witness pad positions |
+| 8 | generic-value | call-nochannel | a generic value has no witness channel at all |
+| 4 | vtable-impl | slot-freevar | slot witness whose name the enclosing cannot bind |
+| 4+4 | monomorphic, lambda | stamparg | `stampWitness` with no stamp arguments |
+
+By callee, the `call-unnamed` bulk is: **`empty` 101, `monoid` 30**, then
+`checkTag` 12, `trace` 6, `shallowEquals` 5, `min` 5, `max` 3, `shallowHash` 1.
+
+### 163 `call-unnamed` — inference records no instantiation
+
+`empty` and `monoid` dominate, and their shape is:
+
+    static member Empty = empty          // adaptive.fpp 10013 / 10125 / 10419
+    static member Instance = monoid      //              13722 / 13736 / 13750
+
+A static member whose body is a bare reference to a generic binding **of the
+same type**, used before it generalizes. `instantiateFor` freshens nothing
+there, so no `instRaw` is recorded; 18 such template sites, each cloned ~12
+times, produce the 163.
+
+**What is needed:** inference must record the instantiation at these uses. The
+identity (`sc.Quantified` as `#id`) is NOT it — parked and measured, it gives
+exactly zero reduction, which proves these uses do not reach the
+forward-reference arm the parking hooks. Find which arm types
+`static member Empty = empty` and why it records nothing. `FPP_QUAL` shows the
+qualified arm recording 359 times for `empty` alone, so it is not that one.
+
+### 25 `call-nochannel` — the ABI has no slot
+
+The enclosing definition IS generic in the variable and the backend owes it a
+parameter it has not got.
+
+* **17 vtable-impl.** Slots where `SlotWitN` came out 0 — the impls disagreed on
+  their method-level count, or the receiver was not a shape `selfWits` reads.
+  `FPP_SLOTWIT=1` prints each slot's k and its impls. Extending the slot ABI to
+  cover them is the fix; the machinery is already there.
+* **8 generic-value.** A generic value is initialised once and serves every
+  instantiation. Link already thunks the EXPANSIVE ones (`let v = e` becomes
+  `let v () = e`) so they can take `FuncWitness`; these are the non-expansive
+  ones, which are not thunked because doing so re-evaluates a lazy or recursive
+  value per use and hung the `patterns` suite.
+
+### 22 pads and stamp arguments
+
+`slot-unnamed` (10) are pad positions the impl never reads — filling them with a
+named `obj` is provably safe (tried; it works, and is currently not landed only
+because it was bundled with a change that was not). `stamparg` (8) is
+`stampWitness` reached with no `curStampArgs`, i.e. the enclosing is not a stamp.
+
+### 3 witnesses with no type id
+
+`witnessPtrRM` (the unnamed constructor) at the builtin-conversion, operator and
+tid-scan sites. Naming them was TRIED AND REVERTED: those paths intern type
+names from a LATE lowering phase, past where the type-NAME table is sized from
+`TypeIds`, so the id lands out of range and `typeName<string>` answers empty.
+Fix the table first — size it from `TypeIdNext` and bounds-check the read — then
+the names are free.
+
+## What was tried and must not be retried without new information
+
+* **Naming the residue `obj` in Lower** (at a use whose instantiation was never
+  recorded). Takes 210 -> 61 and is WRONG: it overwrites the sites where the
+  backend's variable-id fallback was already resolving correctly. `uint32`
+  becomes `obj`, its compare kind goes from unsigned to the structural walker,
+  4000000000 orders as negative and a map lookup raises KeyNotFound
+  (`suites/unsigned.fpp` traps). Isolated to ONE site — the plain-identifier arm;
+  with that arm excluded everything is green and the count is 214, i.e. WORSE
+  than leaving it alone. The whole gain lives in the unsound site.
+* **Naming it by the callee's own variable (`#id`) instead** — same suite, same
+  trap. Neither keeping it symbolic through Link (rather than collapsing on
+  `ownerQuantifies`, which is narrower than the backend's real scope) nor
+  guarding the positional match by length rescues it.
+* **Parking forward references** and recording the definition's quantified
+  variables once it generalizes: zero reduction, +7000 witness arguments.
+* **An `ExpectTy` channel** (the binder's type threaded to the call, consumed
+  once, matched against the callee's result): measured exactly zero.
+* **`resolved-vars=0 / free-vars=1308`** as evidence that the arguments are
+  unconstrained: a TAUTOLOGY. It pruned the definition's scheme's `Quantified`,
+  and a scheme's quantified variables are unbound by construction in every
+  program.
+
+## Diagnostics
+
+`FPP_WITSCAN` (totals), `FPP_WITSTRICT` (per site, with `kind` and `why`),
+`FPP_SLOTWIT` (each vtable slot's k and impls), `FPP_FNWIT=$fNNN`
+(witnessVars/paramVars/selfWits for one function), `FPP_FUNC_DUMP` (map `$fNNN`
+to a source name — join it with WITSTRICT), `FPP_CORE_DUMP`/`FPP_CORE_FN`,
+`FPP_KEYCHECK` (Core key collisions), `FPP_VTDBG` (every vtable row, with the
+impl's hidden-param count against the slot's).
+
+**A diagnostic must never call `err`.** `err` STUBS the offending function, so
+the module then fails somewhere else entirely — a consistency check added that
+way cost hours, with the trap deep inside `$eqv` and nothing pointing at the
+check. Warn with `eprintfn`.
