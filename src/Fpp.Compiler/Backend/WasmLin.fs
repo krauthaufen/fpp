@@ -13987,6 +13987,35 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // uniform sig; a scalar rides the boxed-at-rest representation coreToLowE
     // already produces. (Matches the wasm-GC backend's all-anyref vtable rule.)
     let vtImpls = dictNew<string, bool> ()
+    // A vtable row is reached THROUGH A RECEIVER, so only an instance member can
+    // fill one. `slotImpl` matches by name over a slot list that carries an entry
+    // per declared member in the whole program, so a class' STATIC member —
+    // `HashMap.Empty`, `.Create`, `.FromSeq` — resolved a slot it can never be
+    // dispatched to. Marked vtImpls, it lost both the specialized signature and,
+    // once witnesses existed, its hidden witness parameters: 190 of the port's
+    // uniform fallbacks were static members with perfectly ground callers.
+    //
+    // The receiver is the FIRST PARAMETER's type (an abstract override carries
+    // the abstract signature in its scheme, with no receiver in it). Anything
+    // this cannot read stays dispatchable — the uniform shape is always callable,
+    // so an over-approximation costs specialization while an under-approximation
+    // would mismatch a call_indirect type.
+    let firstParamTy = dictNew<string, Type> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, _, ELam ((_, ps0) :: _, _)) -> dictSet firstParamTy (key v) ps0.Body
+        | _ -> ()
+    let takesSelf (cn : string) (v : VarId) : bool =
+        match dictTryFind firstParamTy (key v) with
+        | Some t ->
+            (match prune t with
+             | TCon (pn, _) -> pn = cn || List.contains pn (chainOf cn) || List.contains cn (chainOf pn)
+             // a receiver is an instance of the class, so its type is that
+             // TCon. A first parameter that is a type VARIABLE belongs to a
+             // static generic member (`HashSet.Single (v : 'a)`) — nothing can
+             // enter a row through it.
+             | _ -> false)
+        | None -> true
     // every function that is a MEMBER of something (a class, an interface
     // impl, a user instance): reachable by dispatch, so its parameter shape
     // is not ours to change
@@ -14030,8 +14059,8 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             if dispatchable then
                 for ifn, mn in vtableSlots do
                     (match slotImpl cn ifn mn with
-                     | Some v -> dictSet vtImpls (key v) true
-                     | None -> ())
+                     | Some v when takesSelf cn v -> dictSet vtImpls (key v) true
+                     | _ -> ())
         | _ -> ()
     for d in decls do
         match d with
@@ -14571,10 +14600,11 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                     vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn v)
                 | _ -> ())
             vtableSlots |> List.iteri (fun slot (ifn, mn) ->
-                match slotImpl cn ifn mn with
+                match (match slotImpl cn ifn mn with Some v when takesSelf cn v -> Some v | _ -> None) with
                 // only a declared top-level function can go in the table; an
                 // impl that never became one (not reachable / not a plain
-                // function) leaves the slot 0
+                // function) leaves the slot 0. A STATIC member never fills one:
+                // the row is entered through a receiver it does not take.
                 | Some v when (dictTryFind st.Funcs (key v)).IsSome ->
                     (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s -> %s" cn cid slot ifn mn v.Name)
                     vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn v)
