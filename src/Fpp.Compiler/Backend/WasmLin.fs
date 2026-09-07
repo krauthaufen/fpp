@@ -5826,7 +5826,21 @@ let private uniformWitnessWhy (st : St) (why : string) : LExpr =
     witArgCount <- witArgCount + 1
     (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then
         eprintfn "WITUNIFORM %s kind=%s why=%s" curFnDbg curChannelKind why)
-    witnessPtrRMK st 4 4 1 5
+    // NAMED `obj`, not anonymous. Reaching here means every source has been
+    // tried: the call's instantiation, the enclosing function's own witnesses
+    // (by the callee's variable id, which a self or group call shares), and the
+    // callee's parameters matched against the arguments' static types. If none
+    // of them names this argument then nothing in the program does, and what
+    // crosses is a uniform word — `obj` is its name, the same conclusion Link
+    // draws for a variable its owner cannot bind. The anonymous witness carried
+    // type id 0, "I do not know", which `typeName` then had to answer for out
+    // of a table entry rather than from the witness itself.
+    //
+    // ONLY HERE. Asserting `obj` EARLIER — in Lower, at a use whose
+    // instantiation was never recorded — is a different thing and a wrong one:
+    // it pre-empts this fallback chain, and the `unsigned` suite trapped and
+    // `typeName` on a string went blank the moment it was tried.
+    witnessPtrRMKT st 4 4 1 5 "obj"
 let private uniformWitness (st : St) : LExpr = uniformWitnessWhy st "?"
 
 /// The witness for the j-th class type parameter inside a STAMPED clone: its
