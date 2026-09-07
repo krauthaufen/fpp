@@ -10392,7 +10392,19 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
                 [ LIf (LPrim (EqW, [ LPrim (AndW, [ refMaskOf w; LConstW 1 ]); LConstW 0 ]),
                        selTid (j + 1) accMask,
                        selTid (j + 1) (accMask ||| (1 <<< j))) ]
-        let selTidGuarded = [ LIf (anyUnknownExpr, [ LSet (wReg tidTmp, LConstW taggedTid) ], selTid 0 0) ]
+        // The pick above is a decision TREE over the generic slots: 2^g leaves,
+        // each interning its own tid. A record with 16 generic fields asked for
+        // 65536 of them and the build died on the tid table ("too many shapes")
+        // — which is one of the reasons fpp.base abandoned its `V3<'a>`/`M44<'a>`
+        // design and generates per scalar instead (~/claude/fpp-base-snags.md
+        // #12). Past a handful of generic slots the precise pick is not worth
+        // its size, so the shape falls back to the same CONSERVATIVE tagged tid
+        // an unresolved witness takes: its scanned words are validated rather
+        // than chased. Precision is kept where it pays — a cons cell, a tuple,
+        // an ordinary record — and 6 slots is already 64 tids.
+        let selTidGuarded =
+            if g > 6 then [ LSet (wReg tidTmp, LConstW taggedTid) ]
+            else [ LIf (anyUnknownExpr, [ LSet (wReg tidTmp, LConstW taggedTid) ], selTid 0 0) ]
         let idx = slots |> List.mapi (fun i v -> i, v)
         let tempOf = idx |> List.map (fun (i, v) -> i, (if isConst v then None else Some (freshTmp ctx)))
         let tregOf i = match List.tryPick (fun (j, t) -> if j = i then Some t else None) tempOf with Some (Some tr) -> tr | _ -> freshTmp ctx

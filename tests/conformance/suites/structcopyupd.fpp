@@ -64,10 +64,18 @@ eq "assign-both-struct-fields" (showSt s4) "7,8 9,10 1.5 True"
 let s5 = { s0 with Turn = s4.Pos }
 eq "assign-from-a-field" (showSt s5) "9,10 2,3 1.5 True"
 
-// chained: the result of one copy-update is the base of the next (through a
-// binding — a brace expression as the BASE is not in the subset)
+// chained: the result of one copy-update is the base of the next, both
+// through a binding and with the brace expression written inline (the base
+// of a copy-update is any EXPRESSION — a call, another copy-update — and
+// only a dotted NAME parsed as one; anything else reached lowering as a
+// computation body)
 let s6a = { s0 with Speed = 3.0 }
 let s6 = { s6a with Turn = { X = 1.0; Y = 2.0 } }
+let s6b = { { s0 with Speed = 3.0 } with Turn = { X = 1.0; Y = 2.0 } }
+eq "chained-inline" (showSt s6b) "1,2 2,3 3 True"
+let mkSt () : St = s0
+let s6c = { mkSt () with Speed = 4.0 }
+eq "the-base-is-a-call" (showSt s6c) "0,0 2,3 4 True"
 eq "chained-copy-updates" (showSt s6) "1,2 2,3 3 True"
 
 // the control: an explicit full literal was always right

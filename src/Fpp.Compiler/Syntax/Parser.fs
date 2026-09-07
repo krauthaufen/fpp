@@ -1770,7 +1770,35 @@ let parseSeeded (apSeed : ApDef list) (src : string) : ParseResult =
                 elif n.Kind = Keyword && n.Text = "with" then true
                 else false
             else false
-        scan 1
+        scan 1 || hasWithBase 1
+
+    /// `{ <expr> with … }` where the base is any EXPRESSION, not only a
+    /// dotted name: `{ mk () with B = 9 }`, `{ { r with A = 1 } with B = 2 }`.
+    /// Those parsed as a computation body and reached lowering as one — "not
+    /// lowerable: computation/sequence body", for a copy-update F# spells
+    /// exactly this way.
+    ///
+    /// The scan stops at the first token that cannot belong to a base
+    /// expression, which is what keeps a computation body from matching: in
+    /// `async { try … with e -> … }` the `try` ends the scan before its
+    /// `with` is reached. `k0` is the offset of the token AFTER the brace.
+    and hasWithBase (k0 : int) : bool =
+        let rec go (k : int) (depth : int) (fuel : int) : bool =
+            if fuel <= 0 then false
+            else
+                let t = s.Peek k
+                match t.Kind with
+                | Eof -> false
+                | Keyword when t.Text = "with" && depth = 0 -> true
+                | Keyword when depth = 0 && t.Text <> "true" && t.Text <> "false" && t.Text <> "null" -> false
+                | RBrace when depth = 0 -> false
+                | Semicolon when depth = 0 -> false
+                | Comma when depth = 0 -> false
+                | Operator when t.Text = "=" && depth = 0 -> false
+                | LParen | LBracket | LBrace -> go (k + 1) (depth + 1) (fuel - 1)
+                | RParen | RBracket | RBrace -> go (k + 1) (depth - 1) (fuel - 1)
+                | _ -> go (k + 1) depth (fuel - 1)
+        go k0 0 400
 
     and parseRecordExpr (ctx : int) : Green =
         let acc = vecNew<Green> ()
@@ -1784,7 +1812,7 @@ let parseSeeded (apSeed : ApDef list) (src : string) : ParseResult =
                     if n.Kind = Operator && n.Text = "." then scan (k + 2)
                     else n.Kind = Keyword && n.Text = "with"
                 else false
-            scan 0
+            scan 0 || hasWithBase 0
         if isWith then
             vecAdd acc (parseExpr ctx)
             if s.IsKw "with" then vecAdd acc (s.Bump ())
