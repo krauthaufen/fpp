@@ -588,6 +588,35 @@ let inlineCalls (decls : Decl list) : Decl list =
                     vecAdd hit false
                     mapChildrenWith (fun c -> (if touchesHost c then vecSet hit 0 true); c) x |> ignore
                     vecGet hit 0
+            // A BODY THAT NAMES A TYPE VARIABLE cannot be copied. `monoBinders`
+            // above checks binder TYPES, and a type variable that appears inside
+            // a STRING is invisible to every pass that rewrites types (this
+            // repo's oldest recurring trap). An `EVarI` instantiation, a record
+            // or cast name, a `$zero:`/`$sizeof:`/`$typename:`/`$class:` marker
+            // — each can spell `#42`, and the backend resolves it against the
+            // ENCLOSING function's witnesses. Copied into a caller that
+            // quantifies nothing, there is no witness to resolve it against and
+            // it falls back to one that knows no type: 59 of the port's
+            // fallbacks were stamped constructors that had inlined `empty`.
+            let namesTypeVar (x0 : Expr) : bool =
+                let hit = vecNew<bool> ()
+                vecAdd hit false
+                let has (n : string) = if n.Contains "#" then vecSet hit 0 true
+                let rec go (x : Expr) : unit =
+                    (match x with
+                     | EVarI (_, _, inst) -> for t in inst do has t
+                     | EUnknown n -> has n
+                     | ERecord (n, _) | ERecordExt (n, _, _) | ECast (n, _, _) | ETypeTest (n, _)
+                     | EArray (n, _) | EIndex (n, _, _) | EIndexSet (n, _, _, _)
+                     | EArrayLen (n, _) | EArrayCreate (n, _, _) | EArrayPin (n, _)
+                     | EArrayUnpin (n, _) | EArrayBytes (n, _) -> has n
+                     | ECtor (n, _, _) -> has n
+                     | EField (_, _, o) -> has o
+                     | EFieldSet (_, _, o, _) -> has o
+                     | _ -> ())
+                    mapChildrenWith (fun c -> go c; c) x |> ignore
+                go x0
+                vecGet hit 0
             let skipped =
                 match System.Environment.GetEnvironmentVariable "FPP_INLINE_SKIP" with
                 | null | "" -> false
@@ -605,6 +634,7 @@ let inlineCalls (decls : Decl list) : Decl list =
                && not (v.Name.Contains "$")
                && ps |> List.forall (fun (_, sch) -> concrete sch && objFree sch)
                && monoBinders body
+               && not (namesTypeVar body)
                && not (isObj (resultOf vsch.Body (List.length ps))) then
                 let k = dictNew<string * int, bool> ()
                 dictSet k (v.Path, v.Offset) true
