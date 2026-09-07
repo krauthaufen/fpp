@@ -1101,6 +1101,25 @@ let private internStrRawGc (st : St) (s : string) : int =
         dictSet st.Consts key slot
         slot
 
+/// the STANDALONE twin of internStrRawGc: already-decoded text baked into the
+/// data segment, each char one UTF-16 unit verbatim. Interning raw text through
+/// `internStr` instead ran `unescape` over it, which STRIPS THE FIRST AND LAST
+/// CHARACTER (they are a literal's quotes) — so `typeName<int>` answered "n"
+/// and a stamped `typeName<'a>` at float answered "loa".
+let private internStrRaw (st : St) (s : string) : int =
+    let quoted =
+        let out = vecNew<char> ()
+        vecAdd out '"'
+        let mutable k = 0
+        while k < strLen s do
+            let c = charAt s k
+            if c = '"' || c = '\\' then vecAdd out '\\'
+            vecAdd out c
+            k <- k + 1
+        vecAdd out '"'
+        System.String (vecToArray out)
+    internStr st quoted
+
 // a string constant as a value: standalone bakes it at a fixed address; GC
 // loads its (possibly relocated) pointer from the root table
 let private lowStrConst (st : St) (s : string) : LExpr =
@@ -1110,7 +1129,7 @@ let private lowStrConst (st : St) (s : string) : LExpr =
 // a RAW (un-unescaped) string constant — for the baked prelude source text.
 let private lowStrConstRaw (st : St) (s : string) : LExpr =
     if gc then LLoad (W, LGetGlobal "$roots", 4 * internStrRawGc st s)
-    else LConstW (internStr st s)
+    else LConstW (internStrRaw st s)
 
 // ---- tag helpers (operate on the wasm stack) ------------------------------
 let private tagi (f : Fn) : unit =           // i32 int -> tagged
@@ -5171,6 +5190,18 @@ let private podLayoutLeaves (st : St) (layout : Dict<string, int * string>) : (i
         | None -> [ (off, ty) ])
     |> List.sortWith (fun (a, _) (b, _) -> if a < b then 0 - 1 elif a > b then 1 else 0)
 
+/// how one LEAF of an inline layout is moved: (storage type, register type,
+/// is-a-reference). A scalar rides its own width; anything else — a string, an
+/// option, a nested reference — is ONE uniform word, which the pod builder
+/// roots across its allocation. Asking `storLTy` alone and unwrapping it
+/// CRASHED the compiler on every inline struct holding a reference (an
+/// `optGet: None` naming a load, nowhere near the declaration —
+/// ~/claude/fpp-base-snags.md #40 and #41).
+let private podLeafTy (ity : string) : LTy * LTy * bool =
+    match storLTy ity with
+    | Some (isty, _) -> (isty, storValTy isty, false)
+    | None -> (W, W, true)
+
 /// the layout resolver for a program: struct records resolve to their fields
 let private layResOf (st : St) : LayRes = fun n -> dictTryFind st.RecFieldTys n
 
@@ -7540,6 +7571,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // a NESTED struct field occupies its own bytes inside this record, so it
         // contributes its leaves at their offsets — a pointer there would
         // disagree with the layout every reader now uses
+        let pre = vecNew<LStmt> ()
         let rec itemsOf (layout : Dict<string, int * string>) (order : string list)
                         (fields : (string * Expr) list) (shift : int) : (int * LTy * LTy * bool * LExpr) list =
             order |> List.collect (fun fn ->
@@ -7557,29 +7589,46 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                     (match ve with
                      // a literal spells its own leaves
                      | Some (ERecord (_, innerFlds)) -> itemsOf inner innerOrder innerFlds (off - HDR)
-                     // any other value is an instance: copy its leaves across
+                     // any other value is an instance: copy its leaves across.
+                     // They are read into locals HERE, in `pre`, rather than
+                     // left as loads inside the items: lowPodBuild reorders
+                     // items (scalars before references), so a load left in an
+                     // item could be emitted ahead of the assignment that binds
+                     // the pointer it reads through.
                      | Some other ->
                          let br = freshTmp ctx
-                         let loads =
-                             podLayoutLeaves st inner |> List.map (fun (ioff, ity) ->
-                                 let (isty, _) = optGet (storLTy ity)
-                                 (off + ioff - HDR, isty, storValTy isty, false,
-                                  LLoad (isty, LGet (wReg br), ioff)))
-                         (match loads with
-                          | [] -> []
-                          | (o0, s0, v0, r0, e0) :: rest ->
-                              (o0, s0, v0, r0, LDo ([ LSet (wReg br, coreToLowE ctx other) ], e0)) :: rest)
+                         vecAdd pre (LSet (wReg br, coreToLowE ctx other))
+                         podLayoutLeaves st inner |> List.map (fun (ioff, ity) ->
+                             let (isty, vty, isRef) = podLeafTy ity
+                             let id = freshTmpT ctx vty
+                             vecAdd pre (LSet ({ Id = id; RTy = vty }, LLoad (isty, LGet (wReg br), ioff)))
+                             (off + ioff - HDR, isty, vty, isRef, LGet { Id = id; RTy = vty }))
                      | None ->
                          podLayoutLeaves st inner |> List.map (fun (ioff, ity) ->
-                             let (isty, _) = optGet (storLTy ity)
-                             (off + ioff - HDR, isty, storValTy isty, false,
-                              zeroOfTy (storValTy isty))))
+                             let (isty, vty, isRef) = podLeafTy ity
+                             (off + ioff - HDR, isty, vty, isRef,
+                              (if isRef then lowInt 0 else zeroOfTy vty))))
                 | None -> [ (off, W, W, true, (match ve with Some e -> coreToLowE ctx e | None -> lowInt 0)) ])
-        lowPodBuild ctx name (itemsOf layout order fields 0)
+        let built = lowPodBuild ctx name (itemsOf layout order fields 0)
+        if vecLen pre = 0 then built else LDo (vecToList pre, built)
     | ERecordExt (name, baseE, updates) when (podOf st name).IsSome ->
         let (layout, _, _) = optGet (podOf st name)
         let order = ctorOrder st name (List.map fst updates)
         let bl = freshTmp ctx
+        // A NESTED struct field occupies its own bytes inside this record, the
+        // same as at construction (see itemsOf above) — so a copy-update must
+        // carry its LEAVES, not one uniform word. Copying a word instead wrote
+        // a POINTER over the first four bytes of an inline value and left the
+        // rest untouched: `{ st with Turn = v }` came back as a bit pattern and
+        // every OTHER struct field of the record read zero, silently
+        // (~/claude/fpp-base-snags.md #56).
+        let innerPodOf (kind : string) : Dict<string, int * string> option =
+            if (podOf st kind).IsSome
+               && (layInlineFields (fun n -> dictTryFind st.RecFieldTys n) 0 kind).IsSome then
+                let (inner, _, _) = optGet (podOf st kind)
+                Some inner
+            else None
+        let leafTy = podLeafTy
         // pre-evaluate each update value into a local; then bind base. lowPodBuild
         // then sees only pure reads (these locals + base loads), so its single
         // allocation cannot move an as-yet-unstored update value or the base.
@@ -7587,18 +7636,49 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             updates |> List.map (fun (fn, e) ->
                 let (off, kind) = optGet (dictTryFind layout fn)
                 match storLTy kind with
-                | Some (sty, _) -> let vty = storValTy sty in let id = freshTmpT ctx vty in (fn, LSet ({ Id = id; RTy = vty }, storUnbox kind (coreToLowE ctx e)), (off, sty, vty, false, LGet { Id = id; RTy = vty }))
-                | None -> let id = freshTmp ctx in (fn, LSet (wReg id, coreToLowE ctx e), (off, W, W, true, LGet (wReg id))))
-        let updEvals = updInfo |> List.map (fun (_, ev, _) -> ev)
+                | Some (sty, _) ->
+                    let vty = storValTy sty
+                    let id = freshTmpT ctx vty
+                    (fn, [ LSet ({ Id = id; RTy = vty }, storUnbox kind (coreToLowE ctx e)) ],
+                     [ (off, sty, vty, false, LGet { Id = id; RTy = vty }) ])
+                | None ->
+                    match innerPodOf kind with
+                    | Some inner ->
+                        // read the value's leaves out NOW, into locals, so no
+                        // pointer into it is held across the base's evaluation
+                        let ptr = freshTmp ctx
+                        let leaves =
+                            podLayoutLeaves st inner |> List.map (fun (ioff, ity) ->
+                                let (isty, vty, isRef) = leafTy ity
+                                (ioff, isty, vty, isRef, freshTmpT ctx vty))
+                        (fn,
+                         LSet (wReg ptr, coreToLowE ctx e)
+                         :: (leaves |> List.map (fun (ioff, isty, vty, _, id) ->
+                                LSet ({ Id = id; RTy = vty }, LLoad (isty, LGet (wReg ptr), ioff)))),
+                         leaves |> List.map (fun (ioff, isty, vty, isRef, id) ->
+                            (off + ioff - HDR, isty, vty, isRef, LGet { Id = id; RTy = vty })))
+                    | None ->
+                        let id = freshTmp ctx
+                        (fn, [ LSet (wReg id, coreToLowE ctx e) ], [ (off, W, W, true, LGet (wReg id)) ]))
+        let updEvals = updInfo |> List.collect (fun (_, ev, _) -> ev)
         let items =
-            order |> List.map (fun fn ->
-                match updInfo |> List.tryPick (fun (f, _, it) -> if f = fn then Some it else None) with
-                | Some it -> it
+            order |> List.collect (fun fn ->
+                match updInfo |> List.tryPick (fun (f, _, its) -> if f = fn then Some its else None) with
+                | Some its -> its
                 | None ->
                     let (off, kind) = optGet (dictTryFind layout fn)
                     match storLTy kind with
-                    | Some (sty, _) -> (off, sty, storValTy sty, false, LLoad (sty, LGet (wReg bl), off))
-                    | None -> (off, W, W, true, LLoad (W, LGet (wReg bl), off)))
+                    | Some (sty, _) -> [ (off, sty, storValTy sty, false, LLoad (sty, LGet (wReg bl), off)) ]
+                    | None ->
+                        match innerPodOf kind with
+                        // the base has this record's layout, so a leaf sits at
+                        // the same offset in both
+                        | Some inner ->
+                            podLayoutLeaves st inner |> List.map (fun (ioff, ity) ->
+                                let (isty, vty, isRef) = leafTy ity
+                                let o = off + ioff - HDR
+                                (o, isty, vty, isRef, LLoad (isty, LGet (wReg bl), o)))
+                        | None -> [ (off, W, W, true, LLoad (W, LGet (wReg bl), off)) ])
         LDo (updEvals @ [ LSet (wReg bl, coreToLowE ctx baseE) ], lowPodBuild ctx name items)
     | ERecord (name, fields) ->
         let order = ctorOrder st name (List.map fst fields)
@@ -8047,8 +8127,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              let br = freshTmp ctx
              let items =
                  podLayoutLeaves st inner |> List.map (fun (ioff, ity) ->
-                     let (isty, _) = optGet (storLTy ity)
-                     (ioff, isty, storValTy isty, false,
+                     let (isty, vty, isRef) = podLeafTy ity
+                     (ioff, isty, vty, isRef,
                       LLoad (isty, LGet (wReg br), off + ioff - HDR)))
              LDo ([ LSet (wReg br, coreToLowE ctx r) ], lowPodBuild ctx kind items)
          | None -> LLoad (W, coreToLowE ctx r, off))
@@ -8470,15 +8550,21 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // witness "what it is" rather than "how it is laid out".
     | EUnknown n when n.StartsWith "$typename:" ->
         let tn = n.Substring 10
-        if tn.Length > 1 && tn.[0] = '#' then
+        // the witness route exists only under GC — there is no root table, no
+        // type-name table and no witness register in the STANDALONE module, and
+        // reaching for `$roots` there emitted a global the module never
+        // declares (the whole `--lowir` mode died on it, at the prelude's own
+        // Seq members). Standalone answers the static name.
+        if gc && tn.Length > 1 && tn.[0] = '#' then
             match dictTryFind ctx.Witness (int (tn.Substring 1)) with
             | Some r ->
                 let tbl = LLoad (W, LGetGlobal "$roots", 4 * gcTyNameSlot)
                 let id = LLoad (W, LGet (wReg r), 16)
                 let slot = LLoad (W, LPrim (AddW, [ tbl; LPrim (MulW, [ id; LConstW 4 ]) ]), 8)
                 LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LPrim (MulW, [ slot; LConstW 4 ]) ]), 0)
-            | None -> LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LConstW (4 * internStrRawGc ctx.LSt "obj") ]), 0)
-        else LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LConstW (4 * internStrRawGc ctx.LSt tn) ]), 0)
+            | None -> lowStrConstRaw ctx.LSt "obj"
+        elif tn.Length > 1 && tn.[0] = '#' then lowStrConstRaw ctx.LSt "obj"
+        else lowStrConstRaw ctx.LSt tn
     | EUnknown n when n.StartsWith "$sizeof:" ->
         let tn = n.Substring 8
         if tn.Length > 1 && tn.[0] = '#' then
@@ -15462,7 +15548,12 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                     | _ -> []
                  else [])
             let selfWits =
-                if (dictTryFind st.FuncWitness (key v)).IsSome then []
+                // witnesses are a GC-mode mechanism: they are recovered off the
+                // receiver through the root table, which the STANDALONE module
+                // has no global for. Recovering them there emitted a read of
+                // `$roots` into every witnessed class' method and killed the
+                // whole `--lowir`/`--linear` build at the prelude.
+                if not gc || (dictTryFind st.FuncWitness (key v)).IsSome then []
                 else
                     match ps with
                     | (_, s0) :: _ ->

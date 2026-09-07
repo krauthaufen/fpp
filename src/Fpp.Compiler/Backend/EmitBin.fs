@@ -366,12 +366,28 @@ let lg (f : Fn) (name : string) : unit =
 let ls (f : Fn) (name : string) : unit =
     emitByte f.B opLocalSet
     emitU32 f.B (localIdx f name)
+// A global the module never declared reached emission as a bare
+// NullReferenceException with nothing but a stack trace — the name is the
+// whole diagnosis, so it is in the message.
+let private globalIdx (f : Fn) (name : string) : int =
+    match dictTryFind f.M.GlobalIdx name with
+    | Some i -> i
+    | None ->
+        // name the FUNCTION being emitted too: bodies are emitted in
+        // declaration order, so the one in progress is the code section's
+        // current index
+        let idx = f.M.ImportedFuncs + f.M.CodeCount
+        let who =
+            match dictPairs f.M.FuncIdx |> List.tryPick (fun (n, i) -> if i = idx then Some n else None) with
+            | Some n -> n
+            | None -> "#" + string idx
+        failwith ("wasm-linear: no global '" + name + "' (emitting " + who + ")")
 let gg (f : Fn) (name : string) : unit =
     emitByte f.B opGlobalGet
-    emitU32 f.B (dictTryFind f.M.GlobalIdx name).Value
+    emitU32 f.B (globalIdx f name)
 let gs (f : Fn) (name : string) : unit =
     emitByte f.B opGlobalSet
-    emitU32 f.B (dictTryFind f.M.GlobalIdx name).Value
+    emitU32 f.B (globalIdx f name)
 
 /// which box producer a given unbox call cancels against
 let private peepPairOf (unboxName : string) : string list =
