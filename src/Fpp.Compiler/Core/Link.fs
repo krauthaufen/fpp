@@ -832,6 +832,19 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
     let rewrite (owner : string) (ownerKey : string * int) (subst : Dict<string, string>) (isTemplate : bool) (isClone : bool) (e : Expr) : Expr =
         e |> mapExpr (fun x ->
             match x with
+            // WITNESS-ONLY: keep the names, make no demand. Stripped here, so
+            // no later pass ever sees the marker.
+            | EVarI (v, sch, m :: rest) when m = witnessOnly ->
+                EVarI (v, sch, rest |> List.map (fun t ->
+                    if t.Contains "#" then
+                        let r = substName subst t
+                        if r.Contains "#" then
+                            let sb = dictNew<string, string> ()
+                            for mv in varsIn r do
+                                if not (ownerQuantifies ownerKey mv) then dictSet sb mv "obj"
+                            substName sb r
+                        else r
+                    else t))
             | EVarI (v, sch, inst0) ->
                 // propagate the caller's instantiation into nested demands
                 let inst =

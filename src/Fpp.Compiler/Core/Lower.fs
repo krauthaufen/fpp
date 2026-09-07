@@ -5107,8 +5107,25 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     nodesOf i
                     |> List.filter (fun m -> isExprish m.NodeKind)
                     |> List.map (fun m -> lowerExpr (GNode m))
+                let bargs = if List.isEmpty args then [ ELit LUnit ] else args
                 (match bdef with
-                 | Some d -> Some (EApp (EVar (varIdOf d, schemeOf d), (if List.isEmpty args then [ ELit LUnit ] else args)))
+                 | Some d ->
+                     // the base's WRITTEN type arguments, carried on the call.
+                     // The base constructor takes a hidden witness per
+                     // quantified variable and a bare `EVar` handed it none.
+                     // WITNESS-ONLY. These names say what the base's type
+                     // arguments ARE; they are not a request to specialize it.
+                     // Asking for the clone builds an `AbstractReader$…` whose
+                     // representation disagrees with instances the canonical
+                     // constructor built, and a match in `Compute` then falls
+                     // through to `unreachable`. Link strips the marker, keeps
+                     // the names and classifies Canon.
+                     let hd =
+                         match baseInst with
+                         | Some bi when not (List.isEmpty bi) && bi |> List.forall (fun x -> x <> "") ->
+                             EVarI (varIdOf d, schemeOf d, witnessOnly :: bi)
+                         | _ -> EVar (varIdOf d, schemeOf d)
+                     Some (EApp (hd, bargs))
                  | None -> Some (note (offsetOf i) ("unknown base class " + bn)))
             | _ -> None
         let isStaticLet (m : GreenNode) =

@@ -197,6 +197,14 @@ type Decl =
     /// that chases the raw even int. Never for float/struct stamps (unchanged).
     | DFieldSubst of string * (string * string) list
 
+/// A leading `EVarI` instantiation entry saying "these names are for WITNESSES,
+/// not a specialization demand". The two have shared one channel — supply the
+/// types a call passes and Link also builds a clone — and every attempt to give
+/// a call its type arguments therefore changed which stamps exist. Link strips
+/// this marker, keeps the remaining names and classifies the call Canon, so
+/// nothing downstream sees it.
+let witnessOnly : string = "$witonly"
+
 /// An `EIfaceCall` method name without its instantiation suffix — the SLOT
 /// key. The declaration, the impl clause and the dispatch site spell a
 /// member's type arguments differently, and all three mean one row.
