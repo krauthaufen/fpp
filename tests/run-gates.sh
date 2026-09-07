@@ -34,6 +34,7 @@ for g in "$here"/tooling/cback/*-gate.sh; do
 done
 gates+=("hkt-gate|$here/tooling/hkt-gate.sh")
 gates+=("classconst-gate|$here/tooling/classconst-gate.sh")
+gates+=("typewitness-gate|$here/tooling/typewitness-gate.sh")
 gates+=("fnidentity-gate|$here/tooling/fnidentity-gate.sh")
 gates+=("builtin-extension-gate|$here/tooling/builtin-extension-gate.sh")
 gates+=("pkg-gate|$here/tooling/pkg-gate.sh")

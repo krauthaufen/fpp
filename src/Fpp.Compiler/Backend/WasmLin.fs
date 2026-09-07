@@ -82,6 +82,21 @@ type private St =
       /// receives one hidden LEADING witness-pointer param per id; the direct
       /// caller prepends the matching witnesses. Empty/absent = non-generic.
       FuncWitness : Dict<string, (int * int) list>
+      /// THE SLOT WITNESS ABI. A vtable row's signature is fixed and `self`
+      /// carries only the CLASS' type arguments, so a member generic beyond
+      /// them (`HashSet.Map`'s `'b`, `HashNode.FoldWith`'s `'s`) had no channel
+      /// for its own and fell back to a witness that says "uniform" and knows
+      /// no type. Such a member now takes k hidden LEADING witness params, k
+      /// being a property of the SLOT so every impl of it agrees — a virtual
+      /// call passes the last k names of the instantiation the dispatch name
+      /// carries, a direct call the last k of `EVarI.inst`. Keyed like
+      /// FuncWitness and never set beside it.
+      SlotWitness : Dict<string, (int * int) list>
+      /// slot index -> its k. 0 for the identity trio (dispatched from
+      /// $cmpv/$hashv at a fixed arity) and wherever the impls disagree: a
+      /// slot nothing can answer consistently keeps the uniform shape rather
+      /// than passing a witness some impl would read at another position.
+      SlotWitN : Dict<int, int>
       /// interned value-witness tables: a "size:align:refMask" key -> its BYTE
       /// offset in the static g_witnesses pool. Deduped, emitted at startup.
       Witnesses : Dict<string, int>
@@ -3888,8 +3903,14 @@ let rec private discover (st : St) (e : Expr) : unit =
     | EFieldSet (r, _, _, x) -> discover st r; discover st x
     | ERecord (_, fs) -> for _, x in fs do discover st x
     | ERecordExt (_, b, fs) -> discover st b; for _, x in fs do discover st x
-    | EIfaceCall (_, _, r, xs) ->
-        dictSet st.IfaceArities (1 + List.length xs) true
+    | EIfaceCall (iface, mn, r, xs) ->
+        // the slot's k witnesses ride ahead of the receiver, so the
+        // call_indirect type is k wider (see the SLOT WITNESS ABI)
+        let k =
+            match dictTryFind st.SlotOf (bareIfaceOf iface + "|" + bareMemberOf mn) with
+            | Some slot -> (match dictTryFind st.SlotWitN slot with Some x -> x | None -> 0)
+            | None -> 0
+        dictSet st.IfaceArities (k + 1 + List.length xs) true
         discover st r; for x in xs do discover st x
     | EMatch (s, cs) | ETry (s, cs) ->
         discover st s
@@ -9175,7 +9196,25 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                         match dictTryFind ctx.Witness vid with
                         | Some reg -> LGet (wReg reg)
                         | None -> (match dictTryFind ctx.Witness pid with Some reg -> LGet (wReg reg) | None -> witnessPtrRM st 4 4 1))
-            | None -> []
+            | None ->
+                // a SLOT-witness member called DIRECTLY (its concrete type was
+                // known here, so no dispatch): the hidden params are the
+                // method's OWN variables, which are the TAIL of the scheme —
+                // and `inst` names the whole scheme. Short of that, uniform:
+                // guessing a position is how a witness ends up describing
+                // another type.
+                match dictTryFind st.SlotWitness (key v) with
+                | Some vids ->
+                    let k = List.length vids
+                    let tailInst = if List.length inst >= k then List.skip (List.length inst - k) inst else []
+                    vids |> List.mapi (fun i (vid, pid) ->
+                        match List.tryItem i tailInst with
+                        | Some nm when nm <> "" -> witnessArgOfName ctx nm
+                        | _ ->
+                            match dictTryFind ctx.Witness vid with
+                            | Some reg -> LGet (wReg reg)
+                            | None -> (match dictTryFind ctx.Witness pid with Some reg -> LGet (wReg reg) | None -> uniformWitness st))
+                | None -> []
         // a SELF call in tail position transfers via return_call: same
         // function, so the signature matches by construction. The result
         // needs no re-boxing — it IS this function's result.
@@ -9584,8 +9623,24 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // row, the slot the column; the word there is the impl's table index.
         // Under GC the vtable is a fpprt array in a root slot (data past the
         // [tag][len] header), read fresh so a collection's move is seen.
+        let slotIdx = match dictTryFind st.SlotOf (bi + "|" + method) with Some s -> s | None -> 0
+        // THE SLOT WITNESS ABI: k leading witnesses, the method's OWN type
+        // arguments, which are the TAIL of the instantiation the dispatch name
+        // carries (the receiver's come first and `self` already supplies them).
+        // Short of k names, uniform — a guessed position would describe another
+        // type, and every impl of the slot reads these at fixed indices.
+        let slotWits =
+            let k = match dictTryFind st.SlotWitN slotIdx with Some x -> x | None -> 0
+            if k = 0 then []
+            else
+                let inst = snd (splitInstName method0)
+                let tail = if List.length inst >= k then List.skip (List.length inst - k) inst else []
+                List.init k (fun i ->
+                    match List.tryItem i tail with
+                    | Some nm when nm <> "" -> witnessArgOfName ctx nm
+                    | _ -> uniformWitness st)
         let vtDispatchWith (argEs : LExpr list) =
-            let slot = match dictTryFind st.SlotOf (bi + "|" + method) with Some s -> s | None -> 0
+            let slot = slotIdx
             let cid = lowHeaderCid (wReg t)
             let vtBase =
                 if gc then LPrim (AddW, [ LLoad (W, LGetGlobal "$roots", 4 * st.VtSlot); LConstW 8 ])
@@ -9593,7 +9648,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             let idxAddr =
                 LPrim (AddW, [ vtBase
                                LPrim (MulW, [ LPrim (AddW, [ LPrim (MulW, [ cid; LConstW st.NSlots ]); LConstW slot ]); LConstW 4 ]) ])
-            LCallIdx (1 + List.length args, LLoad (W, idxAddr, 0), LGet (wReg t) :: argEs)
+            LCallIdx (List.length slotWits + 1 + List.length args, LLoad (W, idxAddr, 0),
+                      slotWits @ (LGet (wReg t) :: argEs))
         let vtDispatch () = vtDispatchWith (List.map (coreToLowE ctx) args)
         // a list has no IEnumerable vtable row, so route the enumerator protocol
         // to the built-in iterator when the receiver IS a built-in seq / iterator,
@@ -13529,7 +13585,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     tblIdx m "$novt" |> ignore
     let st =
         { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew (); StmtInits = dictNew ()
-          Funcs = dictNew (); FuncSig = dictNew (); FuncWitness = dictNew (); Witnesses = dictNew (); WitnessData = vecNew (); WitnessCur = 0; TypeIds = dictNew (); TypeIdNext = 1; Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
+          Funcs = dictNew (); FuncSig = dictNew (); FuncWitness = dictNew (); SlotWitness = dictNew (); SlotWitN = dictNew (); Witnesses = dictNew (); WitnessData = vecNew (); WitnessCur = 0; TypeIds = dictNew (); TypeIdNext = 1; Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; TailApp = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew (); LamWits = dictNew ()
@@ -14242,6 +14298,155 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 dictSet gcGlobalSlots (gl v) slot
         | DExtern (v, _) -> dictSet st.Externs v.Name true
         | _ -> ()
+    // ---- THE SLOT WITNESS ABI ----
+    // A generic vtable member's OWN type parameters (`HashSet.Map`'s `'b`,
+    // `HashNode.FoldWith`'s `'s`) reach it nowhere: the row's signature is
+    // fixed, and `self` carries only the CLASS' arguments. They rode a witness
+    // that says "uniform, compare structurally" and names no type — 138 of the
+    // adaptive port's fallbacks.
+    //
+    // They ride k hidden leading witness params instead. k belongs to the SLOT,
+    // not to the impl, because a row is entered without knowing which impl
+    // answers: every impl of a slot declares the same k, uses it or not. An
+    // impl's own method-level variables are its quantified set MINUS whatever
+    // the receiver type mentions — the receiver's are recovered off `self`
+    // (selfWits) and must not be counted twice — and they are the TAIL of both
+    // orders, since a member scheme's free variables are met through
+    // `TFun (self, body)`: the receiver first, the method's own after. That is
+    // what lets the call site take the last k of the instantiation it carries.
+    //
+    // Where two impls of one slot disagree on that count, or one impl fills two
+    // slots that want different k, the slot goes back to 0 for everyone. A
+    // mismatch here would hand an impl a witness meant for another position —
+    // silently, since every witness is one word — so the rule is agreement or
+    // nothing.
+    if gc then
+        let methodQuant = dictNew<string, Var list> ()
+        for d in decls do
+            match d with
+            | DLet (_, v, s, ELam (ps, _)) when (dictTryFind st.Funcs (key v)).IsSome ->
+                // Only the shape selfWits itself handles: a receiver
+                // `TCon (cn, args)` whose arguments are DISTINCT type variables,
+                // one per class parameter. Anything else and "which variables
+                // does self already supply" has no positional answer, so the
+                // rest cannot be identified as the method's own.
+                let selfIds =
+                    match ps with
+                    | (_, s0) :: _ ->
+                        (match prune s0.Body with
+                         | TCon (_, args) when not (List.isEmpty args) ->
+                             let vs = args |> List.map (fun a2 -> match prune a2 with TVar vv -> vv.Id | _ -> 0 - 1)
+                             if List.contains (0 - 1) vs || List.length (List.distinct vs) <> List.length vs then None
+                             else Some vs
+                         // a STAMPED CLONE: its class arguments are ground and
+                         // baked into the name, so nothing quantified can be
+                         // one of them and everything left is the method's own.
+                         // (A generic class implementing an interface is
+                         // monomorphized into exactly these — `Box<int>.MapTo`
+                         // is `Box$int.MapTo`, and its `'b` is the whole point.)
+                         | TCon (cn, []) ->
+                             (match dictTryFind st.RecBase cn with
+                              | Some b when cn.StartsWith (b + "$") -> Some []
+                              | _ -> None)
+                         | _ -> None)
+                    | [] -> None
+                (match selfIds with
+                 | Some ids ->
+                     let own =
+                         s.Quantified
+                         |> List.filter (fun q ->
+                             not (List.contains q.Id ids) && not (List.contains (prunedId q) ids))
+                     // and they must be the TAIL of the quantified order, which
+                     // is what lets a call site take the last k of the
+                     // instantiation it carries. A member scheme's variables are
+                     // met through `TFun (self, body)`, so this holds — checked
+                     // rather than assumed, because a mismatch would hand an
+                     // impl a witness meant for another position, silently.
+                     let n = List.length own
+                     let tail = s.Quantified |> List.skip (List.length s.Quantified - n)
+                     if n > 0 && List.length tail = n
+                        && List.forall2 (fun (a2 : Var) (b2 : Var) -> a2.Id = b2.Id) own tail then
+                         dictSet methodQuant (key v) own
+                 | None -> ())
+            | _ -> ()
+        let mqOf (k2 : string) = match dictTryFind methodQuant k2 with Some q -> q | None -> []
+        let implSlots = dictNew<string, int list> ()
+        let slotImplKeys = dictNew<int, string list> ()
+        let implVar = dictNew<string, VarId> ()
+        for cn, _, _, _ in classDecls do
+            let dispatchable =
+                List.length (chainOf cn) > 1 || List.length (subclassesOf cn) > 1
+                || (declsNamed cn |> List.exists (fun (_, _, _, impls) -> not (List.isEmpty impls)))
+            if dispatchable then
+                vtableSlots |> List.iteri (fun slot (ifn, mn) ->
+                    match slotImpl cn ifn mn with
+                    | Some v when takesSelf cn v && (dictTryFind st.Funcs (key v)).IsSome ->
+                        let k2 = key v
+                        dictSet implVar k2 v
+                        (match dictTryFind implSlots k2 with
+                         | Some ss -> if not (List.contains slot ss) then dictSet implSlots k2 (ss @ [ slot ])
+                         | None -> dictSet implSlots k2 [ slot ])
+                        (match dictTryFind slotImplKeys slot with
+                         | Some ks -> if not (List.contains k2 ks) then dictSet slotImplKeys slot (ks @ [ k2 ])
+                         | None -> dictSet slotImplKeys slot [ k2 ])
+                    | _ -> ())
+        for slot, keys in dictPairs slotImplKeys do
+            // slots 0/1/2 are the identity trio: $cmpv/$hashv call through them
+            // at a fixed (self, other), so their arity is not ours to grow
+            // The MAX, over the impls that need any: an impl whose own type
+            // arguments are already baked in (a stamped clone) needs none, and
+            // declaring k it ignores costs it nothing. Two impls that need
+            // DIFFERENT counts have no common ordering, so that slot goes back
+            // to 0 for everyone.
+            let k =
+                if slot < 3 then 0
+                else
+                    let nz = keys |> List.map (fun k2 -> List.length (mqOf k2)) |> List.filter (fun n -> n > 0) |> List.distinct
+                    match nz with
+                    | [ n ] -> n
+                    | _ -> 0
+            dictSet st.SlotWitN slot k
+        let kOf (slot : int) = match dictTryFind st.SlotWitN slot with Some x -> x | None -> 0
+        // monotone to zero, so it converges; the bound is a backstop
+        let mutable changed = true
+        let mutable rounds = 0
+        while changed && rounds < 10 do
+            changed <- false
+            rounds <- rounds + 1
+            for k2, slots in dictPairs implSlots do
+                let ks = slots |> List.map kOf |> List.distinct
+                // an impl may need FEWER than the slot supplies (it is stamped,
+                // or plainly not generic) — only needing MORE is a conflict
+                let bad =
+                    match ks with
+                    | [] -> false
+                    | [ k ] -> k <> 0 && List.length (mqOf k2) > k
+                    | _ -> true
+                if bad then
+                    for s2 in slots do
+                        if kOf s2 <> 0 then
+                            dictSet st.SlotWitN s2 0
+                            changed <- true
+        for k2, slots in dictPairs implSlots do
+            let k = match slots with s2 :: _ -> kOf s2 | [] -> 0
+            // never beside FuncWitness: the two would both claim the leading
+            // params, and a vtable impl is exactly what the FuncWitness pass
+            // excludes
+            if k > 0 && (dictTryFind st.FuncWitness k2).IsNone then
+                // an impl that needs fewer takes the slot's shape anyway: its
+                // OWN variables are the last of the k (the tail rule again),
+                // and the leading pad binds ids nothing can look up
+                let own = mqOf k2 |> List.map (fun q -> q.Id, prunedId q)
+                let pad = List.init (k - List.length own) (fun i -> (0 - 1 - i, 0 - 1 - i))
+                dictSet st.SlotWitness k2 (pad @ own)
+        if System.Environment.GetEnvironmentVariable "FPP_SLOTWIT" = "1" then
+            for slot, k in dictPairs st.SlotWitN do
+                if k > 0 then
+                    let ifn, mn = List.item slot vtableSlots
+                    eprintfn "SLOTWIT %s.%s k=%d impls=[%s]" ifn mn k
+                        (match dictTryFind slotImplKeys slot with
+                         | Some ks -> ks |> List.map (fun k2 -> (match dictTryFind implVar k2 with Some v -> v.Name | None -> k2) + "/mq" + string (List.length (mqOf k2))) |> String.concat ","
+                         | None -> "")
     // JS interop detection: any Js.* primitive use (EUnknown "js<Upper>…") or
     // a [<JsImport>] extern turns on the "jslin" boundary imports. Runs before
     // rtDeclsLin — imports must precede every declared function.
@@ -14468,7 +14673,10 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, _)) when (dictTryFind st.Funcs (key v)).IsSome ->
-            let nw = match dictTryFind st.FuncWitness (key v) with Some ws -> List.length ws | None -> 0
+            let nw =
+                match dictTryFind st.FuncWitness (key v) with
+                | Some ws -> List.length ws
+                | None -> (match dictTryFind st.SlotWitness (key v) with Some ws -> List.length ws | None -> 0)
             (match dictTryFind st.FuncSig (key v) with
              | Some (paramTys, retTy) ->
                  let tn = "$ft" + fn v
@@ -14929,12 +15137,16 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // Link mints every stamp in its own offset zone (stampNext), and
             // mangles the instantiation onto the name; a stamped member spells
             // the CLASS' parameters first.
+            let hidWits =
+                match dictTryFind st.FuncWitness (key v) with
+                | Some ws -> ws
+                | None -> (match dictTryFind st.SlotWitness (key v) with Some ws -> ws | None -> [])
             curNoWitnessChannel <-
                 gc && not (List.isEmpty sch.Quantified)
-                && (dictTryFind st.FuncWitness (key v)).IsNone
+                && List.isEmpty hidWits
                 && v.Offset < 800000000
             curChannelKind <- (if v.Offset >= 800000000 then "stamp"
-                               elif (dictTryFind st.FuncWitness (key v)).IsSome then "has-params"
+                               elif not (List.isEmpty hidWits) then "has-params"
                                elif List.isEmpty sch.Quantified then "monomorphic"
                                else "vtable-impl")
             curStampArgs <-
@@ -14972,7 +15184,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 match dictTryFind st.TupleParam (key v), body with
                 | Some binds, EMatch (_, [ (_, None, inner) ]) -> binds, inner
                 | _ -> ps, body
-            emitFuncLow st m (fn v) (match dictTryFind st.BrParamPay (key v) with Some d -> d | None -> dictNew ()) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncParamPlan (key v) with Some pl -> pl | None -> []) (match dictTryFind st.FuncParamByRef (key v) with Some bl -> bl | None -> []) (dictTryFind st.FuncRetStruct (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps2 |> List.map fst) (ps2 |> List.map (fun (_, s) -> s.Body)) body2 (fun _ -> ())
+            emitFuncLow st m (fn v) (match dictTryFind st.BrParamPay (key v) with Some d -> d | None -> dictNew ()) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncParamPlan (key v) with Some pl -> pl | None -> []) (match dictTryFind st.FuncParamByRef (key v) with Some bl -> bl | None -> []) (dictTryFind st.FuncRetStruct (key v)) hidWits selfWits constWits (ps2 |> List.map fst) (ps2 |> List.map (fun (_, s) -> s.Body)) body2 (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -15049,6 +15261,14 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         // Must equal FPPRT_WASM_NROOTS in fpprt-wasm-shim.c — the shadow stack has
         // no bounds check, so this range has to cover the deepest recursion the
         // compiler reaches self-hosting (the full-prelude compile needs >>64K).
+        // INTERN THE TYPE NAMES FIRST. `$sp` is baked from RootNext here, so a
+        // constant interned after this line lands in the shadow stack and is
+        // overwritten by the first push — `typeName<'a>` through a witness read
+        // whatever the stack had left there. (The table itself is written
+        // below; only the slot allocation has to happen before `$sp`.)
+        let tyNameSlots =
+            (0, internStrRawGc st "obj")
+            :: (dictPairs st.TypeIds |> List.map (fun (nm, i) -> i, internStrRawGc st nm))
         ic rf 2097152; callf rf "$rootsreg"
         ic rf (st.RootNext * 4); gs rf "$sp"
         // fill the tid->cid table (raw class-ids, fixed static memory)
@@ -15066,12 +15286,15 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         // string. Indirecting through a root slot rather than storing the
         // pointer keeps the table a plain int array — the strings themselves
         // are already rooted, so a moving collection updates them there.
-        (let names = dictPairs st.TypeIds
-         let maxId = names |> List.fold (fun a (_, i) -> if i > a then i else a) 0
+        // ENTRY 0 is "obj": id 0 is a witness that does not know what it is,
+        // and an unwritten entry left the read indexing ROOT SLOT 0 — the print
+        // scratch buffer — so `typeName` on such a witness answered with
+        // whatever text happened to be in it. Same answer as the untyped
+        // concrete path.
+        (let maxId = tyNameSlots |> List.fold (fun a (i, _) -> if i > a then i else a) 0
          ic rf gcIntTid; ic rf (maxId + 1); callf rf "$fpallocn"; ls rf "$t"
          gg rf "$roots"; ic rf (4 * st.TyNameSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
-         for nm, i in names do
-             let sl = internStrRawGc st nm
+         for i, sl in tyNameSlots do
              lg rf "$t"; ic rf (8 + 4 * i); ins rf "i32.add"; ic rf sl; mem rf "i32.store")
         // the tid->cid table is a FIXED static array in fpprt-wasm-shim.c
         // (FPPRT_WASM_NTIDS). Writing past it corrupts the static memory that

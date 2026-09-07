@@ -1061,6 +1061,11 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                 // resolve the SYMBOLIC instantiation the way $class does:
                 // the size is only knowable once the stamp names the type
                 EUnknown ("$sizeof:" + substName subst (n.Substring 8))
+            | EUnknown n when n.StartsWith "$typename:" ->
+                // the same for the NAME: a stamp knows the type, so the marker
+                // must be substituted alongside $sizeof or a stamped clone
+                // reaches the backend still naming a variable nothing binds
+                EUnknown ("$typename:" + substName subst (n.Substring 10))
             | EUnknown n when n.StartsWith "$class:" ->
                 // an ARRAY pattern would read better here, but F++ has no
                 // array patterns yet (see PLAN.md) — an array literal in
