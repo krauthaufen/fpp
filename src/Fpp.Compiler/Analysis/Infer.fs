@@ -7032,12 +7032,41 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // from, and storing a pair into it asked `'T` to become `'T * 'T`.
             // That surfaced as an occurs check on the tuple, a long way from
             // the binding that caused it.
-            let declaresTyParams =
+            let tyParamNode =
                 vecToList before
-                |> List.exists (fun c ->
+                |> List.tryPick (fun c ->
                     match c with
-                    | GNode t -> t.NodeKind = TyParams
-                    | _ -> false)
+                    | GNode t when t.NodeKind = TyParams -> Some t
+                    | _ -> None)
+            let declaresTyParams = tyParamNode.IsSome
+            // AN EXPLICITLY DECLARED TYPE PARAMETER IS QUANTIFIED, whether or
+            // not the binding's TYPE mentions it. `let rec union<'K, 'V> (cmp :
+            // IEqualityComparer<'K>) (na : SetNode<'K>) (nb : SetNode<'K>)` uses
+            // 'V only in a CAST TARGET (`na :?> MapLeaf<'K,'V>`) and in the
+            // nodes it builds — so HM generalization, which reads the type,
+            // dropped it. It is observable all the same: the cast's success
+            // depends on it, and the objects the body constructs carry its
+            // witness. Every caller spells `union<'K, 'V>`, so the argument is
+            // there to be passed; without the quantifier there was no parameter
+            // to pass it in, and the witness fell back to uniform at each use.
+            //
+            // DECLARED PARAMETERS COME FIRST, in written order: an explicit
+            // application (`union<'K, 'V> cmp na nb`) pins positionally against
+            // the scheme, so the two orders have to be the one order.
+            let declaredParamVars : Var list =
+                if letDepth > 0 then []
+                else
+                    match tyParamNode with
+                    | Some tp ->
+                        tp.Children
+                        |> List.choose (fun c ->
+                            match c with
+                            | GNode x when isTypeKind x.NodeKind ->
+                                (match prune (typeFromNode vars x) with
+                                 | TVar v -> Some v
+                                 | _ -> None)
+                            | _ -> None)
+                    | None -> []
             // An ANNOTATION with free type variables is the same promise a
             // `<'k,'v>` makes: `let empty : HashNode<'k,'v> = hmEmpty ()` is a
             // GENERIC VALUE, so it is exempt from the value restriction exactly
@@ -7071,7 +7100,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             (match Green.tokens (GNode namePat) |> List.tryFind (fun t -> t.Kind = Ident) with
              | Some t when (dictTryFind defsAt t.Offset).IsSome ->
                  if isMutable || expansiveValue then setScheme t.Offset (mono funTy)
-                 else setScheme t.Offset (generalizeBinding declared funTy)
+                 else
+                     let sch0 = generalizeBinding declared funTy
+                     let declQ =
+                         declaredParamVars
+                         // the same level rule GeneralizeWith applies: a
+                         // variable an OUTER binding owns is not this one's to
+                         // quantify
+                         |> List.filter (fun v -> v.Level > st.Level)
+                     let sch =
+                         if List.isEmpty declQ then sch0
+                         else
+                             let rest =
+                                 sch0.Quantified
+                                 |> List.filter (fun q -> not (declQ |> List.exists (fun v -> v.Id = q.Id)))
+                             { Quantified = declQ @ rest
+                               Constraints = sch0.Constraints
+                               Body = sch0.Body }
+                     setScheme t.Offset sch
                  // an ACTIVE PATTERN definition must answer its cases'
                  // carrier: the parser spells `(|A|B|)` as `$ap$A$B`. A
                  // total multi-case answers ActiveChoiceN, a partial
