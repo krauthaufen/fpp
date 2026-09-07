@@ -91,7 +91,13 @@ type InferResult =
       /// offsets of computation-expression body items that have no value:
       /// statements, where anything else in the same position would be an
       /// implicit `yield`
-      CompStatements : int list }
+      CompStatements : int list
+      /// offsets of computation-expression body items the probe typed and
+      /// found to HAVE a value — the other half of CompStatements, and the
+      /// only positions where "this value would be discarded" can be said
+      /// with certainty: an item the probe never typed (a branch body, a
+      /// loop body) is unknown, not a statement
+      CompValues : int list }
 
 type FieldInfo =
     { TypeName : string
@@ -727,6 +733,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// the PROBE pass fills this: by the time the rewrite has run there is
     /// no CompExpr left to see.
     let compBuildersRaw = vecNew<int * Type> ()
+    let compValuesRaw = vecNew<int> ()
     let customOpsRaw = vecNew<string * string * string> ()
     /// offsets of bare body expressions that turned out to have NO value —
     /// statements, not implicit yields
@@ -1985,6 +1992,31 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// which class DECLARED the member at (path, offset) — the bare name
     /// is no longer unique across classes, so ownership keys on the def
     let memberOwnerByDef = dictNew<string * int, string> ()
+    /// which class declares the member a USE resolved to, or None.
+    ///
+    /// A class member's name is global, so a use in another file can only be
+    /// recognized BY NAME — and a name is a poor witness: `show`, `create`,
+    /// `read`, `min` and `compare` are all class members here, and all of
+    /// them are names a program legitimately binds. Taking such a binding's
+    /// use for the class member ran the INSTANCE body in its place, silently:
+    /// `let show (x : 'a) = "v(" + string x + ")"` answered "7" for `show 7`,
+    /// its literal parts gone, because the body executed was Show's
+    /// (~/claude/fpp-base-snags.md #45).
+    ///
+    /// The name counts only when the definition it resolved to LIVES WHERE
+    /// THE CLASS WAS DECLARED — a member declaration sits inside its class,
+    /// so its file and a position after the class' own token are what no
+    /// ordinary binding elsewhere can imitate.
+    let memberOwnerOfUse (d : Resolve.Definition) (name : string) : string option =
+        match dictTryFind memberOwnerByDef (d.Path, d.Offset) with
+        | Some cls -> Some cls
+        | None ->
+            match dictTryFind classes.MemberOwner name with
+            | Some cls ->
+                (match dictTryFind classes.Classes cls with
+                 | Some cd when cd.Path = d.Path && d.Offset >= cd.Offset -> Some cls
+                 | _ -> None)
+            | None -> None
     /// operator offset -> the left operand's type, for the backend
     let opTypesRaw = vecNew<int * Type> ()
     let exprTypesRaw = vecNew<int * int * Type> ()
@@ -3575,9 +3607,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         vecAdd packSitesRaw (t.Offset, cninfo, c0, elems)
                                     | [] -> ())
                                | None -> ())
-                              match (match dictTryFind memberOwnerByDef (d.Path, d.Offset) with
-                                     | Some cls -> Some cls
-                                     | None -> dictTryFind classes.MemberOwner t.Text) with
+                              match memberOwnerOfUse d t.Text with
                               | Some cls ->
                                   (match cs |> List.tryFind (fun c -> c.Class = cls) with
                                    | Some c -> vecAdd pendingClassUses (t.Offset, t.Text, c, true, qfresh)
@@ -6067,9 +6097,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               let pinTo (c : Constraint) =
                                   if c.Args.Length = written.Length then
                                       List.iter2 (unifyAt tk.Offset) c.Args written
-                              (match (match dictTryFind memberOwnerByDef (d.Path, d.Offset) with
-                                      | Some cls -> Some cls
-                                      | None -> dictTryFind classes.MemberOwner d.Name) with
+                              (match memberOwnerOfUse d d.Name with
                                | Some cls ->
                                    (match cs |> List.tryFind (fun c -> c.Class = cls) with
                                     | Some c -> pinTo c
@@ -6084,9 +6112,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          // `Num.Zero` binds to an instance member exactly as
                          // the bare `Zero` does — the qualification only says
                          // which class, never which instance
-                         match (match dictTryFind memberOwnerByDef (d.Path, d.Offset) with
-                                | Some cls -> Some cls
-                                | None -> dictTryFind classes.MemberOwner d.Name) with
+                         match memberOwnerOfUse d d.Name with
                          | Some cls ->
                              (match cs |> List.tryFind (fun c -> c.Class = cls) with
                               | Some c -> vecAdd pendingClassUses (tk.Offset, d.Name, c, true, qfresh)
@@ -6384,6 +6410,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match nodesOf brace with
                          | [ one ] when one.NodeKind = BlockExpr -> nodesOf one
                          | ms -> ms
+                     // An item that is NOT a bare expression — a `for`, an
+                     // `if`, a `yield`, a `let!` — is deliberately left
+                     // untyped here: it is still written in the forms the
+                     // rewrite has not produced yet. But a CE NESTED inside
+                     // one is a computation of its own, and its builder has
+                     // to be typed or the rewrite gets the UNKNOWN builder
+                     // for it: no Run, no Delay, and the inner CE's
+                     // statements desugar onto the OUTER builder. That was a
+                     // silent wrong tree — `div { for i in 1 .. 3 do span
+                     // { … } }` put the spans' content on the div and
+                     // produced no span at all (~/claude/fpp-base-snags.md
+                     // #50). Typing the nested CompExpr re-enters this arm,
+                     // so its own body and its own nesting are covered.
+                     let rec probeNestedCe (m : GreenNode) : unit =
+                         if m.NodeKind = CompExpr then exprType (GNode m) |> ignore
+                         else for x in nodesOf m do probeNestedCe x
                      for it in items do
                          if isBareCompItem it then
                              let t = exprType (GNode it)
@@ -6391,8 +6433,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some tok ->
                                   (match prune t with
                                    | TCon ("unit", []) -> vecAdd compStmtsRaw tok.Offset
-                                   | _ -> ())
+                                   | TVar _ -> ()
+                                   | _ -> vecAdd compValuesRaw tok.Offset)
                               | None -> ())
+                         else probeNestedCe it
                  | None -> ())
                 st.Fresh ()
             | RecordExpr ->
@@ -9726,6 +9770,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
       MemberSites = vecToList memberSitesRaw
       FieldOwners = vecToList fieldOwnersRaw
       CompStatements = vecToList compStmtsRaw
+      CompValues = vecToList compValuesRaw
       CustomOps = vecToList customOpsRaw
       CompBuilders =
         vecToList compBuildersRaw
