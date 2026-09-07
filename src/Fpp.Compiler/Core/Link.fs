@@ -823,7 +823,13 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
             |> List.exists (fun qv -> t = "#" + string qv.Id || t = "#" + string (prunedId qv))
         | None -> false
 
-    let rewrite (owner : string) (ownerKey : string * int) (subst : Dict<string, string>) (isTemplate : bool) (e : Expr) : Expr =
+    /// `isClone` says this body is a STAMPED COPY: its instantiation is ground
+    /// (capInst forces it), so `substScheme` leaves it quantifying nothing. A
+    /// variable the substitution did not resolve therefore has nothing left to
+    /// resolve it, and `obj` is its name — asking `ownerQuantifies` about the
+    /// ORIGINAL definition answers a question the clone is not the subject of,
+    /// and kept 59 names symbolic that no witness parameter existed for.
+    let rewrite (owner : string) (ownerKey : string * int) (subst : Dict<string, string>) (isTemplate : bool) (isClone : bool) (e : Expr) : Expr =
         e |> mapExpr (fun x ->
             match x with
             | EVarI (v, sch, inst0) ->
@@ -860,14 +866,30 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                                 // shape. Nothing stamped such a slot, so nothing
                                 // put a raw scalar in it: it holds an ordinary
                                 // uniform word, and `obj` names that honestly.
-                                if isTemplate then t
-                                elif not stampScalars then "obj"
+                                // A TEMPLATE COLLAPSES TOO. The template body is
+                                // itself EMITTED, as the shared Canon function —
+                                // clones are rewritten from the ORIGINAL body in a
+                                // pass of their own, so nothing downstream reads
+                                // this copy's names but the backend. Leaving a
+                                // variable the owner does not quantify symbolic
+                                // there asked it to forward a witness that has no
+                                // parameter: 220 of the port's 380 uniform
+                                // fallbacks were exactly this, a name for a
+                                // variable the enclosing definition is not
+                                // generic in.
+                                if isClone && stampScalars then "obj"
+                                elif not stampScalars then (if isTemplate then t else "obj")
                                 else
                                     let sb = dictNew<string, string> ()
                                     for mv in varsIn t do
                                         if not (ownerQuantifies ownerKey mv) then dictSet sb mv "obj"
-                                    let r2 = substName sb t
-                                    if r2.Contains "#" then t else r2
+                                    // and a MIXED name keeps what it resolved:
+                                    // `list$<#7.#9>` where the owner quantifies
+                                    // only #7 becomes `list$<#7.obj>`, not the
+                                    // original. Refusing a partial answer left
+                                    // the whole name symbolic and both halves
+                                    // unresolved.
+                                    substName sb t
                         else t)
                 // a TUPLE argument stamps by its elements only where a class
                 // CONSTRAINT observes that variable — element names are what
@@ -1281,7 +1303,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                 isFunction
                 && (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
                 && not (List.isEmpty sch.Quantified)
-            vecAdd out (DLet (rc, v, sch, rewrite v.Name (v.Path, v.Offset) (dictNew ()) isTemplate e))
+            vecAdd out (DLet (rc, v, sch, rewrite v.Name (v.Path, v.Offset) (dictNew ()) isTemplate false e))
         | other -> vecAdd out other
 
     // transitive closure: stamping a clone may demand further stamps
@@ -1731,7 +1753,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                  // env-gated pass cannot be validated by the fixpoint, because
                  // GetEnvironmentVariable answers null inside the wasm-hosted
                  // compiler, so stage-0 would run it and stage-1 would not.
-                 let body0 = objFix (allocFix (selfFix (rewrite mangled selfKey subst false e)))
+                 let body0 = objFix (allocFix (selfFix (rewrite mangled selfKey subst false true e)))
                  let body1 = substBinderTypes inst sch substOverride body0
                  DLet (rc, nv, substScheme inst sch,
                        alphaRename (10000000 + (abs (strHash mangled) % 1000000) * 10) body1)

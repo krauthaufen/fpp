@@ -471,6 +471,12 @@ let mutable private curStampArgs : string list = []
 /// tagged scalar or a pointer, never a raw one. The uniform witness is therefore
 /// the correct answer for whatever `self` could not supply — the UNKNOWN
 /// sentinel was only ever an admission that nobody had worked this out.
+/// the ids the ENCLOSING definition's scheme quantifies. A `#N` with no witness
+/// in scope is one of two very different things, and only this tells them
+/// apart: a variable the definition IS generic in (a missing CHANNEL — the
+/// backend owes it a parameter) or one it is not (Link should have collapsed
+/// the name to `obj` before the backend ever saw it).
+let mutable private curFnQuantIds : int list = []
 let mutable private curNoWitnessChannel = false
 let mutable private curChannelKind = "?"
 let mutable private chkSite = 0
@@ -5829,7 +5835,8 @@ let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
             (if System.Environment.GetEnvironmentVariable "FPP_WITSTRICT" = "1" then
                 eprintfn "UNIFVAR %s kind=%s var=%s have=[%s]" curFnDbg curChannelKind nm
                     (dictPairs ctx.Witness |> List.map (fst >> string) |> List.sort |> String.concat ","))
-            uniformWitnessWhy ctx.LSt "freevar"
+            uniformWitnessWhy ctx.LSt
+                (if List.contains (int (nm.Substring 1)) curFnQuantIds then "freevar-nochannel" else "freevar-notgeneric")
     else
         let bare = layStripGen nm
         witnessPtrRMKT ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm
@@ -9312,7 +9319,14 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                              | None ->
                                  match witFromArgs vid pid with
                                  | Some w -> w
-                                 | None -> uniformWitnessWhy st ((if List.isEmpty inst then "call-unnamed" else "call-freevar") + ":" + v.Name)))
+                                 | None ->
+                                     let tag =
+                                         match List.tryItem i inst with
+                                         | Some nm when nm.Length > 1 && nm.[0] = '#' ->
+                                             if List.contains (int (nm.Substring 1)) curFnQuantIds then "call-nochannel" else "call-notgeneric"
+                                         | Some _ -> "call-named"
+                                         | None -> "call-unnamed"
+                                     uniformWitnessWhy st (tag + ":" + v.Name)))
             | None ->
                 // a SLOT-witness member called DIRECTLY (its concrete type was
                 // known here, so no dispatch): the hidden params are the
@@ -15401,6 +15415,9 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 | None -> []
             // a tupled member's PARAMETERS are the destructured binders, and
             // its body is the match's arm — the tuple never exists
+            curFnQuantIds <-
+                (sch.Quantified |> List.map (fun q -> q.Id))
+                @ (sch.Quantified |> List.map prunedId)
             let ps2, body2 =
                 match dictTryFind st.TupleParam (key v), body with
                 | Some binds, EMatch (_, [ (_, None, inner) ]) -> binds, inner
