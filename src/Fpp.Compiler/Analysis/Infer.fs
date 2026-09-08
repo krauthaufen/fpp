@@ -5761,8 +5761,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // `e :> T` / `e :?> T`: the operand is typed for its own
                 // sake, the result is the target type
                 let cvars = dictNew<string, Type> ()
+                let mutable opTy = None
                 (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
-                 | Some operand -> exprType (GNode operand) |> ignore
+                 | Some operand -> opTy <- Some (exprType (GNode operand))
                  | None -> ())
                 if hasOpToken ":?" n then
                     (match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
@@ -5775,7 +5776,39 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     tBool
                 else
                     match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
-                    | Some tn -> typeFromNode cvars tn
+                    | Some tn ->
+                        let ty = typeFromNode cvars tn
+                        // AN UPCAST'S TYPE ARGUMENTS COME FROM THE CLASS.
+                        // `ConstantVal<'T>(v) :> aval<_>` is an `aval<'T>` and
+                        // nothing else — the class declares which
+                        // instantiation of the interface it implements. Left
+                        // to the wildcard, the two were INDEPENDENT: the
+                        // adaptive port's `AVal.constant` inferred
+                        // `'a -> aval<'b>`, so `constant (Some x)` fitted a
+                        // parameter declared `aval<seq<_>>`, an overload was
+                        // chosen on that lie, and the option was ENUMERATED at
+                        // run time. F# rejects the program (FS0001); here it
+                        // built and trapped in a vtable row that does not
+                        // exist (~/claude/fpp-base-snags.md #48).
+                        (match opTy with
+                         | Some ot ->
+                             (match prune ot, prune ty with
+                              | TCon (cname, cargs), TCon (iname, iargs) when
+                                     cname <> iname && iname <> "obj"
+                                     && not (List.isEmpty iargs) && not (List.isEmpty cargs)
+                                     && isSupertypeOf iname cname ->
+                                  (match Types.subsumeHook with
+                                   | Some hook ->
+                                       (match hook (TCon (iname, iargs)) (TCon (cname, cargs)) with
+                                        | Some (da, db) ->
+                                            (match Green.tokens (GNode tn) |> List.tryHead with
+                                             | Some t -> unifyAt t.Offset da db
+                                             | None -> unify da db |> ignore)
+                                        | None -> ())
+                                   | None -> ())
+                              | _ -> ())
+                         | None -> ())
+                        ty
                     | None -> st.Fresh ()
             | DotExpr when
                   (nodesOf n |> List.exists (fun m -> m.NodeKind = ListExpr))

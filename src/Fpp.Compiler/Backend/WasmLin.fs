@@ -1743,18 +1743,30 @@ let private emitNoVt (m : Mod) : unit =
     ins f "unreachable"
     endFn f
 
-/// the same trap at the WIDER slot shapes (a slot that passes witnesses)
-let private emitNoVt3 (m : Mod) : unit =
-    let f = beginFn m [ "$a"; "$b"; "$c" ]
+/// the same trap at the WIDER slot shapes (a slot that passes witnesses).
+/// They PRINT the receiver's class id first: a missing row is otherwise a
+/// bare `unreachable` in a frame named `$novt3`, and the one thing the reader
+/// needs — WHICH type had no implementation — is exactly what the backtrace
+/// cannot say. `FPP_VTDBG=1` prints `cid=` per class, so the number names it.
+let private emitNoVtCid (m : Mod) (ps : string list) : unit =
+    let f = beginFn m ps
     localsDone f
+    // the header holds `tid<<1|1` under GC, the class id directly otherwise
+    // the RECEIVER's class id, printed before the trap: a missing row is
+    // otherwise a bare `unreachable` in a frame named `$novt3`, and the one
+    // thing the reader needs — WHICH type had no implementation — is exactly
+    // what the backtrace cannot say. `FPP_VTDBG=1` prints `cid=` per class,
+    // so the number names it. The receiver is the SECOND argument: a slot
+    // that carries witnesses passes them first.
+    lg f "$b"; mem f "i32.load"
+    (if gc then (ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"; gg f "$t2c"; ins f "i32.add"; mem f "i32.load"))
+    callf f "$str_of_int"; callf f "$prints"
     ins f "unreachable"
     endFn f
 
-let private emitNoVt4 (m : Mod) : unit =
-    let f = beginFn m [ "$a"; "$b"; "$c"; "$d" ]
-    localsDone f
-    ins f "unreachable"
-    endFn f
+let private emitNoVt3 (m : Mod) : unit = emitNoVtCid m [ "$a"; "$b"; "$c" ]
+
+let private emitNoVt4 (m : Mod) : unit = emitNoVtCid m [ "$a"; "$b"; "$c"; "$d" ]
 
 let private emitClsEq (m : Mod) : unit =
     let f = beginFn m [ "$a"; "$b" ]
