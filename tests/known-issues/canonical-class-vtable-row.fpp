@@ -2,6 +2,18 @@
 // only ever stamped at the CONCRETE instantiations, so the row names a stamp
 // nobody made and the dispatch traps in `$novt3`.
 //
+// WHY THE FUNCTION IS MISSING, settled 2026-09-08 by `FPP_NO_DCE=1`: with dead
+// -code elimination off, EVERY row fills. Nothing was missing from
+// monomorphization — elimination dropped the functions, and it only drops what
+// nothing can reach, since a class' vtable members are parked on its
+// CONSTRUCTOR and woken when the construction turns out reachable. So an
+// unfilled row means THIS PROGRAM NEVER BUILDS THAT CLASS, and the row cannot
+// be entered. The base-template fallback that used to fill 836 of them is gone
+// (it would answer with the base's body where an override belongs).
+//
+// What is left here is the latent half: if a program ever does construct such
+// a class canonically, the row is a trap and `--strict` will not have said so.
+//
 // THE fpp.dom TRAP THIS FILE WAS WRITTEN FOR WAS NOT THIS (2026-09-08). It
 // was a WILDCARD UPCAST taking type arguments independent of its class:
 // `C<'T>(v) :> IBox<_>` left the interface's argument free, so
@@ -48,24 +60,21 @@
 //     template is not among the emitted functions: monomorphization stamped
 //     the concrete uses and nothing kept the template alive, so a value whose
 //     class-id is the canonical one has nothing to dispatch to.
-//   * a STAMPED class whose own stamp is missing now falls back to its base's
-//     template when the widths agree — that filled 893 rows in this program,
-//     including MapExt$obj$obj's. It does not reach the base classes above,
-//     which have no base of their own to borrow from.
+//   * that fallback is GONE (2026-09-08): borrowing the base's function
+//     answers with the base's body where an override belongs, and the rows it
+//     filled — 836 of them — were never dispatched.
 //   * every unfilled row is now the trap of ITS SLOT'S WIDTH ($novt/$novt3/
 //     $novt4). Before that they were 0 — index 0, `$novt`, which takes two
 //     arguments — so a slot passing witnesses failed the call_indirect TYPE
 //     CHECK first and the engine said "indirect call type mismatch" with
 //     nothing to name. That is why this looked like a mystery for so long.
 //   * a row whose filler takes a different number of witnesses than its slot
-//     passes is reported at build time now ("stubbed vtable row …"); twelve
-//     of them exist in that program, and none is the one that traps.
+//     passes is reported only when some `EIfaceCall` names that pair; the rest
+//     are columns for members nothing dispatches (13 in fpp.dom, 18 in
+//     fpp.rendering, all silent now).
 //
-// WHAT IT NEEDS: the template must survive for a class that is still
-// CONSTRUCTED canonically — either by keeping it as a DCE root whenever the
-// canonical class-id is reachable, or by stamping the canonical
-// instantiation like any other. The fix belongs in Link, beside the stamping
-// decisions, not in the backend.
+// WHAT IT WOULD NEED, if a program ever reaches one: the canonical
+// instantiation stamped like any other, in Link beside the stamping decisions.
 module CanonicalClassVtableRow
 
 // what the shape looks like in the small (this one WORKS — the stamp exists)

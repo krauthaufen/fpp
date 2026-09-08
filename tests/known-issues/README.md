@@ -20,7 +20,16 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
 ~/.wasmtime/bin/wasmtime run -W gc=y,exceptions=y /tmp/x.wasm
 ```
 
-One open issue: `canonical-class-vtable-row.fpp` — a generic class that is
+Three entries, none of them reached by any program we can build:
+
+* `canonical-class-constant.fpp` — the prelude's generic range keeps an
+  unresolved `$class:Num:One` marker in its UNSTAMPED copy. Every call lands on
+  a stamp and answers correctly; the canonical copy is emitted and never
+  entered.
+* `witness-uniform-fallback.md` — 45 witness arguments in fpp.dom's build go out
+  uniform. Measured, not a defect: they sit in canonical bodies, where the
+  values really are uniform.
+* `canonical-class-vtable-row.fpp` — a generic class that is
 CONSTRUCTED canonically (all-obj) has no vtable row, because its members were
 only stamped at the concrete instantiations and the shared template did not
 survive. The file cannot hold its own repro (every small program stamps what

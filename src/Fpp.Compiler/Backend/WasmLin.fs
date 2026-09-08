@@ -16165,8 +16165,14 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     let bytes = assembleWith m pages st.UsesExn ""
     if not (isNull (System.Environment.GetEnvironmentVariable "FPP_LINWARN")) then
         for w in vecToList st.Warnings do eprintfn "LINWARN %s" w
+        // FPP_FNMAP=<hash,hash,...> resolves the `$fN` names the witness and
+        // stub diagnostics print back to their definition keys
+        let fnmapWanted =
+            match System.Environment.GetEnvironmentVariable "FPP_FNMAP" with
+            | null -> [ "2034791193"; "658953085"; "2143567545"; "1381067340"; "1380175341" ]
+            | e -> e.Split ',' |> Array.toList
         for (k, _) in dictPairs st.Funcs do
-            for h in [ "2034791193"; "658953085"; "2143567545"; "1381067340"; "1380175341" ] do
+            for h in fnmapWanted do
                 if string (abs (strHash k)) = h then eprintfn "FNMAP f%s = %s name=%s" h k (match dictTryFind nameOf k with Some n -> n | None -> "?")
     (if System.Environment.GetEnvironmentVariable "FPP_WITSCAN" = "1" then
         let byCat = dictNew<string, int> ()
