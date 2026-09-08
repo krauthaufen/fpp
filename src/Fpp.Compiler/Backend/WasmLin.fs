@@ -5897,6 +5897,9 @@ let private witnessPtr (st : St) (t : Type) : LExpr =
 /// It replaces an "unknown" SENTINEL (refMask 2) that meant "nobody worked this
 /// out" and dropped the whole object onto the conservative tagged shape.
 /// Counted anyway, so the sites stay visible (FPP_WITSCAN / FPP_WITSTRICT).
+/// every DLet's declared scheme, keyed like the function table: what a use
+/// that carries no scheme of its own falls back to (see `witFromArgs`).
+let private defSchemeOf = dictNew<string, Scheme> ()
 let mutable private witUniformCount = 0
 /// every witness ARGUMENT a call site emits, resolved or not — the denominator
 /// the fallback count only means something against
@@ -9436,7 +9439,14 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 match prune t with
                 | TFun (a2, r) -> peel r (acc @ [ a2 ])
                 | _ -> acc
-            let ptys0 = peel vsch.Body []
+            // the use's scheme first; the DEFINITION's when the use carries
+            // none (peeling `?` answers no parameters, and then nothing lines up)
+            let ptys0 =
+                match peel vsch.Body [] with
+                | [] -> (match dictTryFind defSchemeOf (key v) with
+                         | Some ds -> peel ds.Body []
+                         | None -> [])
+                | ps -> ps
             // a TUPLED callee takes one arrow over a tuple; the caller spreads it
             let ptys, argEs =
                 match ptys0, args with
@@ -9534,6 +9544,24 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                                              if List.contains (int (nm.Substring 1)) curFnQuantIds then "call-nochannel" else "call-notgeneric"
                                          | Some _ -> "call-named"
                                          | None -> "call-unnamed"
+                                     (if System.Environment.GetEnvironmentVariable "FPP_WITWHY" = v.Name then
+                                         let rec peel2 (t : Type) (acc : Type list) =
+                                             match prune t with
+                                             | TFun (a2, r) -> peel2 r (acc @ [ a2 ])
+                                             | _ -> acc
+                                         eprintfn "WITWHY %s i=%d vid=%d pid=%d body=%s quant=[%s] params=[%s] args=[%s] ctxwit=[%s]"
+                                             v.Name i vid pid (typeString (prune vsch.Body))
+                                             (vsch.Quantified |> List.map (fun q -> string q.Id) |> String.concat ",")
+                                             (peel2 vsch.Body [] |> List.map typeString |> String.concat "; ")
+                                             (args |> List.map (fun a ->
+                                                 match a with
+                                                 | EVar (_, s2) | EVarI (_, s2, _) -> "var:" + typeString (prune s2.Body)
+                                                 | EField (_, fn2, _) -> "field:" + fn2
+                                                 | _ -> "?") |> String.concat "; ")
+                                             (dictPairs ctx.Witness |> List.map (fun (k2, _) -> string k2) |> String.concat ",")
+                                         eprintfn "   host kind=%s stampargs=[%s] quantids=[%s]"
+                                             curChannelKind (String.concat "," curStampArgs)
+                                             (curFnQuantIds |> List.map string |> String.concat ","))
                                      uniformWitnessWhy st (tag + ":" + v.Name)))
             | None ->
                 // a SLOT-witness member called DIRECTLY (its concrete type was
@@ -14754,6 +14782,12 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // param path (decl, emit, call, generic cons) is a no-op there.
             if gc && not (List.isEmpty s.Quantified) && (dictTryFind vtImpls (key v)).IsNone then
                 dictSet st.FuncWitness (key v) (s.Quantified |> List.map (fun qv -> qv.Id, prunedId qv))
+            // THE DEFINITION'S OWN SCHEME, for a use that carries none. A call
+            // whose `EVar` was built without one (`min` reached through the
+            // by-name router) left the argument-derived witness path with no
+            // parameter types to line the arguments up against, so it could not
+            // even look at an argument whose static type names the variable.
+            dictSet defSchemeOf (key v) s
         | DLet (_, v, s, _) ->
             dictSet st.Globals (key v) true
             (match scalarLTy s.Body with
