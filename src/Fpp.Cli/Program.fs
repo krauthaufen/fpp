@@ -86,6 +86,28 @@ let private preludeCacheStore (file : string) : unit =
             System.IO.File.Move (tmp, file, true)
     with _ -> ()
 
+/// A stub names its function's definition as "<path>:<offset>"; the CLI holds
+/// the sources, so it is the one place that can turn that into the line and
+/// column every other diagnostic prints.
+let private atSource (msg : string) : string =
+    let i = msg.IndexOf " at "
+    if i < 0 then msg
+    else
+        let rest = msg.Substring (i + 4)
+        let j = rest.IndexOf " ("
+        let loc = if j < 0 then rest else rest.Substring (0, j)
+        let k = loc.LastIndexOf ':'
+        if k <= 0 then msg
+        else
+            let path = loc.Substring (0, k)
+            match System.Int32.TryParse (loc.Substring (k + 1)) with
+            | true, off when System.IO.File.Exists path ->
+                let starts = Fpp.Lines.starts (readSource path)
+                let line, col = Fpp.Lines.toLineCol starts off
+                msg.Substring (0, i) + " at " + path + ":" + string (line + 1) + ":" + string (col + 1)
+                + (if j < 0 then "" else rest.Substring j)
+            | _ -> msg
+
 let private check (strict : bool) (defines : string list) (files : string list) : int =
     preludeCacheBegin defines
     let ws = Workspace()
@@ -109,7 +131,7 @@ let private check (strict : bool) (defines : string list) (files : string list) 
         let _bytes, eerrs = ws.EmitProgramWasmReactor ()
         for e in eerrs do eprintfn "error: %s" e
         let stubs = ws.EmitWarnings |> List.filter (fun w -> w.StartsWith "stubbed ")
-        for st in stubs do eprintfn "error (strict): %s" st
+        for st in stubs do eprintfn "error (strict): %s" (atSource st)
         if List.isEmpty eerrs && List.isEmpty stubs then 0 else 1
 
 let private picks (files : string list) : int =
@@ -213,27 +235,6 @@ let private build (strict : bool) (defines : string list) (out : string) (files 
     // handing over the binary anyway is right for the porting workflow
     // (unreached surface stubs are routine there) and wrong for a program
     // someone intends to ship — this flag draws that line.
-    // a stub names its function's definition as "<path>:<offset>"; the CLI
-    // holds the sources, so it is the one place that can turn that into the
-    // line and column every other diagnostic prints
-    let atSource (msg : string) : string =
-        let i = msg.IndexOf " at "
-        if i < 0 then msg
-        else
-            let rest = msg.Substring (i + 4)
-            let j = rest.IndexOf " ("
-            let loc = if j < 0 then rest else rest.Substring (0, j)
-            let k = loc.LastIndexOf ':'
-            if k <= 0 then msg
-            else
-                let path = loc.Substring (0, k)
-                match System.Int32.TryParse (loc.Substring (k + 1)) with
-                | true, off when List.contains path srcs ->
-                    let starts = Fpp.Lines.starts (readSource path)
-                    let line, col = Fpp.Lines.toLineCol starts off
-                    msg.Substring (0, i) + " at " + path + ":" + string (line + 1) + ":" + string (col + 1)
-                    + (if j < 0 then "" else rest.Substring j)
-                | _ -> msg
     let strictBlocked () : bool =
         let stubs = ws.EmitWarnings |> List.filter (fun w -> w.StartsWith "stubbed ")
         if strict && not (List.isEmpty stubs) then

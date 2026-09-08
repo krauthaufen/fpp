@@ -240,6 +240,26 @@ let parseSeeded (apSeed : ApDef list) (src : string) : ParseResult =
 
     let isCloser () = s.Is RParen || s.Is RBracket || s.Is RBrace || s.Is Comma || s.Is Semicolon
 
+    /// `module X` with NO `=` is a FILE-LEVEL header whatever column it lands
+    /// on — a nested module is spelled `module X = ...`. Concatenation can
+    /// indent one by accident: `cat` glues the next file's first line onto a
+    /// previous file that ends without a newline, and read as a nested
+    /// declaration the header silently RENAMES the whole module, so every
+    /// reference to it resolves to nothing. That is what looked like "a call
+    /// into a sibling module stubs at program scale" in fpp.rendering's demo
+    /// (~/claude/fpp-base-snags.md #55).
+    let atModuleHeader () : bool =
+        if not (s.IsKw "module") then false
+        else
+            let rec scan (k : int) =
+                let t = s.Peek k
+                if t.Kind = Ident then
+                    let n = s.Peek (k + 1)
+                    if n.Kind = Operator && n.Text = "." then scan (k + 2)
+                    else not (n.Kind = Operator && n.Text = "=")
+                else false
+            scan 1
+
     /// `(+)` in name position: three tokens with nothing between them. They
     /// fuse into ONE identifier token spelled "(+)", so every downstream pass
     /// sees an operator member as an ordinary name. Concatenation still
@@ -2019,7 +2039,7 @@ let parseSeeded (apSeed : ApDef list) (src : string) : ParseResult =
             if s.Mark = mark then go <- false
             // same-line `;` sequencing: `a <- 1; b <- 2`
             elif s.Is Semicolon && s.SameLine then vecAdd acc (s.Bump ())
-            elif s.AtEof || isBlockStopKw () || isCloser () then go <- false
+            elif s.AtEof || isBlockStopKw () || isCloser () || atModuleHeader () then go <- false
             // next item: fresh line, exactly at block column
             elif not s.SameLine && s.CurCol = blockCol && canStartItem () then ()
             else go <- false
@@ -2718,6 +2738,9 @@ let parseSeeded (apSeed : ApDef list) (src : string) : ParseResult =
             let mutable go = true
             while go && not s.AtEof do
                 if not s.SameLine && s.CurCol <= modCol then go <- false
+                // a file-level header is never part of this body, however it
+                // is indented (see atModuleHeader)
+                elif atModuleHeader () then go <- false
                 elif canStartDecl () then
                     let mark = s.Mark
                     vecAdd acc (parseDecl (modCol + 1))
