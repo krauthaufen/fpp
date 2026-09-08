@@ -617,6 +617,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// offset was called through a value, which F# rejects
     let staticAccessOk = dictNew<int, bool> ()
 
+    /// Constructor offsets registered by `predeclareCtor`. Those schemes are
+    /// PROVISIONAL — built from their own fresh variables so a body typed
+    /// before the declaration has something to call — and the real
+    /// registration REPLACES them. Kept, they decide overloads with a
+    /// quantification that is not the declaration's: `MapExt<'K,'V>(comparer,
+    /// root)` unified its comparer with 'K ("the type IComparer<'a> would
+    /// contain itself"), and the type-token/`new`-keyword choice for the
+    /// ctor's site read a non-empty table where the real one is empty.
+    let predeclaredCtorOffsets = dictNew<int, bool> ()
+    /// The constructors of `name` that a real declaration registered.
+    let realCtors (ctorsTbl : Dict<string, (int * Scheme) list>) (name : string) : (int * Scheme) list =
+        match dictTryFind ctorsTbl name with
+        | Some l -> l |> List.filter (fun (o, _) -> (dictTryFind predeclaredCtorOffsets o) <> Some true)
+        | None -> []
+
     let ctorSitesRaw = vecNew<int * int> ()
     /// record literals, resolved after solving so the instantiation is known
     let pendingRecords = vecNew<int * Type> ()
@@ -6008,11 +6023,41 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 headIdent inner
                             | _ -> None
                         else None
+                    // the fallback below may only ask about a head that IS a
+                    // bare name. A DOTTED head is a member access on a value,
+                    // and its last segment is a FIELD — `w1.Cam.Location`,
+                    // where the record's field is named after its type, then
+                    // read as a static of `Cam` and answered zero
+                    let bareHead =
+                        match nodesOf n |> List.tryHead with
+                        | Some h -> h.NodeKind = IdentExpr
+                        | None -> false
                     match nodesOf n |> List.tryHead |> Option.bind headIdent with
                     | Some t ->
                         (match dictTryFind useDefs t.Offset with
                          | Some d when d.Kind = Resolve.DefType -> Some (arityNameOfDef d)
-                         | _ -> None)
+                         | Some _ -> None
+                         | None when not bareHead -> None
+                         | None ->
+                             // ANOTHER FILE's type. Resolve records a use only
+                             // for a name its own env can answer, and a type
+                             // declared elsewhere is not in it — so a
+                             // cross-file `T.Member` head stayed unrecorded,
+                             // the access was not read as a static one, and
+                             // its type stayed a free VARIABLE: it fitted
+                             // every annotation and reached the backend as
+                             // `unsupported unknown T`, a stub that is silent
+                             // without --strict. The member table is
+                             // project-wide, so it can answer — and asking it
+                             // for THIS member name is what keeps a value
+                             // whose name merely matches a type from being
+                             // read as one.
+                             match lastIdent with
+                             | Some nm ->
+                                 arityVariants t.Text
+                                 |> List.tryFind (fun v ->
+                                     (dictTryFind fields (v + "." + nm.Text)).IsSome)
+                             | None -> None)
                     | None -> None
                 // `V3<int>.ZeroV` WRITES the class' arguments. `headIdent`
                 // above keeps only the NAME, so they were dropped: the class
@@ -7355,6 +7400,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             else tUnit
 
     and inferTypeDecl (n : GreenNode) : unit =
+        // EVERY type predeclares its constructors, not just an `and`-chained
+        // one. A member body is typed where it stands, so a static member
+        // above the `new(...)` it calls found no constructor and its type
+        // stayed a VARIABLE — `static member Top = AdaptiveToken(...)` above
+        // `internal new(caller)` then fitted every type, and cross-file the
+        // imported (unit-lifted) definition flowed into that variable and the
+        // use read as the un-applied property (~/claude/fpp-base-snags.md's
+        // successor: fpp.rendering's scene.fpp). The call is idempotent — the
+        // real pass re-registers the same offsets with its own variables.
+        predeclareCtor n
         if pendingStructAttr then
             (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
              | Some t -> dictSet structTypes t.Text true
@@ -7984,7 +8039,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let csch = { Quantified = ctorQuantified (vecToList tyParams) ctorTy; Constraints = typeCons; Body = ctorTy }
                 // With no primary constructor the FIRST `new` is what the
                 // type name denotes; any others live at their own keyword.
-                let prior = match dictTryFind ctors name with Some l -> l | None -> []
+                // only what a real declaration registered: a predeclared
+                // entry is a placeholder this registration replaces
+                let prior = realCtors ctors name
                 let typeTok = tokensOf n |> List.tryFind (fun t -> t.Kind = Ident)
                 let siteOffset =
                     match typeTok with
@@ -7996,6 +8053,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match siteOffset with
                  | Some off ->
                      setScheme off csch
+                     dictSet predeclaredCtorOffsets off false
                      dictSet ctors name (prior @ [ off, csch ])
                      dictSet explicitCtorTypes name true
                  | None -> ())
@@ -8103,8 +8161,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let ctorTy = TFun (ctorArgTy, selfTy)
                      let sch = { Quantified = ctorQuantified (vecToList tyParams) ctorTy; Constraints = typeCons; Body = ctorTy }
                      setScheme nameTok.Offset sch
-                     let prior = match dictTryFind ctors name with Some l -> l | None -> []
+                     let prior = realCtors ctors name
                      if not (prior |> List.exists (fun (o, _) -> o = nameTok.Offset)) then
+                         dictSet predeclaredCtorOffsets nameTok.Offset false
                          dictSet ctors name (prior @ [ nameTok.Offset, sch ])
                  | _ -> ())
             | _ -> ()
@@ -8669,7 +8728,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let tyParams = vecNew<Type> ()
         for m in nodesOf n do
             if m.NodeKind = TyParams then
-                for t in Green.tokens (GNode m) do
+                // exactly as inferTypeDecl reads them: an INLINE CONSTRAINT
+                // (`'Key : comparison`) names a class, not a parameter, and
+                // counting it declared a type of the wrong arity — the
+                // predeclared constructor then answered `MapExt<'a,'b,'c>`
+                // where the declaration says `MapExt<'a,'b>`
+                let paramToks =
+                    m.Children
+                    |> List.collect (fun c ->
+                        match c with
+                        | GNode w when w.NodeKind = WhenDecl -> []
+                        | other -> Green.tokens other)
+                for t in paramToks do
                     if t.Kind = Ident && t.Text <> "_" && not (dictTryFind vars t.Text).IsSome then
                         let v = st.Fresh ()
                         dictSet vars t.Text v
@@ -8696,6 +8766,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let key = match prune selfTy with TCon (kn, _) -> kn | _ -> nameTok.Text
                         let prior = match dictTryFind ctors key with Some l -> l | None -> []
                         if not (prior |> List.exists (fun (o, _) -> o = nk.Offset)) then
+                            dictSet predeclaredCtorOffsets nk.Offset true
                             dictSet ctors key (prior @ [ nk.Offset, sch ])
                     | _ -> ()
             (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
@@ -8717,6 +8788,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      | _ -> nameTok.Text
                  let prior = match dictTryFind ctors key with Some l -> l | None -> []
                  if not (prior |> List.exists (fun (o, _) -> o = nameTok.Offset)) then
+                     dictSet predeclaredCtorOffsets nameTok.Offset true
                      dictSet ctors key (prior @ [ nameTok.Offset, sch ])
              | None -> ())
         | _ -> ()

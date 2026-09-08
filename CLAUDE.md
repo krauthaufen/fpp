@@ -2130,6 +2130,56 @@ struct receiver is a byref (FS0406). What was fixed is a compiler crash on a
 program fsc rejects; the same capture over a struct PARAMETER is legal in
 both languages and is what the suite uses.
 
+## A STATIC ACCESS NEEDS ITS TYPE, and cross-file it had none
+
+`AdaptiveToken.Top` in another file than the one declaring the type typed as
+a FREE VARIABLE. It fitted every annotation — `let n : int = Tok.Top` was
+accepted and printed a pointer — and the use reached the backend as
+`unsupported unknown AdaptiveToken`, a stub only `--strict` mentions. It is
+why fpp.rendering's `scene.fpp` compiled CONCATENATED and failed as separate
+files, which reads as a scale bug and is not one.
+
+Three places had to learn the same fact, and each was a different reading of
+"who names a type":
+
+* **Resolve** records a use only for a name its own file's `env` can answer,
+  and a type declared elsewhere is not in it — so the head of a dotted
+  expression carried nothing. `headTypeUse` asks `lookupType` (which does
+  consult `imports`) when `env` has no binding, and records the TYPE.
+* **Infer**'s `staticOwner` reads `useDefs` for the head. When there is no
+  entry at all it now asks the project-wide member table instead: a head
+  whose text names a type CARRYING THIS MEMBER is the owner. Asking for the
+  member name is what keeps a value that merely shares a type's name from
+  being read as one; a head that resolved to something else keeps its
+  meaning. The head must also be a BARE NAME: `headIdent` reduces a dotted
+  head to its LAST SEGMENT, which on a value is a FIELD — a record whose
+  field is named after its type (`w1.Cam.Location`, `type Cam` beside
+  `Cam : Cam`) then read as a static of Cam and answered zero, which is how
+  `suites/structcopyupd.fpp` caught it.
+* **Lower**'s `isStaticUse` made the same head test, so a static that
+  inference had bound was emitted WITH a receiver. It now falls back to what
+  inference decided — the owner it filed against the member token, and that
+  member's `IsStatic`.
+
+The other half is the DEFINITION. Every type predeclares its constructors
+now, not just an `and`-chained one: a member is typed where it stands, so a
+static above the `new(...)` it calls found no constructor and its own type
+stayed a variable — which is where the free variable above came from
+(`static member Top = AdaptiveToken(Unchecked.defaultof<_>)` sits above
+`internal new(caller)`). Two rules keep that from breaking what it touches:
+
+* the parameters are read as `inferTypeDecl` reads them, INLINE CONSTRAINTS
+  excluded (`'Key : comparison` names a class), or the predeclared type has
+  the wrong arity and `MapExt<'K,'V>` answered `MapExt<'a,'b,'c>`;
+* a predeclared entry is PROVISIONAL (`predeclaredCtorOffsets`) and the real
+  declaration replaces it. Left in place it decided overloads with a
+  quantification that is not the declaration's — "the type `IComparer<'a>`
+  would contain itself" — and made the ctor's own site read a non-empty
+  table where the real one is empty.
+
+`suites/staticbeforector.fpp`, `neg/static-above-ctor-has-a-type.fpp` and
+the static case in `tooling/crossfile-gate.sh` pin all of it.
+
 ## A MODULE does not shadow a VALUE of its own name
 
 F# keeps the two in different namespaces, and a value-position use finds the

@@ -225,6 +225,30 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | Some d when d.Kind = DefType -> Some d
             | _ -> findQualifiedType name
 
+    /// The head of a dotted expression, when it is a bare identifier that
+    /// names a TYPE rather than anything in scope: `AdaptiveToken.Top` is a
+    /// static access, not a member of a value. Only a name `env` cannot
+    /// answer is asked — a local, a parameter or a same-file binding keeps
+    /// its own meaning — so this reaches exactly the cross-file case, where
+    /// `env` holds this file's bindings and the type lives in `imports`.
+    let headTypeUse (env : Env) (first : Green) : (Token * Definition) option =
+        // the head is a bare token in the plain spine (`Tok.Top`) and an
+        // IdentExpr when the parser wrapped it — both spellings reach here
+        let headTok =
+            match first with
+            | GToken q when q.Kind = Ident -> Some q
+            | GNode h when h.NodeKind = IdentExpr ->
+                (match h.Children |> List.choose (fun x -> match x with GToken q when q.Kind = Ident -> Some q | _ -> None) with
+                 | [ q ] -> Some q
+                 | _ -> None)
+            | _ -> None
+        match headTok with
+        | Some ht when (Map.tryFind ht.Text env).IsNone ->
+            (match lookupType env ht.Text with
+             | Some td when td.Kind = DefType -> Some (ht, td)
+             | _ -> None)
+        | _ -> None
+
     /// Record a use under a name that is not the token's own text — an
     /// operator's definition is written `(+++)` and used as `+++`.
     let tryRecordAs (env : Env) (name : string) (t : Token) : unit =
@@ -747,7 +771,18 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      let t = (n.Children |> List.rev |> List.pick (fun c -> match c with GToken x when x.Kind = Ident -> Some x | _ -> None))
                      record t (dictTryFind membersByName t.Text).Value.Head
                      (match n.Children with
-                      | first :: _ -> walkExpr env first |> ignore
+                      | first :: _ ->
+                          // the head may name a TYPE DECLARED IN ANOTHER FILE
+                          // — `env` carries only this file's bindings and its
+                          // opens, so walking it as an expression recorded
+                          // NOTHING and inference could not see a static
+                          // access. `AdaptiveToken.Top` then typed as a free
+                          // variable: it fitted every annotation, and the use
+                          // reached the backend as `unsupported unknown
+                          // AdaptiveToken` — a stub, silent without --strict.
+                          (match headTypeUse env first with
+                           | Some (ht, td) -> record ht td
+                           | None -> walkExpr env first |> ignore)
                       | [] -> ())
                  | Some (head :: rest) when
                         (match Map.tryFind head.Text env with
@@ -862,7 +897,17 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      // any index expression (a.[i])
                      (match n.Children with
                       | first :: rest ->
-                          walkExpr env first |> ignore
+                          // …unless the lhs names a TYPE FROM ANOTHER FILE,
+                          // which is a STATIC access and not a value at all.
+                          // `env` carries this file's bindings only, so the
+                          // walk recorded nothing, inference saw no owner and
+                          // typed the access as a free VARIABLE — it fitted
+                          // every annotation and reached the backend as
+                          // `unsupported unknown <Type>`, a stub that is
+                          // silent without --strict.
+                          (match headTypeUse env first with
+                           | Some (ht, td) -> record ht td
+                           | None -> walkExpr env first |> ignore)
                           for c in rest do
                               match c with
                               | GNode m when m.NodeKind = ListExpr -> walkExpr env c |> ignore

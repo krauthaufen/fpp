@@ -20,6 +20,13 @@
 #   * a cross-file ACTIVE PATTERN returning a tuple (#32) and a cross-file
 #     `[<CustomOperation>]` builder (#37) — both fixed earlier, both regression
 #     -prone: they ride project-wide SEEDS that a per-file parse cannot have.
+#   * a STATIC MEMBER reached through its type (`Tok.Top`). The resolver
+#     records a use only for a name its own file's env can answer, so the
+#     head of a cross-file `T.Member` carried nothing, the access was never
+#     read as a static one, and its type stayed a free VARIABLE: it fitted
+#     every annotation and reached the backend as `unsupported unknown T` — a
+#     stub, silent without --strict. It is what stopped fpp.rendering's
+#     scene.fpp from building as separate files.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -45,6 +52,15 @@ let (|PairP|_|) (e : Ex) =
     match e with
     | EPair (n, b) -> Some (n, b)
     | _ -> None
+
+// a static reached through its TYPE from the other file, and written ABOVE
+// the constructor it calls — the shape fpp.adaptive's AdaptiveToken has
+type Tok =
+    val mutable n : int
+    static member Top = Tok(7)
+    static member OfInt (v : int) = Tok(v)
+    member x.N = x.n
+    new (n : int) = { n = n }
 
 type SB() =
     member x.Yield (u : unit) = ("", "")
@@ -75,6 +91,10 @@ let t3 =
 let r = sam { texture "Diffuse"
               filter "Linear" }
 let t4 = printfn "ce %s %s" (fst r) (snd r)
+// a static property and a static method of ANOTHER file's type. The
+// annotation is load-bearing: it is what the free variable used to satisfy
+let tok : Tok = Tok.Top
+let t5 = printfn "tok %d %d" tok.N (Tok.OfInt 4).N
 FPP
 
 "$fpp" build --strict -o "$out/x.wasm" "$out/lib.fpp" "$out/use.fpp"
@@ -85,9 +105,10 @@ cat > "$out/want.txt" <<'EXP'
 class=x
 pair 5
 ce Diffuse Linear
+tok 7 4
 EXP
 if diff -u "$out/want.txt" "$out/got.txt"; then
-    echo "CROSSFILE OK (alias ctor, autoopen type, active pattern, custom op)"
+    echo "CROSSFILE OK (alias ctor, autoopen type, active pattern, custom op, static)"
 else
     echo "CROSSFILE MISMATCH"; exit 1
 fi

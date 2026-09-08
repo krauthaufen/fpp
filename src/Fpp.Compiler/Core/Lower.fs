@@ -315,7 +315,28 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         match n.Children |> List.tryPick (fun c -> match c with GNode m -> Some m | _ -> None) with
         | Some head ->
             (match headIdent head with
-             | Some t -> (dictTryFind useDefs t.Offset |> Option.map (fun d -> d.Kind = Resolve.DefType)) = Some true
+             | Some t ->
+                 (match dictTryFind useDefs t.Offset with
+                  | Some d -> d.Kind = Resolve.DefType
+                  | None ->
+                      // ANOTHER FILE's type: the resolver records a use only
+                      // for a name its own env can answer, so the head of a
+                      // cross-file `T.Member` carries nothing. Inference has
+                      // already decided — it filed the OWNER against the
+                      // member token — so ask the member instead of the head,
+                      // and take the receiver away only for a member the
+                      // owner declares STATIC.
+                      (match Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.tryLast with
+                       | Some mt when mt.Offset <> t.Offset ->
+                           (match dictTryFind memberSites mt.Offset with
+                            | Some owner ->
+                                let hash = owner.IndexOf "#"
+                                let plain = if hash < 0 then owner else owner.Substring (0, hash)
+                                (match dictTryFind fieldsTable (plain + "." + mt.Text) with
+                                 | Some fi -> fi.IsStatic && fi.DefKey.IsSome
+                                 | None -> false)
+                            | None -> false)
+                       | _ -> false))
              | None -> false)
         | None -> false
 
