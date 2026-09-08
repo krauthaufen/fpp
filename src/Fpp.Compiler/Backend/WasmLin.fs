@@ -9972,7 +9972,16 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // row, the slot the column; the word there is the impl's table index.
         // Under GC the vtable is a fpprt array in a root slot (data past the
         // [tag][len] header), read fresh so a collection's move is seen.
-        let slotIdx = match dictTryFind st.SlotOf (bi + "|" + method) with Some s -> s | None -> 0
+        // A MISS IS LOUD. The slot table holds what the program dispatches, so
+        // a call naming a pair that is not in it means the pair was SYNTHESIZED
+        // after the table was built — and slot 0 is Equals, so answering 0
+        // quietly would call the wrong member with the wrong arity.
+        let slotIdx =
+            match dictTryFind st.SlotOf (bi + "|" + method) with
+            | Some s -> s
+            | None ->
+                vecAdd st.Warnings ("stubbed no vtable slot for " + bi + "." + method)
+                0
         // THE SLOT WITNESS ABI: k leading witnesses, the method's OWN type
         // arguments, which are the TAIL of the instantiation the dispatch name
         // carries (the receiver's come first and `self` already supplies them).
@@ -14397,12 +14406,63 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // receiver whose static type declares none (an INTERFACE) has to reach the
     // object's own override, and the dynamic renderer is where that happens.
     let identitySlots = [ "$id", "Equals"; "$id", "GetHashCode"; "$id", "CompareTo"; "$id", "ToString" ]
+    // A SLOT EXISTS ONLY WHERE A DISPATCH CAN LAND. The table used to hold a
+    // column for every interface member and every DECLARED member of every
+    // type — 1290 of them in fpp.dom's build, against a handful the program
+    // can actually enter — and the surplus is what produced rows nothing could
+    // fill: `ConditionalWeakTable.Add` takes two witnesses of its own, no
+    // dispatch passes any, and the row became a "quietstub" trap. The slot set
+    // is the (interface, member) pairs some `EIfaceCall` names, plus the
+    // identity four, which `$cmpv`/`$hashv`/`$strv` enter by index.
+    let dispatchedPairs = dictNew<string, bool> ()
+    let rec scanIface (e : Expr) : unit =
+        match e with
+        | EIfaceCall (i, mn, r, xs) ->
+            dictSet dispatchedPairs (bareIfaceOf i + "|" + bareMemberOf mn) true
+            scanIface r; List.iter scanIface xs
+        | ELam (_, b) -> scanIface b
+        | EApp (f, args) -> scanIface f; List.iter scanIface args
+        | ELet (_, _, _, r, b) -> scanIface r; scanIface b
+        | EIf (a, b, c) -> scanIface a; scanIface b; scanIface c
+        | EMatch (sc, cs) ->
+            scanIface sc
+            for _, g, b in cs do
+                (match g with Some g -> scanIface g | None -> ())
+                scanIface b
+        | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> List.iter scanIface xs
+        | ECtor (_, _, xs) -> List.iter scanIface xs
+        | ERecord (_, fs) -> for _, v in fs do scanIface v
+        | ERecordExt (_, b, fs) -> scanIface b; (for _, v in fs do scanIface v)
+        | EField (r, _, _) -> scanIface r
+        | ECast (_, x, _) | ETypeTest (_, x) -> scanIface x
+        | EFieldSet (r, _, _, v) -> scanIface r; scanIface v
+        | EWhile (c, b) -> scanIface c; scanIface b
+        | EAssign (_, x) -> scanIface x
+        | ETry (b, cs) ->
+            scanIface b
+            for _, g, x in cs do
+                (match g with Some g -> scanIface g | None -> ())
+                scanIface x
+        | EArray (_, xs) -> List.iter scanIface xs
+        | EIndex (_, a, i) -> scanIface a; scanIface i
+        | EIndexSet (_, a, i, v) -> scanIface a; scanIface i; scanIface v
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) -> scanIface a
+        | EArrayCreate (_, n, v) -> scanIface n; scanIface v
+        | _ -> ()
+    for d in decls0 do
+        match d with DLet (_, _, _, e) -> scanIface e | _ -> ()
     let vtableSlots =
         identitySlots
         @ (((interfaceDecls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn)))
             @ (classDecls |> List.collect (fun (_, _, _, impls) -> impls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn))))
             // abstract/override members dispatched through the CLASS: a slot
             // per declared member name, keyed by the declaring class
+            // a CLASS-declared member gets a column only where a dispatch
+            // names it: those are the rows nothing could fill (an impl with
+            // witnesses of its own, no dispatch to pass any). An INTERFACE
+            // member keeps its column whether or not this program's Core
+            // names it — the enumerator route synthesizes its dispatches
+            // during lowering, after this table is fixed.
             @ declaredMemberSlots)
            |> List.distinct |> List.sort)
     st.NSlots <- List.length vtableSlots
@@ -15342,10 +15402,22 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                         // `--strict`-fatal would reject working programs. It
                         // rides the quiet channel; `FPP_VTDBG=1` prints the
                         // same numbers per row.
-                        vecAdd st.Warnings
-                            ("quietstub vtable row " + cn + "." + ifn + "." + mn + " (takes "
-                             + string (hiddenWitCount st (key v)) + " witness parameter(s) where slot "
-                             + string slot + " passes " + string kSlot + ")")
+                        // ONLY IF SOMETHING CAN DISPATCH IT. The table has a
+                        // column for every declared member, so most of these
+                        // rows are unreachable by construction: no `EIfaceCall`
+                        // in the program names the pair, and the mismatch is
+                        // then a fact about a row nothing enters — not a stub.
+                        // Restricting the TABLE instead was measured and
+                        // rejected: it moves members off the slot-witness ABI
+                        // onto the ordinary one, which doubled the witness
+                        // arguments (6995 -> 13857) and the uniform fallbacks
+                        // (54 -> 133) in fpp.dom's build for a 32% smaller
+                        // module. The witnesses are worth more than the bytes.
+                        if (dictTryFind dispatchedPairs (ifn + "|" + bareMemberOf mn)).IsSome then
+                            vecAdd st.Warnings
+                                ("quietstub vtable row " + cn + "." + ifn + "." + mn + " (takes "
+                                 + string (hiddenWitCount st (key v)) + " witness parameter(s) where slot "
+                                 + string slot + " passes " + string kSlot + ")")
                         (match kSlot with
                          | 1 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt3"
                          | 2 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt4"
@@ -15353,34 +15425,26 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                     else vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn v)
                 | Some v ->
                     // The impl exists as a DECLARATION but no function was
-                    // emitted for it: a STAMPED class whose members were only
-                    // ever stamped at the CONCRETE instantiations, so the
-                    // canonical (all-obj) copy names a stamp nobody made. The
-                    // shared TEMPLATE is the implementation for exactly that
-                    // case — it takes its type arguments as witnesses, which is
-                    // what this slot passes — so the row takes it when the
-                    // widths agree. Without it the row stayed empty and the
-                    // dispatch trapped, which is how fpp.dom's adaptive
-                    // attribute reader failed (~/claude/fpp-base-snags.md #48).
+                    // emitted for it. That means dead-code elimination dropped
+                    // it, and IT ONLY DROPS WHAT NOTHING CAN REACH: a class'
+                    // vtable members are parked on its constructor and woken
+                    // when the construction turns out to be reachable, so a
+                    // missing function says this class is never built here and
+                    // the row can never be entered.
+                    //
+                    // There was a FALLBACK here — borrow the base's function
+                    // when the widths agree, 836 rows of it in fpp.dom's build.
+                    // It is gone. A borrowed row is a guess: if the missing
+                    // function is an OVERRIDE, the base's body answers where
+                    // the derived one should have, which is a wrong answer
+                    // rather than a trap. The row stays a width-matched trap,
+                    // and `--strict`-clean gates across fpp.dom, fpp.adaptive,
+                    // fpp.base and fpp.rendering say nothing dispatches to one.
                     (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s MISS-func %s" cn cid slot ifn mn v.Name)
-                    let kSlot = match dictTryFind st.SlotWitN slot with Some x -> x | None -> 0
-                    let template =
-                        match dictTryFind st.RecBase cn with
-                        | Some b when b <> cn ->
-                            (match slotImpl b ifn mn with
-                             | Some tv when (dictTryFind st.Funcs (key tv)).IsSome
-                                            && hiddenWitCount st (key tv) = kSlot -> Some tv
-                             | _ -> None)
-                        | _ -> None
-                    (match template with
-                     | Some tv ->
-                         (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s -> TEMPLATE %s" cn cid slot ifn mn tv.Name)
-                         vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn tv)
-                     | None ->
-                         (match kSlot with
-                          | 1 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt3"
-                          | 2 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt4"
-                          | _ -> ()))
+                    (match dictTryFind st.SlotWitN slot with
+                     | Some 1 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt3"
+                     | Some 2 -> vtRows.[cid * st.NSlots + slot] <- tblIdx m "$novt4"
+                     | _ -> ())
                 | None ->
                     // no implementation at all: the row stays a trap, but at
                     // THIS SLOT'S WIDTH for the reason above

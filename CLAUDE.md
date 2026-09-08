@@ -115,6 +115,42 @@ override. The member index is keyed by the DECLARED name and a use site
 records the INSTANTIATION (`Box$<int>`), so the lookup missed and the call
 fell through to a Show instance that does not exist.
 
+## A vtable row is filled by its own class, or not at all
+
+There WAS a fallback: a row whose implementation had no emitted function
+borrowed the BASE's, when the witness widths agreed — 836 rows of it in
+fpp.dom's build. It is gone, and the row keeps its width-matched trap.
+
+The measurement that settled it is worth keeping. `FPP_NO_DCE=1` (Workspace,
+skips `deadCodeEliminate`) rebuilds the same program with every definition
+alive: every row fills, MISS and TEMPLATE both zero. So nothing was missing
+from monomorphization — dead-code elimination had dropped functions the rows
+name, and it only drops what nothing can reach: a class' vtable members are
+parked on its CONSTRUCTOR and woken when the construction turns out to be
+reachable. A row with no function is therefore a class this program never
+builds, and a borrowed row is a guess — if the missing function is an
+OVERRIDE, the base's body answers where the derived one should, which is a
+wrong answer rather than a trap.
+
+The other fallback-shaped thing, a filler whose hidden witness count differs
+from its slot's k, now WARNS only when some `EIfaceCall` in the program names
+that (interface, member) pair. The slot table has a column for every declared
+member, so most such rows are unreachable by construction — 13 in fpp.dom, 18
+in fpp.rendering, none of them dispatched.
+
+RESTRICTING THE TABLE ITSELF WAS MEASURED AND REJECTED. Giving a column only
+to dispatched pairs makes the module 32% smaller (7.24 MB -> 4.94 MB on
+fpp.dom's CE build, top slot 1450 -> 119) and it costs the WITNESSES: members
+move off the slot-witness ABI onto the ordinary one, and the uniform witness
+fallbacks went 54 -> 133 while the witness arguments went 6995 -> 13857.
+Do not re-try it without that number in hand. Two more facts from the
+attempt: INTERFACE members must keep their columns whatever the Core says —
+the enumerator route synthesizes `GetEnumerator`/`MoveNext`/`Current`
+dispatches during lowering, after the table is fixed, and filtering them
+trapped `tuples`/`equality`/`comparison` with "undefined element" at module
+init — and a dispatch naming a pair with no slot is now a LOUD stub, because
+the miss used to answer slot 0, which is `Equals`.
+
 ## A vtable row is only as wide as its slot
 
 A row of 0 is table index 0 — `$novt`, which takes TWO arguments. A slot that

@@ -1385,7 +1385,13 @@ type Workspace() =
             // concrete here, and dead-code elimination afterwards collects
             // the definitions inlining made unreachable
             let opt = if optimize then Fpp.Core.Optimize.optimize mono else mono
-            let linked = Fpp.Core.Link.deadCodeEliminate opt
+            // FPP_NO_DCE=1 keeps every definition. A diagnostic knob: it is
+            // how "the vtable row's function is missing" is told apart from
+            // "the row's function was never created" — if a row fills with
+            // DCE off, the elimination dropped something a vtable can reach.
+            let linked =
+                if System.Environment.GetEnvironmentVariable "FPP_NO_DCE" = "1" then opt
+                else Fpp.Core.Link.deadCodeEliminate opt
             if not (List.isEmpty monoErrs) then [], monoErrs
             else linked, []
 
