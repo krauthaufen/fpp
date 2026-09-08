@@ -2,11 +2,27 @@
 // only ever stamped at the CONCRETE instantiations, so the row names a stamp
 // nobody made and the dispatch traps in `$novt3`.
 //
+// THE fpp.dom TRAP THIS FILE WAS WRITTEN FOR WAS NOT THIS (2026-09-08). It
+// was a WILDCARD UPCAST taking type arguments independent of its class:
+// `C<'T>(v) :> IBox<_>` left the interface's argument free, so
+// `AVal.constant (Some x)` fitted a parameter declared `aval<seq<_>>`, the
+// wrong Yield overload was chosen on that lie, and the OPTION was enumerated
+// at run time — reaching a row nothing fills. The upcast now takes its
+// arguments from the class' own declaration (`suites/upcastargs.fpp`,
+// `neg/upcast-wildcard-argument.fpp`), and fpp.dom's ce gate passes with all
+// six formerly blocked cases. There is no program left that reaches an empty
+// row.
+//
+// WHAT REMAINS OPEN is the row itself: a class CONSTRUCTED canonically still
+// has no implementation to dispatch to. Nothing known reaches one, so this
+// is a missing mechanism rather than an observable defect — kept here for
+// the diagnosis, which is otherwise expensive to re-derive.
+//
 // THIS FILE IS NOT THE REPRO — it cannot be, and that is the point. Every
 // small program stamps every instantiation it uses, so every row is filled.
 // The shape needs a program where a generic class is BOTH stamped at concrete
 // types and constructed canonically (a value that reaches a `'a`-typed field,
-// an `obj` container, a reader's output). The living repro is fpp.dom:
+// an `obj` container, a reader's output). The recipe that USED to trap:
 //
 //   cd ~/projects/fpp.dom && cp -r . /tmp/domx && cd /tmp/domx
 //   # tests/gen-ce-tests.py: BLOCKED = set()
@@ -17,9 +33,9 @@
 //   fpp build --strict -o /tmp/ce.wasm /tmp/ce.fpp
 //   wasmtime run -W gc=y,exceptions=y --env FPPRT_HEAP_MB=256 /tmp/ce.wasm
 //
-// It prints its cases and then traps inside `$novt3` under `Seq.ofSeq`, on
-// the `avalatt` case (`div { AVal.constant (Some (Dom.Id "opt")) }`, the
-// AttributeMap.OfOptionA path). It is #48 in ~/claude/fpp-base-snags.md.
+// It printed its cases and then trapped inside `$novt3` under `Seq.ofSeq`,
+// on the `avalatt` case (`div { AVal.constant (Some (Dom.Id "opt")) }`, the
+// AttributeMap.OfOptionA path) — that was #48, and it passes now.
 //
 // WHAT IS KNOWN, so the next session does not re-derive it:
 //

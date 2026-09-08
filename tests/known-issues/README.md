@@ -24,8 +24,10 @@ One open issue: `canonical-class-vtable-row.fpp` — a generic class that is
 CONSTRUCTED canonically (all-obj) has no vtable row, because its members were
 only stamped at the concrete instantiations and the shared template did not
 survive. The file cannot hold its own repro (every small program stamps what
-it uses); it holds the diagnosis, the living repro's recipe, and what was
-already ruled out.
+it uses); it holds the diagnosis and what was already ruled out. The fpp.dom
+trap it was written for turned out to be a WILDCARD UPCAST choosing the wrong
+overload, which is fixed — so nothing known reaches an empty row any more,
+and what is left here is a missing mechanism, not an observable defect.
 
 Fixed and removed (see git history for the repros):
 `module-abbreviation` (`module Ab = Inner` parsed as a module with an EMPTY
