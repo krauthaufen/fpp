@@ -807,6 +807,16 @@ let rec private printConOf (st : St) (e : Expr) : string =
          | [] -> "")
     | _ -> ""
 
+/// Type names whose REPRESENTATION is a raw scalar although the name is not a
+/// scalar type: an enum (its slot holds the tag's int) and a COLLAPSED
+/// single-field record (`[<Struct>] type Symbol = { Id : int }` IS its int).
+/// Separate from `rawScalarName`, which also answers "which scalar type is
+/// this" for boxing and `:?` — those must keep naming real scalar types, while
+/// TRACING has to follow the representation or a collection chases an integer.
+let mutable private rawReprNames : Dict<string, bool> = dictNew ()
+let private rawReprName (n : string) : bool =
+    rawScalarName n || (dictTryFind rawReprNames n).IsSome
+
 let rec private refKindOfTy (t : Type) : RefKind =
     match prune t with
     | TVar _ -> RKGen
@@ -818,7 +828,7 @@ let rec private refKindOfTy (t : Type) : RefKind =
     // once inlined: the inliner binds the argument, so `Real.PositiveInfinity`,
     // `V3d.Zero` and every other `()`-taking member allocated per call.
     | TCon ("unit", _) -> RKRaw
-    | TCon (n, _) -> if rawScalarName n then RKRaw else RKRef
+    | TCon (n, _) -> if rawReprName n then RKRaw else RKRef
     | TFun _ | TTuple _ -> RKRef
     | TApp (h, _) -> (match prune h with TVar _ -> RKGen | _ -> RKRef)
 
@@ -930,6 +940,11 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
          // a fully-applied beta-redex resolves to its body's kind
          | ELam (ps, body) when List.length args >= List.length ps -> refKindOfExpr body
          | _ -> RKGen)
+    // a COLLAPSED record literal is its field: `{ Id = 2 }` of
+    // `[<Struct>] type Symbol = { Id : int }` yields the bare int, so the slot
+    // that stores it holds a raw word. Classified RKRef by the catch-all
+    // below, the cons cell traced the 2 as a pointer.
+    | ERecord (n, _) | ERecordExt (n, _, _) when rawReprName n -> RKRaw
     | ETuple _ | EListLit _ | EArray _ | EArrayCreate _ | ERecord _ | ERecordExt _ | ECtor _ | ELam _ -> RKRef
     // an array length / type test is always a raw scalar (int / bool), never a
     // pointer — a generic aggregate storing one must exclude it from its scan
@@ -940,6 +955,15 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
          // int arithmetic / comparisons / bool ops -> a raw scalar result;
          // the `w` (uint32) forms are raw i32 words too
          | "+w" | "-w" | "*w" | "/w" | "%w" | "<<<w" | ">>>w" -> RKRaw
+         // …AND THE BITWISE AND COMPARISON `w` FORMS. Only arithmetic and the
+         // shifts were listed, so `(data <<< 1) ||| uint32 k` — adaptive's
+         // SetNode packing a kind and a payload into one uint32 — classified
+         // RKGen. The mutable then took the WITNESS-selected cell, whose
+         // tagged payload is scanned: the raw 12 in it was read as a pointer
+         // and the collector aborted (`BADFIELD tid=… val=0x0000000c`). A `w`
+         // comparison answers a bool, which is as raw as the int forms.
+         | "&&&w" | "|||w" | "^^^w" | "~~~w" | "u~~~w" -> RKRaw
+         | "<w" | ">w" | "<=w" | ">=w" | "=w" | "<>w" -> RKRaw
          | "+" | "-" | "*" | "/" | "%" when op = b -> RKRaw
          | "<" | ">" | "<=" | ">=" | "=" | "<>" -> RKRaw
          | "&&" | "||" | "not" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" when op = b -> RKRaw
@@ -5943,7 +5967,7 @@ let private stampWitness (st : St) (j : int) : LExpr =
     match List.tryItem j curStampArgs with
     | Some nm ->
         let bare = layStripGen nm
-        witnessPtrRMKT st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm
+        witnessPtrRMKT st 4 4 (if rawReprName bare then 0 else 1) (cmpKindOfName bare) nm
     // nothing here determines this class parameter — same conclusion
     | None -> uniformWitnessWhy st "stamparg"
 
@@ -5959,7 +5983,7 @@ let private witnessArgOfNameOpt (ctx : LowCtx) (nm : string) : LExpr option =
     else
         witArgCount <- witArgCount + 1
         let bare = layStripGen nm
-        Some (witnessPtrRMKT ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm)
+        Some (witnessPtrRMKT ctx.LSt 4 4 (if rawReprName bare then 0 else 1) (cmpKindOfName bare) nm)
 
 let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
     if nm.Length > 0 && nm.[0] = '#' then
@@ -5980,7 +6004,7 @@ let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
                 (if List.contains (int (nm.Substring 1)) curFnQuantIds then "freevar-nochannel" else "freevar-notgeneric")
     else
         let bare = layStripGen nm
-        witnessPtrRMKT ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm
+        witnessPtrRMKT ctx.LSt 4 4 (if rawReprName bare then 0 else 1) (cmpKindOfName bare) nm
 
 // A witness LExpr for a GENERIC aggregate slot, so lowObjR takes the precise
 // refoffs path (a raw element excluded, a ref included) rather than the tagged
@@ -5993,7 +6017,7 @@ let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
     let st = ctx.LSt
     let ofName (nm : string) =
         let bare = layStripGen nm
-        witnessPtrRMKT st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm
+        witnessPtrRMKT st 4 4 (if rawReprName bare then 0 else 1) (cmpKindOfName bare) nm
     let ofTy (t : Type) : LExpr option =
         match prune t with
         | TVar tv -> (match dictTryFind ctx.Witness tv.Id with Some r -> Some (LGet (wReg r)) | None -> None)
@@ -9498,7 +9522,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 | TVar tv -> (match dictTryFind ctx.Witness tv.Id with Some r -> Some (LGet (wReg r)) | None -> None)
                 | TCon (n, _) ->
                     let bare = layStripGen n
-                    Some (witnessPtrRMKT st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) bare)
+                    Some (witnessPtrRMKT st 4 4 (if rawReprName bare then 0 else 1) (cmpKindOfName bare) bare)
                 | _ -> None
             List.zip (List.truncate n ptys) (List.truncate n argEs)
             |> List.tryPick (fun (pt, ae) ->
@@ -11160,6 +11184,9 @@ and private lowSlotInit (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) :
         dictSet ctx.LSt.CellKind k ck
         // a still-generic cell with the element WITNESS in scope selects its
         // tid at runtime: raw 'a -> unscanned cell$s, ref 'a -> scanned cell
+        (if System.Environment.GetEnvironmentVariable "FPP_CELLDBG" = "1" then
+            eprintfn "CELLMK in %s ty=%s kind=%A wit=%b" curFnDbg (typeString (prune sch.Body)) ck
+                ((match prune sch.Body with TVar tv -> dictTryFind ctx.Witness tv.Id | _ -> None)).IsSome)
         match ck, (match prune sch.Body with TVar tv -> dictTryFind ctx.Witness tv.Id | _ -> None) with
         | RKGen, Some wreg when gc -> lowMkCellW ctx (LGet (wReg wreg)) (coreToLowE ctx rhs)
         | _ -> lowMkCell ctx ck (coreToLowE ctx rhs)
@@ -11476,6 +11503,9 @@ and private lowLetBind (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) : 
                 // is unresolved (a genuinely generic mutable).
                 let ck = match refKindOfTy sch.Body with RKGen -> refKindOfExpr rhs | k -> k
                 dictSet ctx.LSt.CellKind k ck
+                (if System.Environment.GetEnvironmentVariable "FPP_CELLDBG" = "1" then
+                    eprintfn "CELLMK2 in %s ty=%s kind=%A wit=%b" curFnDbg (typeString (prune sch.Body)) ck
+                        ((match prune sch.Body with TVar tv -> dictTryFind ctx.Witness tv.Id | _ -> None)).IsSome)
                 // runtime-witnessed tid for a generic cell (see lowSlotInit)
                 match ck, (match prune sch.Body with TVar tv -> dictTryFind ctx.Witness tv.Id | _ -> None) with
                 | RKGen, Some wreg when gc -> lowMkCellW ctx (LGet (wReg wreg)) (coreToLowE ctx rhs)
@@ -11509,7 +11539,13 @@ and private lowMkCellW (ctx : LowCtx) (witExpr : LExpr) (v : LExpr) : LExpr =
     let t = freshTmp ctx
     let wr = freshTmp ctx
     let tidS = gcTidRef ctx.LSt "cell$s" (HDR + 4) []
-    let tidT = gcTid ctx.LSt "cell" (HDR + 4) FK_TAGGED 1
+    // FPP_CELLDBG=1: name the tid after the creating function, as lowMkCell
+    // does — without it every witness-selected cell shares one tid and a
+    // mis-kinded one cannot be traced back to its builder.
+    let tidT =
+        gcTid ctx.LSt
+            (if System.Environment.GetEnvironmentVariable "FPP_CELLDBG" = "1" then "cellW@" + curFnDbg else "cell")
+            (HDR + 4) FK_TAGGED 1
     let rawBuild =
         [ LSet (wReg b, lowAllocSized ctx tidS (HDR + 4))
           LStore (W, LGet (wReg b), HDR, LGet (wReg t)) ]
@@ -14126,6 +14162,15 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         | [ f ] when (dictTryFind noCollapse (fst kv)).IsNone && (dictTryFind classNames (fst kv)).IsNone ->
             dictSet st.Collapse (fst kv) f
         | _ -> ()
+    // REPRESENTATION, for tracing. A collapsed record IS its field, so one that
+    // resolves to a scalar stores a raw word — in a global, a local, a cons
+    // cell or any aggregate slot — and an ENUM slot holds its tag's int. Both
+    // were classified by NAME as references, so a collection chased the integer
+    // (`FPPRT_ROOTCHECK`: `val=0x00000002 hdr=0x00000000`).
+    rawReprNames <- dictNew ()
+    for n, _ in dictPairs st.Collapse do
+        if rawScalarName (storKindRes st n) then dictSet rawReprNames n true
+    for n, _ in dictPairs enumTypeSet do dictSet rawReprNames n true
     // WITNESSED CLASSES (RecFields is FULL here): every generic class — base
     // and derived alike — carries one trailing witness pointer per type
     // parameter, after ALL its fields. A member reads them off self at the
@@ -14801,8 +14846,23 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             // unscanned wasm global — an even int in the SCANNED root table
             // reads as a bogus pointer. Only ref/generic globals take a root
             // slot (they hold heap pointers a moving collection must update).
-            if gc && refKindOfTy s.Body <> RKRaw && (scalarLTy s.Body).IsNone
-               && (structTyName st s.Body).IsNone then
+            //
+            // THROUGH THE COLLAPSE. A single-field record IS its field
+            // (`[<Struct>] type Symbol = { Id : int }` stores the bare int), so
+            // the question is what the collapse RESOLVES to, not what the
+            // annotation says. Asking the name gave "not a scalar, not a
+            // struct" and the raw int went into the scanned table: the first
+            // collection read 2 as a pointer and trapped, with `FPPRT_ROOTCHECK`
+            // reporting `val=0x00000002 hdr=0x00000000`.
+            let rootBody =
+                match prune s.Body with
+                | TCon (n, _) ->
+                    let bare = layStripGen n
+                    let res = storKindRes st bare
+                    if res <> bare then TCon (res, []) else prune s.Body
+                | t -> t
+            if gc && refKindOfTy rootBody <> RKRaw && (scalarLTy rootBody).IsNone
+               && (structTyName st rootBody).IsNone then
                 let slot = st.RootNext
                 st.RootNext <- slot + 1
                 dictSet st.GlobalSlot (key v) slot
@@ -15850,7 +15910,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
                 | Some pairs ->
                     pairs |> List.map (fun (vid, nm) ->
                         let bare = layStripGen nm
-                        vid, witnessPtrRMKT st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare) nm)
+                        vid, witnessPtrRMKT st 4 4 (if rawReprName bare then 0 else 1) (cmpKindOfName bare) nm)
                 | None -> []
             // a tupled member's PARAMETERS are the destructured binders, and
             // its body is the match's arm — the tuple never exists

@@ -116,6 +116,17 @@ static inline size_t gc_trace_object(struct gc_ref ref,
                                      void *trace_data) {
   void *obj = gc_ref_heap_object(ref);
   uintptr_t tag = *fpprt_tag_word_(ref);
+#ifdef __wasm__
+  /* DEBUG (FPPRT_ROOTCHECK=1): the TAG ITSELF, before it indexes the type
+   * table. An object reached through a bogus edge has a header that is not an
+   * odd (tid<<1)|1 of a registered type, and indexing on it reads a garbage
+   * kind/size — which faults somewhere else entirely, naming nothing. */
+  if (fpprt_rootcheck_() && (!(tag & 1) || (tag >> 1) >= fpprt_ntypes_)) {
+    fprintf(stderr, "BADOBJ at=0x%08x tag=0x%08x ntypes=%zu\n",
+            (unsigned)(uintptr_t)obj, (unsigned)tag, (size_t)fpprt_ntypes_);
+    abort();
+  }
+#endif
   struct fpprt_type_intern *t = &fpprt_types_[tag >> 1];
 #ifdef FPP_GC_CENSUS
   if ((tag >> 1) < 4096)
@@ -128,6 +139,28 @@ static inline size_t gc_trace_object(struct gc_ref ref,
         uintptr_t *slot = (uintptr_t *)((char *)obj + t->refoffs[i]);
         /* a slot on the map can hold a TAGGED SCALAR (bit 0 set) where its
          * static type is generic — those are values, not edges */
+#ifdef __wasm__
+        /* DEBUG (FPPRT_ROOTCHECK=1): see the tagged case below — a RAW scalar
+         * on the refoffs map is about to be followed as an edge. */
+        if (fpprt_rootcheck_() && *slot && !(*slot & 1)) {
+          uintptr_t v = *slot;
+          uintptr_t lim = (uintptr_t)__builtin_wasm_memory_size(0) * 65536u;
+          uintptr_t hv = 0;
+          int ok = 0;
+          if (v + sizeof(uintptr_t) <= lim) {
+            hv = *(uintptr_t *)v;
+            ok = (hv & 1) && ((hv >> 1) < fpprt_ntypes_);
+          }
+          if (!ok) {
+            fprintf(stderr,
+                    "BADFIELD tid=%zu kind=struct refslot=%u off=%u at=0x%08x "
+                    "val=0x%08x hdr=0x%08x\n",
+                    (size_t)(tag >> 1), (unsigned)i, (unsigned)t->refoffs[i],
+                    (unsigned)(uintptr_t)slot, (unsigned)v, (unsigned)hv);
+            abort();
+          }
+        }
+#endif
         if (*slot && !(*slot & 1))
           visit(gc_edge(slot), heap, trace_data);
       }
@@ -140,6 +173,32 @@ static inline size_t gc_trace_object(struct gc_ref ref,
     if (visit) {
       uintptr_t *w = (uintptr_t *)obj;
       uint32_t n = t->size / (uint32_t)sizeof(uintptr_t);
+#ifdef __wasm__
+      /* DEBUG (FPPRT_ROOTCHECK=1): the range check above covers the shadow
+       * stack; this is the same check for an OBJECT's payload. An even word
+       * here is about to be followed as an edge, so its header must be an odd
+       * (tid<<1)|1 of a registered type. A RAW scalar stored in a tagged slot
+       * faults deep in the collector with nothing named; this prints the
+       * holder's TID first — and with FPP_CELLDBG=1 that tid names the
+       * function that built the cell. */
+      if (fpprt_rootcheck_())
+        for (uint32_t i = t->nrefs; i < n; i++) {
+          uintptr_t v = w[i];
+          if (!v || (v & 1)) continue;
+          uintptr_t lim = (uintptr_t)__builtin_wasm_memory_size(0) * 65536u;
+          uintptr_t hv = 0;
+          if (v + sizeof(uintptr_t) <= lim) {
+            hv = *(uintptr_t *)v;
+            if ((hv & 1) && (hv >> 1) < fpprt_ntypes_) continue;
+          }
+          fprintf(stderr,
+                  "BADFIELD tid=%zu kind=tagged slot=%u of=%u at=0x%08x "
+                  "val=0x%08x hdr=0x%08x\n",
+                  (size_t)(tag >> 1), (unsigned)i, (unsigned)n,
+                  (unsigned)(uintptr_t)&w[i], (unsigned)v, (unsigned)hv);
+          abort();
+        }
+#endif
       for (uint32_t i = t->nrefs; i < n; i++)
         if (w[i] && !(w[i] & 1))
           visit(gc_edge(&w[i]), heap, trace_data);
@@ -241,9 +300,32 @@ static inline void gc_trace_heap_roots(struct gc_heap_roots *roots,
                                        struct gc_heap *heap,
                                        void *trace_data) {
   if (!roots) return;
-  for (size_t i = 0; i < roots->nstatics; i++)
+  for (size_t i = 0; i < roots->nstatics; i++) {
+#ifdef __wasm__
+    /* DEBUG (FPPRT_ROOTCHECK=1): the STATIC roots — the globals' slots — were
+     * never validated, only the ranges below. A global holding a raw scalar
+     * lands here and is followed as an edge. */
+    if (fpprt_rootcheck_() && roots->statics[i] && !(roots->statics[i] & 1)) {
+      uintptr_t v = roots->statics[i];
+      uintptr_t lim = (uintptr_t)__builtin_wasm_memory_size(0) * 65536u;
+      uintptr_t hv = 0;
+      int ok = 0;
+      if (v + sizeof(uintptr_t) <= lim) {
+        hv = *(uintptr_t *)v;
+        ok = (hv & 1) && ((hv >> 1) < fpprt_ntypes_);
+      }
+      if (!ok) {
+        fprintf(stderr,
+                "BADSTATIC slot=%zu of=%zu at=0x%08x val=0x%08x hdr=0x%08x\n",
+                i, roots->nstatics, (unsigned)(uintptr_t)&roots->statics[i],
+                (unsigned)v, (unsigned)hv);
+        abort();
+      }
+    }
+#endif
     if (roots->statics[i] && !(roots->statics[i] & 1))
       trace_edge(gc_edge(&roots->statics[i]), heap, trace_data);
+  }
   for (size_t r = 0; r < roots->nranges; r++) {
     uintptr_t *base = roots->ranges[r].base;
     /* DEBUG (FPPRT_ROOTCHECK=1): a range root that is not a plausible object
