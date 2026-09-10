@@ -481,6 +481,71 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
         match d with
         | DLet (rc, v, sch, e) -> dictSet bodies (v.Path, v.Offset) (rc, v, sch, e)
         | _ -> ()
+    // A GENERIC class' `static let`, marked by Lower: it runs PER
+    // INSTANTIATION rather than once, so it is stamped like a function.
+    let classStatic = dictNew<string * int, string> ()
+    for d in decls do
+        match d with
+        | DExport (v, nm) when nm.StartsWith "$classstatic:" ->
+            dictSet classStatic (v.Path, v.Offset) (nm.Substring 13)
+        | _ -> ()
+    // The class' parameters are FREE in a static's type, never QUANTIFIED by
+    // the binding — `static let mutable cache : list<'T>` has a scheme
+    // quantifying nothing — so the stamp key is its type's free variables.
+    // The stamp key is the scheme's QUANTIFIED variables when it has them —
+    // Infer puts the class' parameters there for a static, which is the only
+    // key a `static let mutable n = 0` has: its TYPE mentions no parameter,
+    // yet `Holder<int>` and `Holder<string>` must not share the counter.
+    // Falls back to the type's free variables.
+    let staticFvs (k : string * int) : int list =
+        match dictTryFind bodies k with
+        | Some (_, _, sch, _) ->
+            // The variables that APPEAR in the type come first: they are the
+            // class' parameters as this static actually uses them, and the
+            // enclosing stamp settles them (CountingHashSet's Traceable rides
+            // its own 'T). The QUANTIFIED list is the fallback for a static
+            // whose type mentions no parameter at all — `static let mutable
+            // n = 0` — where Infer put the class' parameters and there is no
+            // other key. Preferring Quantified outright stamps the Traceable
+            // at obj: the appended parameter is not the variable its body
+            // names, and it settles differently.
+            let inBody = Types.freeVars sch.Body |> List.map prunedId |> List.distinct
+            if not (List.isEmpty inBody) then inBody
+            else sch.Quantified |> List.map prunedId |> List.distinct
+        | None -> []
+    // ALL OR NOTHING per static. A reader whose own type does not mention the
+    // class parameter can never be stamped — `static member Count =
+    // List.length cache` reads a `list<'T>` global and is itself
+    // `unit -> int` — and stamping the static anyway SPLIT the references:
+    // writes to the shared copy, reads from the stamp, an int counter
+    // answering 1 where F# says 2. Worse than the sharing it fixes.
+    // mangled stamp name -> the template it was made from, recorded at
+    // creation for the init-order placement at the end of this pass
+    let valueStampTemplate = dictNew<string, string * int> ()
+    let stampableStatic = dictNew<string * int, bool> ()
+    for k, _ in dictPairs classStatic do
+        let fvs = staticFvs k
+        let mutable ok = not (List.isEmpty fvs)
+        if ok then
+            for d in decls do
+                match d with
+                | DLet (_, dv, dsch, de) when (dv.Path, dv.Offset) <> k ->
+                    let mutable refs = false
+                    mapExpr
+                        (fun x ->
+                            (match x with
+                             | EVar (w, _) | EVarI (w, _, _) | EAssign (w, _) ->
+                                 if (w.Path, w.Offset) = k then refs <- true
+                             | _ -> ())
+                            x)
+                        de |> ignore
+                    if refs then
+                        let dvars =
+                            (Types.freeVars dsch.Body |> List.map prunedId)
+                            @ (dsch.Quantified |> List.map prunedId)
+                        if not (fvs |> List.forall (fun f -> List.contains f dvars)) then ok <- false
+                | _ -> ()
+        dictSet stampableStatic k ok
     let recFieldsIdx = dictNew<string, (string * string) list> ()
     for d in decls do
         match d with
@@ -830,8 +895,58 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
     /// ORIGINAL definition answers a question the clone is not the subject of,
     /// and kept 59 names symbolic that no witness parameter existed for.
     let rewrite (owner : string) (ownerKey : string * int) (subst : Dict<string, string>) (isTemplate : bool) (isClone : bool) (e : Expr) : Expr =
+        // A class static named with NO instantiation of its own (`static
+        // member TraceNoRefCount = traceNoRefCount` is a plain EVar). The
+        // enclosing stamp settles the class' variables; they ride to the clone
+        // as an explicit substitution, since the queue builds its own from
+        // sch.Quantified, which for a static is empty.
+        let stampClassStatic (v : VarId) : VarId option =
+            if (dictTryFind stampableStatic (v.Path, v.Offset)) <> Some true then None
+            else
+                let pairs =
+                    staticFvs (v.Path, v.Offset)
+                    |> List.map (fun id ->
+                          id, (match dictTryFind subst ("#" + string id) with
+                               | Some n -> n
+                               | None -> "#"))
+                if List.isEmpty pairs || pairs |> List.exists (fun (_, n) -> n.Contains "#") then None
+                else
+                    let i = capInst (pairs |> List.map snd)
+                    let mangled = mangleFor v i
+                    if not (dictTryFind seen mangled).IsSome then
+                        dictSet seen mangled true
+                        vecAdd queue ((v.Path, v.Offset), i,
+                                      pairs |> List.map (fun (id, n) -> "#" + string id, n))
+                    // remember WHICH template this stamp came from: the
+                    // placement below needs it, and recovering it from the
+                    // stamp's offset matches the wrong decl (measured: the
+                    // clone initialised at slot 9, its template at 45).
+                    dictSet valueStampTemplate mangled (v.Path, v.Offset)
+                    Some { Path = v.Path; Offset = stampOffsetOf v.Offset mangled; Name = mangled }
         e |> mapExpr (fun x ->
             match x with
+            | EVar (v, sch) when (dictTryFind classStatic (v.Path, v.Offset)).IsSome ->
+                (match stampClassStatic v with
+                 | Some nv -> EVar (nv, sch)
+                 | None -> x)
+            // the static now CARRIES the class' parameters, so a read of it
+            // lowers WITH an instantiation and would otherwise fall to the
+            // general EVarI arm and canonicalize — writes went to the stamp
+            // while reads came from the shared copy, and the counter read 0.
+            // The guard runs the lookup, so a static this use cannot settle
+            // falls through to that arm exactly as before.
+            | EVarI (v, sch, _) when (dictTryFind classStatic (v.Path, v.Offset)).IsSome
+                                     && (stampClassStatic v).IsSome ->
+                (match stampClassStatic v with
+                 | Some nv -> EVar (nv, sch)
+                 | None -> x)
+            // the WRITE side: mapExpr does not map an assignment's VarId, so
+            // without this a mutable static's writes stay on the shared copy
+            // while its reads move to the stamp.
+            | EAssign (v, rhs) when (dictTryFind classStatic (v.Path, v.Offset)).IsSome ->
+                (match stampClassStatic v with
+                 | Some nv -> EAssign (nv, rhs)
+                 | None -> x)
             // WITNESS-ONLY: keep the names, make no demand. Stripped here, so
             // no later pass ever sees the marker.
             | EVarI (v, sch, m :: rest) when m = witnessOnly ->
@@ -969,7 +1084,18 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                 // A value gains nothing from scalar stamping — a nullary union
                 // case shares one singleton, a scalar rides its box — so keep it
                 // Canon, which stays initialised and interoperates by cid.
-                let cls = match cls with | Stamp _ -> (match dictTryFind bodies (v.Path, v.Offset) with Some (_,_,_,ELam _) -> cls | Some _ -> Canon | None -> cls) | other -> other
+                // ... EXCEPT a generic class' static, which RUNS PER
+                // INSTANTIATION and whose value captures the instantiation.
+                // Its clone IS wired into module init: stamped VALUES are
+                // spliced at their template's position, not appended.
+                let cls =
+                    match cls with
+                    | Stamp _ ->
+                        (match dictTryFind bodies (v.Path, v.Offset) with
+                         | Some (_,_,_,ELam _) -> cls
+                         | Some _ -> if (dictTryFind stampableStatic (v.Path, v.Offset)) = Some true then cls else Canon
+                         | None -> cls)
+                    | other -> other
                 (match cls with
                  // The shared (Canon) body is emitted once and generic. Under
                  // the wasm-linear witness ABI (stampScalars) a raw scalar like
@@ -1839,7 +1965,39 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
         for sub, cn, _, own, _ in vecToList instClasses do
             eprintfn "INSTCLS %s <- %s (%d own)" sub cn (List.length own)
         for k, _ in dictPairs vtableLayoutDep do eprintfn "VTLAYDEP %s" k
-    emitted @ (dictPairs stamped |> List.map snd) @ instDecls, vecToList errors
+    // A stamped VALUE is a global with an INITIALIZER, and the backend runs
+    // those in DECL ORDER — appending it with the function stamps would
+    // initialise it after the module-level code that reads it. It carries its
+    // template's dependencies, whose position already satisfies them.
+    let stampedAll = dictPairs stamped |> List.map snd
+    let isValueStamp (d : Decl) = match d with DLet (_, _, _, ELam _) -> false | DLet _ -> true | _ -> false
+    let valueStamps = stampedAll |> List.filter isValueStamp
+    let otherStamps = stampedAll |> List.filter (fun d -> not (isValueStamp d))
+    let stampsAfter = dictNew<string * int, Decl list> ()
+    for d in valueStamps do
+        match d with
+        | DLet (_, nv, _, _) ->
+            (match dictTryFind valueStampTemplate nv.Name with
+             | Some kk ->
+                 dictSet stampsAfter kk (match dictTryFind stampsAfter kk with Some xs -> xs @ [ d ] | None -> [ d ])
+             | None -> ())
+        | _ -> ()
+    let placed =
+        emitted
+        |> List.collect (fun d ->
+              match d with
+              | DLet (_, v, _, _) ->
+                  (match dictTryFind stampsAfter (v.Path, v.Offset) with
+                   | Some xs -> d :: xs
+                   | None -> [ d ])
+              | _ -> [ d ])
+    let placedKeys = dictNew<string * int, bool> ()
+    for d in placed do
+        match d with DLet (_, v, _, _) -> dictSet placedKeys (v.Path, v.Offset) true | _ -> ()
+    let orphans =
+        valueStamps
+        |> List.filter (fun d -> match d with DLet (_, v, _, _) -> (dictTryFind placedKeys (v.Path, v.Offset)).IsNone | _ -> false)
+    placed @ orphans @ otherStamps @ instDecls, vecToList errors
 
 // The link step, v0: demand-closure over symbols. Roots are the program's
 // top-level value initializers; only reachable functions survive. Tier-1
@@ -2116,7 +2274,7 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         // nothing in the program names it. The `$inline` marker is NOT a
         // root — it is a note about a function, and pinning it would keep
         // every fully-inlined body alive forever.
-        | DExport (v, nm) -> if nm <> "$inline" then demand (v.Path, v.Offset)
+        | DExport (v, nm) -> if nm <> "$inline" && not (nm.StartsWith "$classstatic:") then demand (v.Path, v.Offset)
         | _ -> ()
     let mutable i = 0
     while i < vecLen work do
@@ -2139,6 +2297,7 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         // a marker whose function died goes with it, or a later pass meets
         // a DExport naming nothing
         | DExport (v, "$inline") -> (dictTryFind keep (v.Path, v.Offset)).IsSome
+        | DExport (v, nm) when nm.StartsWith "$classstatic:" -> (dictTryFind keep (v.Path, v.Offset)).IsSome
         | DExtern (v, _) -> (dictTryFind keep (v.Path, v.Offset)).IsSome
         // a value nobody reads, whose initializer cannot have an effect, does
         // not need to be computed — and dropping it drops whatever only its

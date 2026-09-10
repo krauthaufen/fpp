@@ -8004,7 +8004,36 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | None -> []
                          dictSet unionCasesReg name (paramVarList (), prev @ [ (t.Text, comps) ])
                  | None -> ())
-            | LetDecl -> inferLet m |> ignore
+            | LetDecl ->
+                inferLet m |> ignore
+                // ... and the `static let` the members read: it is per
+                // instantiation for the same reason, and its scheme has to
+                // quantify the class' parameters or a member stamped at int
+                // has nothing to settle when it names the global.
+                if (tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static"))
+                   && not (List.isEmpty (paramVarList ())) then
+                    (match nodesOf m
+                           |> List.tryFind (fun c2 -> c2.NodeKind = IdentPat)
+                           |> Option.bind (fun ip -> Green.tokens (GNode ip) |> List.tryFind (fun t -> t.Kind = Ident)) with
+                     | Some bt ->
+                         (match dictTryFind defSchemes bt.Offset with
+                          | Some sch ->
+                              let cps =
+                                  paramVarList ()
+                                  |> List.filter (fun cp -> not (sch.Quantified |> List.exists (fun q -> q.Id = cp.Id)))
+                              // spelled out, NOT `{ sch with ... }`: a record
+                              // literal resolves by FIELD-NAME SET and
+                              // `Quantified` belongs to FieldInfo as well, so
+                              // the copy-update read as a FieldInfo and the
+                              // dogfooding gate reported "Scheme vs FieldInfo"
+                              // on this compiler's own source.
+                              if not (List.isEmpty cps) then
+                                  setScheme bt.Offset
+                                      { Quantified = sch.Quantified @ cps
+                                        Constraints = sch.Constraints
+                                        Body = sch.Body }
+                          | None -> ())
+                     | None -> ())
             // a `do` block in a class body is CONSTRUCTOR code and has to be
             // typed like any other: without this its dot-accesses never
             // resolved, so `do db.SetInput ...` reached emission as an
@@ -8564,7 +8593,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // all-zero Var). Hoisted statements compile correctly; see
                 // docs/WASMLIN-SELFHOST-STATUS.md §11.
                 let memberSch =
-                    let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id)
+                    let own = freeVars defTy |> List.distinctBy (fun v -> v.Id)
+                    // A STATIC member belongs to the CLOSED type, as it does
+                    // in .NET: `Holder<int>.Count` and `Holder<string>.Count`
+                    // are different members over different statics even when
+                    // the member's own type mentions no parameter (`Count :
+                    // unit -> int`). Without the class' parameters here the
+                    // use records no instantiation, the member is never
+                    // stamped, and every instantiation shares one static.
+                    // APPENDED, so a member whose type already mentions them
+                    // keeps its existing order and mangling.
+                    let qs =
+                        if isStatic then
+                            own @ (classParams
+                                   |> List.filter (fun cp ->
+                                         not (own |> List.exists (fun v -> v.Id = cp.Id))))
+                        else own
                     for v in qs do (if v.Level > st.Level then v.Level <- 0)
                     { Quantified = qs; Constraints = memberCons; Body = defTy }
                 setScheme t.Offset memberSch

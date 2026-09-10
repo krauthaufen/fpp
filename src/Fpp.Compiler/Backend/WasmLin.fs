@@ -1764,6 +1764,14 @@ let private emitMemcopy (m : Mod) : unit =
 let private emitNoVt (m : Mod) : unit =
     let f = beginFn m [ "$a"; "$b" ]
     localsDone f
+    // print the receiver's class id, as the wider traps below do. This slot
+    // carries no witnesses, so the receiver is the FIRST argument. Without it
+    // a missing row at k=0 is a bare `unreachable` in a frame named `$novt`,
+    // and WHICH type had no implementation — the one thing needed — is
+    // exactly what the backtrace cannot say.
+    lg f "$a"; mem f "i32.load"
+    (if gc then (ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"; gg f "$t2c"; ins f "i32.add"; mem f "i32.load"))
+    callf f "$str_of_int"; callf f "$prints"
     ins f "unreachable"
     endFn f
 
@@ -2269,6 +2277,16 @@ let private emitLalloc (m : Mod) : unit =
 let private emitSpush (m : Mod) : unit =
     let f = beginFn m [ "$v" ]
     localsDone f
+    // FPP_SPUSHCHK=1: trap where a RAW SCALAR is pushed as an in-flight root.
+    // Only a reference belongs here, so a small even non-zero word is a value
+    // that reached a reference path untagged — the collector would later trace
+    // it as a pointer. Trapping at the PUSH keeps the storing function and its
+    // callers in the backtrace; found at collection time they are long gone.
+    if System.Environment.GetEnvironmentVariable "FPP_SPUSHCHK" = "1" then
+        lg f "$v"; ic f 0; ins f "i32.ne"
+        lg f "$v"; ic f 1; ins f "i32.and"; ins f "i32.eqz"; ins f "i32.and"
+        lg f "$v"; ic f 65536; ins f "i32.lt_u"; ins f "i32.and"
+        ifE f; ins f "unreachable"; endB f
     gg f "$roots"; gg f "$sp"; ins f "i32.add"; lg f "$v"; mem f "i32.store"
     gg f "$sp"; ic f 4; ins f "i32.add"; gs f "$sp"
     endFn f
@@ -5472,9 +5490,24 @@ let private lowHeaderCid (t : LReg) : LExpr =
 // directly), so a popped slot left non-zero always holds a valid pointer: the
 // scanner retains it for at most one cycle until overwritten — no corruption,
 // so pop need not clear the slot.
+// FPP_SPUSHCHK=1: trap where a RAW SCALAR is pushed as an in-flight root. Only
+// a reference belongs in a scanned slot, so a small even non-zero word is a
+// value that reached a reference path untagged — the collector traces it as a
+// pointer later, by which time the storing frame is gone. Trapping at the PUSH
+// keeps that function and its callers in the backtrace. Note this push is
+// INLINED here rather than calling $spush, so instrumenting $spush misses it.
+let private spushChk = System.Environment.GetEnvironmentVariable "FPP_SPUSHCHK" = "1"
 let private gcPushStmts (v : LExpr) : LStmt list =
-    [ LStore (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0, v)
-      LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ]
+    let slot () = LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0)
+    [ LStore (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0, v) ]
+    @ (if spushChk then
+        [ LIf (LPrim (AndW,
+                      [ LPrim (AndW, [ LPrim (NeW, [ slot (); LConstW 0 ])
+                                       LPrim (EqW, [ LPrim (AndW, [ slot (); LConstW 1 ]); LConstW 0 ]) ])
+                        LPrim (LtUW, [ slot (); LConstW 65536 ]) ]),
+               [ LTrap ], []) ]
+       else [])
+    @ [ LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ]
 let private gcPopInto (addr : LExpr) (off : int) : LStmt list =
     [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
       LStore (W, addr, off, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0)) ]
@@ -15616,7 +15649,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // (markers live in decls0 — the reachability filter keeps only DLets)
     for d in decls0 do
         match d with
-        | DExport (v, nm) when nm <> "$jsimport" && nm <> "$inline" && (dictTryFind st.Funcs (key v)).IsSome ->
+        | DExport (v, nm) when nm <> "$jsimport" && nm <> "$inline" && not (nm.StartsWith "$classstatic:") && (dictTryFind st.Funcs (key v)).IsSome ->
             exportFn m nm (fn v)
         | _ -> ()
     // runtime bodies

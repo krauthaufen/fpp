@@ -2539,7 +2539,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                           (lowerExpr (GNode r))
                            | None ->
                           match lowerExpr (GNode l) with
-                           | EVar (v, _) -> EAssign (v, lowerExpr (GNode r))
+                           // EVarI too: a generic class' `static let` carries
+                           // the class' parameters, so its name lowers WITH an
+                           // instantiation. The write targets the same binding
+                           // — Link redirects it to the stamp from the
+                           // enclosing body's substitution, which is the only
+                           // sound source for it anyway.
+                           | EVar (v, _) | EVarI (v, _, _) -> EAssign (v, lowerExpr (GNode r))
                            | EIndex (nm, a, i) -> EIndexSet (nm, a, i, lowerExpr (GNode r))
                            | EField (recv, fname, owner) -> EFieldSet (recv, fname, owner, lowerExpr (GNode r))
                            // a member writing class `let mutable` state: the
@@ -5177,7 +5183,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let classLets = nodesOf n |> List.filter (fun m -> m.NodeKind = LetDecl && not (isStaticLet m))
         for sl in staticLets do
             match lowerLetParts sl with
-            | Some (SimpleLet (isRec, v, sch, rhs, _)) -> vecAdd decls (DLet (isRec, v, sch, rhs))
+            | Some (SimpleLet (isRec, v, sch, rhs, _)) ->
+                vecAdd decls (DLet (isRec, v, sch, rhs))
+                // A GENERIC class' static RUNS SEPARATELY PER INSTANTIATION, as
+                // it does in .NET: `Foo<int>` and `Foo<string>` get their own
+                // storage AND their own initializer. Lifted to a single
+                // top-level binding it is built once at the canonical (obj)
+                // instantiation and shared — wrong for state, and unsound when
+                // the value CAPTURES the instantiation: CountingHashSet's
+                // Traceable holds ComputeDelta$obj closures, so a `cset<int>`
+                // ran canonical code over RAW ints and put an untagged key in a
+                // tagged cell. The marker tells Link the global is
+                // class-parameterized; it is a NOTE, not an export, like
+                // `$inline`.
+                if not (List.isEmpty tyParams) then
+                    vecAdd decls (DExport (v, "$classstatic:" + name))
             | _ -> vecAdd notes (offsetOf sl, "static let shape")
         let doNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = BlockExpr)
         let isAbstract (m : GreenNode) =

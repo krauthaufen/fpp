@@ -2166,6 +2166,74 @@ struct receiver is a byref (FS0406). What was fixed is a compiler crash on a
 program fsc rejects; the same capture over a struct PARAMETER is legal in
 both languages and is what the suite uses.
 
+## A generic class' `static let` RUNS PER INSTANTIATION
+
+In .NET the statics of a generic type belong to the CLOSED type: `Box<int>`
+and `Box<string>` have their own. Lifted to a top-level binding they became
+ONE global, built at the canonical (obj) instantiation and shared by every
+stamp — two bugs at once, and only the second is visible without a collector:
+
+* SHARED STATE. Two instantiations saw one counter.
+* A REPRESENTATION CROSSING. Such a value CAPTURES its instantiation:
+  fpp.adaptive's `CountingHashSet<'T>` holds `static let traceNoRefCount`,
+  whose closures are `ComputeDelta$obj`/`ApplyDeltaNoRefCount$obj`. So a
+  `cset<int>` ran canonical code over RAW ints, the untagged key landed in a
+  tagged cell, and the collector traced a small integer as a pointer and
+  aborted. `ComputeDelta$int` was compiled and never reached. That was the
+  fifth heap GC regression in ~/claude/fpp-heap-gc.md.
+
+Lower marks the binding (`$classstatic:<class>`, a NOTE like `$inline` — the
+same three consumers must ignore it: DCE roots, the keep rule, WasmLin's
+export section), and Link stamps it like a function. Five things it has to
+get right, each of which was measured going wrong:
+
+* **A class static's scheme quantifies NOTHING.** The class' parameters are
+  FREE in it — `static let mutable items : list<'T>` reports
+  `quantified=0` — so keying the stamp on `sch.Quantified` silently does
+  nothing. Key on `Types.freeVars sch.Body`, and pass them to the clone as an
+  explicit substitution, since the queue builds its own from `Quantified`.
+* **`mapExpr` does not map an assignment's VarId.** Without an `EAssign`
+  case a mutable static's READS move to the stamp while its WRITES stay on
+  the shared copy: an int counter answered 1 where F# says 2, which is worse
+  than the sharing being fixed.
+* **A STATIC belongs to the CLOSED type, so Infer gives it the CLASS'
+  PARAMETERS.** Without them `static let mutable n = 0` has no key at all
+  (its type mentions none) and `static member Count = n` is `unit -> int`, so
+  the use records no instantiation and every instantiation shares one
+  counter — the counting idiom, which is the common case. They are APPENDED,
+  so a member whose type already mentions them keeps its order and mangling.
+  Two consequences: the static's name then lowers WITH an instantiation, so
+  `rewrite` needs an `EVarI` case beside the `EVar` one (without it writes
+  went to the stamp and reads to the shared copy, and the counter read 0),
+  and an assignment target may be `EVarI`, which Lower must accept.
+* **The stamp key is the variables that APPEAR in the static's type**, and
+  the quantified class parameters only as a FALLBACK when none do. Preferring
+  the quantified list outright stamps CountingHashSet's Traceable at `obj` —
+  the appended parameter is not the variable its body names and settles
+  differently, and the heap corruption came straight back.
+* **Stamping is ALL OR NOTHING per static.** If any referring decl cannot
+  carry the static's variables, stamp none of them: a partly-stamped static
+  is the split above.
+* **A stamped VALUE is spliced at its TEMPLATE'S position**, not appended
+  with the function stamps: the backend runs global initializers in DECL
+  ORDER, so an appended one initialises after the code that reads it.
+* **Key that placement on the template recorded AT STAMP TIME.** Recovering
+  it by reverse-engineering the stamp's offset matched the wrong decl — the
+  clone initialised at slot 9 with its template at 45, so every read got NULL
+  and dispatched through a null receiver. That presented as `$novt`, which
+  reads as a missing vtable row and is not one: `$novt` prints the receiver's
+  cid now (the k=0 trap did not; the wider ones already did), and a cid of 0
+  means the receiver is null, not that a row is empty. Check that before
+  diagnosing the vtable.
+
+`suites/genericstatic.fpp` pins both shapes against the fsi oracle at three
+instantiations, so a fix that merely separates obj from int does not pass.
+
+One trap in writing it: `{ sch with Quantified = ... }` reads as a FieldInfo,
+which also has a `Quantified` field — a record literal resolves by field-name
+SET — and the dogfooding gate caught it as "Scheme vs FieldInfo" on this
+compiler's own source. Spell the record out.
+
 ## A STATIC ACCESS NEEDS ITS TYPE, and cross-file it had none
 
 `AdaptiveToken.Top` in another file than the one declaring the type typed as
