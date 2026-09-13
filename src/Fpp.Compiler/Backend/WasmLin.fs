@@ -139,6 +139,24 @@ type private St =
       Lams : Vec<string * (VarId * Scheme) * Expr * (string * int * Type) list>
       /// while emitting a lifted lambda body: captured key -> its env slot
       mutable Captures : Dict<string, int>
+      /// a capture's STATIC type, kept beside its index. A lifted lambda's env
+      /// slot holds a type-parameter capture as RAW storage, while the USE
+      /// inside the body still names the declaration's variable — so `$box`
+      /// asked `refKindOfExpr`, saw a type parameter and skipped, returning the
+      /// raw int (`unbox<int>` then threw). The binder IS specialized in a
+      /// stamped clone, and this is where that answer survives lifting.
+      mutable CaptureTys : Dict<string, Type>
+      /// a BINDER's type, keyed path:offset, for the decl being lifted. The
+      /// lifting reads a capture's type off the USE, which in a stamped clone
+      /// still names the declaration's variable while the BINDER was
+      /// specialized — so an `int` capture was recorded as `'a` and `$box`
+      /// skipped it. Rebuilt per decl: stamped clones share param VarIds.
+      mutable BinderTys : Dict<string, Type>
+      /// per LIFTED LAMBDA, its captures' binder types. `BinderTys` is rebuilt
+      /// per decl during lifting and is stale by emission, and it cannot be
+      /// made cumulative: stamped clones SHARE param VarIds, so one key would
+      /// answer `int` for the $int clone and `string` for its sibling.
+      mutable LamCapTys : Dict<string, Dict<string, Type>>
       /// lifted lambda name -> (enclosing type-var id, env slot) list: the
       /// enclosing generic fn's witnesses captured into the closure so the
       /// lambda body's generic aggregates resolve raw-vs-ref (the closure
@@ -4046,6 +4064,12 @@ let rec private discover (st : St) (e : Expr) : unit =
         let bnd = dictNew<string, bool> ()
         dictSet bnd (key pv) true
         let caps = freeVars st bnd body
+        // snapshot the captures' BINDER types while this decl's map is live
+        let capTys = dictNew<string, Type> ()
+        for (cp, co, _) in caps do
+            let ck = cp + ":" + string co
+            (match dictTryFind st.BinderTys ck with Some t -> dictSet capTys ck t | None -> ())
+        dictSet st.LamCapTys name capTys
         vecAdd st.Lams (name, (pv, psch), body, caps)
         discover st body
     | ELam ((pv, psch) :: rest, body) ->
@@ -10006,9 +10030,30 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // boxes of their own, so they take the second path.
     | EPrim ("$unbox", [ x ]) -> lowUnboxW (coreToLowE ctx x)
     | EPrim ("$box", [ x ]) ->
+        // the USE's scheme is not the last word inside a LIFTED LAMBDA: a
+        // capture whose declared type is a type parameter rides RAW storage in
+        // the env slot, and the binder that decided that was specialized in
+        // this stamped clone. Ask the capture's recorded type before concluding
+        // there is nothing to box.
+        // The BINDER'S type, not the use's. In a stamped clone the binder was
+        // specialized to a scalar while every use kept naming the
+        // declaration's variable, and a lifted lambda's env slot holds such a
+        // capture as RAW storage — so `refKindOfExpr` saw a type parameter,
+        // skipped the box, and `unbox<int>` threw on a raw word. This decides
+        // ONLY whether to box: the capture's recorded type still drives the env
+        // layout and its GC kind, because taking the binder's word THERE
+        // changes representations and cost `seqmod` two tests.
+        let capName =
+            match x with
+            | EVar (v, _) | EVarI (v, _, _) ->
+                (match dictTryFind ctx.LSt.BinderTys (v.Path + ":" + string v.Offset) with
+                 | Some ty -> (match prune ty with TCon (n, []) when rawScalarName n -> n | _ -> "")
+                 | None -> "")
+            | _ -> ""
         if refKindOfExpr x = RKRaw then
             let nm = rawScalarNameOfExpr x
             lowBoxW ctx (scalarKindOf (if nm = "" then "int" else nm)) (coreToLowE ctx x)
+        elif capName <> "" then lowBoxW ctx (scalarKindOf capName) (coreToLowE ctx x)
         else coreToLowE ctx x
     | ETypeTest (tn, e2) -> (lowTypeTest ctx tn (coreToLowE ctx e2))
     | ECast (tn, e2, true) when
@@ -14092,7 +14137,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
           Funcs = dictNew (); FuncSig = dictNew (); FuncWitness = dictNew (); SlotWitness = dictNew (); SlotWitN = dictNew (); SlotWitIdx = dictNew (); Witnesses = dictNew (); WitnessData = vecNew (); WitnessCur = 0; TypeIds = dictNew (); TypeIdNext = 1; Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; TailApp = refMapNew shallowLamHash; Lams = vecNew ()
-          Captures = dictNew (); LamWits = dictNew ()
+          Captures = dictNew (); CaptureTys = dictNew (); BinderTys = dictNew (); LamCapTys = dictNew (); LamWits = dictNew ()
           RecFields = dictNew (); ClassNames = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); SubFieldKind = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew (); EnumConst = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew (); ObjWit = dictNew (); CasePod = dictNew (); UnionFlat = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
@@ -15394,10 +15439,24 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // discover every NESTED lambda (the top-level ELams ARE the functions,
     // so walk their bodies, not the whole binding) and give each a lifted
     // function and a code-table slot
+    // seed the binder types for THIS decl before lifting it: a capture's type
+    // is read off the use, which a stamped clone leaves naming the
+    // declaration's variable. Rebuilt per decl — clones share param VarIds.
+    let seedBinderTys (e : Expr) =
+        st.BinderTys <- dictNew ()
+        let rec goB (x : Expr) : unit =
+            (match x with
+             | ELam (ps, _) -> for (bv, bsch) in ps do dictSet st.BinderTys (key bv) bsch.Body
+             | ELet (_, bv, bsch, _, _) -> dictSet st.BinderTys (key bv) bsch.Body
+             | _ -> ())
+            List.iter goB (children x)
+        goB e
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (_, body)) when (dictTryFind st.Funcs (key v)).IsSome -> discover st body
-        | DLet (_, _, _, e) -> discover st e
+        | DLet (_, v, _, (ELam (_, body) as whole)) when (dictTryFind st.Funcs (key v)).IsSome ->
+            seedBinderTys whole
+            discover st body
+        | DLet (_, _, _, e) -> seedBinderTys e; discover st e
         | _ -> ()
     // interface dispatches (found during discover) call a `$lfn<n>` type at
     // arity `1 + argc`; declare any not already covered by a top-level function
@@ -15950,6 +16009,20 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             curFnQuantIds <-
                 (sch.Quantified |> List.map (fun q -> q.Id))
                 @ (sch.Quantified |> List.map prunedId)
+            // this function's OWN binder types, for the `$box` decision. A
+            // parameter used DIRECTLY (`Identity = box value`) hits the same
+            // gap a capture does: the binder is specialized in a stamped clone
+            // while the use still names the declaration's variable. Seeded per
+            // decl — stamped clones share param VarIds, so it cannot accumulate.
+            st.BinderTys <- dictNew ()
+            (let rec goB (x : Expr) : unit =
+                (match x with
+                 | ELam (bps, _) -> for (bv, bsch) in bps do dictSet st.BinderTys (key bv) bsch.Body
+                 | ELet (_, bv, bsch, _, _) -> dictSet st.BinderTys (key bv) bsch.Body
+                 | _ -> ())
+                List.iter goB (children x)
+             for (bv, bsch) in ps do dictSet st.BinderTys (key bv) bsch.Body
+             goB body)
             tailFnKey <- key v
             let ps2, body2 =
                 match dictTryFind st.TupleParam (key v), body with
@@ -16011,7 +16084,11 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // lowering reads them from the env register.
     for name, (pv, psch), body, caps in vecToList st.Lams do
         st.Captures <- dictNew ()
-        caps |> List.iteri (fun i (p, o, _) -> dictSet st.Captures (p + ":" + string o) i)
+        st.CaptureTys <- dictNew ()
+        caps |> List.iteri (fun i (p, o, ty) ->
+              dictSet st.Captures (p + ":" + string o) i
+              dictSet st.CaptureTys (p + ":" + string o) ty)
+        st.BinderTys <- (match dictTryFind st.LamCapTys name with Some d -> d | None -> dictNew ())
         emitLambdaLow st m name pv psch body
     // GC: emit $fpreg_all LAST — every shape's tid is known now. Each shape is
     // registered as (tid, size, kind, start, refoffs=0, name=0); `start` is the
