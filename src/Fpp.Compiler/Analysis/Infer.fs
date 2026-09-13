@@ -7514,6 +7514,60 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   (match Green.tokens (GNode tn) |> List.tryHead with
                    | Some t -> vecAdd pendingBaseInsts (t.Offset, baseTy)
                    | None -> ())
+                  // TYPE THE BASE CONSTRUCTOR'S ARGUMENTS, with the base's own
+                  // parameter type flowing IN. They were lowered but never
+                  // inferred — `inherit Base<'T>("s")` against a base taking
+                  // `list<'T>` compiled clean, `--strict` included — and with
+                  // nothing typing them no instantiation was recorded, so a
+                  // generic value passed here stayed canonical and its witness
+                  // went out UNIFORM (`IndexList.trace` reaching
+                  // AbstractReader is 6 of fpp.adaptive's sites).
+                  //
+                  // `exprExpect` is the channel an ordinary argument uses, and
+                  // it is REQUIRED here, not a refinement: typing the argument
+                  // bottom-up and unifying afterwards rejects `(<>) "Input"`
+                  // passed where `obj -> bool` is declared (F# accepts it; the
+                  // expectation is what pins 'a to obj before the literal is
+                  // typed), and it records the instantiation at `obj`, which is
+                  // WORSE than the flagged fallback it replaces.
+                  let baseArgNodes = nodesOf inh |> List.filter (fun m -> isExprish m.NodeKind)
+                  if not (List.isEmpty baseArgNodes) then
+                      let ctorParams =
+                          match prune baseTy with
+                          | TCon (bn, _) ->
+                              let cands =
+                                  realCtors ctors bn
+                                  |> List.filter (fun (_, csch) ->
+                                        let rec arity (t : Type) (n : int) =
+                                            match prune t with TFun (_, r) -> arity r (n + 1) | _ -> n
+                                        arity csch.Body 0 = List.length baseArgNodes)
+                              (match cands with
+                               | [ (_, csch) ] ->
+                                   let cty = st.Instantiate csch
+                                   let rec peelC (t : Type) (acc : Type list) =
+                                       match prune t with
+                                       | TFun (a2, r) -> peelC r (acc @ [ a2 ])
+                                       | res -> acc, res
+                                   let ps, res = peelC cty []
+                                   // pin the class' arguments first, so a
+                                   // parameter mentioning 'T is expected at the
+                                   // base's instantiation and not at a fresh var
+                                   Types.unify res baseTy |> ignore
+                                   if List.length ps = List.length baseArgNodes then ps else []
+                               | _ -> [])
+                          | _ -> []
+                      baseArgNodes
+                      |> List.iteri (fun i m ->
+                            (match List.tryItem i ctorParams with
+                             | Some pt -> exprExpect <- Some pt
+                             | None -> exprExpect <- None)
+                            let at = exprType (GNode m)
+                            match List.tryItem i ctorParams with
+                            | Some pt ->
+                                (match Green.tokens (GNode m) |> List.tryHead with
+                                 | Some at0 -> unifyArg at0.Offset pt at
+                                 | None -> ())
+                            | None -> ())
                   // `and IAdaptiveValue<'T> = inherit IAdaptiveValue` names
                   // the SAME key as the type being declared, because a type
                   // is keyed by its bare name. Recording it would make the

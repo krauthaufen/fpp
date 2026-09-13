@@ -2174,6 +2174,44 @@ struct receiver is a byref (FS0406). What was fixed is a compiler crash on a
 program fsc rejects; the same capture over a struct PARAMETER is legal in
 both languages and is what the suite uses.
 
+## A base constructor's ARGUMENTS are typed, with the expectation flowing IN
+
+They were LOWERED but never INFERRED — the "parses and is then ignored" shape
+this file forbids. `inherit Base<'T>("s")` against a base taking `list<'T>`
+compiled clean, `--strict` included, and ran with a string where a list
+belongs. The same gap cost WITNESSES: nothing typed the argument, so no
+instantiation was recorded for what it names, and a generic value passed to a
+base constructor stayed canonical with its witness UNIFORM. `IndexList.trace`
+reaching `AbstractReader` that way was 6 of fpp.adaptive's 39 uniform sites
+(39 -> 33 once fixed).
+
+THE EXPECTED TYPE MUST FLOW IN (`exprExpect`, the channel an ordinary argument
+uses). Typing the argument bottom-up and unifying afterwards is a different
+thing and is wrong twice, both measured:
+
+* it REJECTS WHAT F# ACCEPTS. `(<>) "Input"` is `string -> bool` passed where
+  `obj -> bool` is declared. F# instantiates `(<>)` at obj BEFORE typing the
+  literal, because the expectation is known there; unifying after the fact
+  compares `string -> bool` with `obj -> bool` and fails. Four
+  `AbstractDirtyReader` sites in fpp.adaptive died on it, under plain `unify`
+  and under `unifyArg` alike.
+* it RECORDS THE WRONG INSTANTIATION. Without the expectation the value's
+  variable is unconstrained and defaults to `obj`, so `Derived$int` built
+  `empty<obj>` — an unflagged witness asserting "pointer" over what may be a
+  raw int, which is WORSE than the flagged fallback it replaces.
+
+`(<>) "a"` really is `string -> bool`, and that is not a subtype of
+`obj -> bool`: function domains are contravariant, so the coercion upstream
+relies on is the UNSAFE direction. The compiler is right and the SOURCE is
+adapted — `tests/port-adaptive.py` rewrites the idiom, which is upstream
+FSharp.Data.Adaptive's own (AdaptiveHashSet.fs 953/1000/1065/1156), not our
+port's. Supporting it in the compiler would mean expected-type propagation
+through partial applications — sound, but not function subtyping and not
+needed here. The result tie at an application is deliberately restricted to
+tuple-literal arguments; read the comment there before widening it.
+
+`neg/inherit-arg-typechecked.fpp` pins the check.
+
 ## A BINDER is specialized by a stamp; its USES are not
 
 `substBinderTypes` rewrites a clone's lambda parameters, `let`s and pattern

@@ -873,6 +873,16 @@ def thunk_module_generic_values(src):
     src = chr(10).join(out)
     src = re.sub(r"\b(" + "|".join(THUNKED_MODULE_VALUES) + r")\.empty(<[^<>=]*>)?(?! ?\(\))",
                  lambda m: "(" + m.group(1) + ".empty" + (m.group(2) or "") + " ())", src)
+    # `(<>) "Input"` is upstream's spelling for an `obj -> bool` dirty filter
+    # (AdaptiveHashSet.fs 953/1000/1065/1156). F# accepts it by instantiating
+    # (<>) at obj BEFORE typing the literal, because the expected type is
+    # known there; F++ types an application bottom-up, so the partial
+    # application is `string -> bool` — which is the CORRECT type for it, and
+    # not a subtype of `obj -> bool` (function domains are contravariant, so
+    # the coercion upstream relies on is the unsafe direction). Spell the
+    # filter out at the type the base declares.
+    src = re.sub(r'\(<>\) "([A-Za-z0-9_]+)"',
+                 lambda m: '(fun (o : obj) -> o <> box "' + m.group(1) + '")', src)
     src = src.replace("empty () ()", "empty ()")
     src = src.replace("(empty ()) ()", "(empty ())")
     return src
