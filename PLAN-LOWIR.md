@@ -1,5 +1,11 @@
 # LowIR — a shared machine IR for the linear/tagged backends
 
+> **STATUS 2026-09-13: LANDED and effectively always on.** `LowIR.fs` exists,
+> `--lowir` is a real flag, and `Program.fs` turns the LowIR path on for every
+> GC build (`lowirBackend <- (--lowir) || useGc`, and `--gc` is the default) —
+> so the seam is the normal path, not an experiment. `FPP_LOWIR_STATS`, named
+> below, is in no source file: do not reach for it.
+
 The C backend (`CEmit`, over fpprt) and the direct wasm-linear backend
 (`WasmLin`) re-implement the same lowering: lambda lifting, closure
 representation, pattern-match compilation, the tagged value model, f64/i64

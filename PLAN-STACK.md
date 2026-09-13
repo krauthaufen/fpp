@@ -521,8 +521,9 @@ Wired a full-compiler self-compile harness (whole frontier + a driver that calls
 run). It compiles cleanly (0 errors) and RUNS the whole pipeline — the first time
 `lower`/`infer`/emit execute under WasmLin.
 
-Fixed the long-documented **`let rec … and` self-host bug** (CLAUDE.md +
-tests/known-issues/let-rec-and-group-self-host.fpp). `lower` has a
+Fixed the long-documented **`let rec … and` self-host bug** (CLAUDE.md; the
+known-issues repro it names is gone, and `tests/conformance/suites/letrecand.fpp`
+pins the shapes instead). `lower` has a
 `let rec quote … and quoteTy …` group in a match arm; `quoteTy` stubbed as an
 "unresolved variable", so `lower` became an `unreachable` trap. Root cause: a
 rec-group member gets its register + cell ONLY when the rec-group lowering

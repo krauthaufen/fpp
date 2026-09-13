@@ -4,13 +4,26 @@ A handover. What is built, what it is being built towards, and what is known
 to be wrong — written so the next session can start without re-deriving any
 of it.
 
-Gates at the time of writing, all green (the numbers move; the shape does not):
+> **READ THIS FIRST (2026-09-13).** Parts of this document are stale by a
+> WHOLE BACKEND. The wasm-GC backend it refers to as a live oracle is DELETED
+> — `BinDriver.fs` and the `--wasmgc` flag are gone, and the only mention left
+> in the source is a comment saying so. There is ONE backend today: wasm-linear
+> over fpprt/Whippet, with the C backend (`CEmit`) sharing its middle end.
+> Where this file says "the wasm-GC oracle", read "the fsi oracle" or "the
+> wasm-linear gate". CLAUDE.md is the operative document; this one is history
+> plus design rationale.
+
+Gates, re-measured 2026-09-13 (the numbers move; the shape does not):
 
 ```
-663 tests
-corpus fixpoint      78159 bytes, byte-identical
-self-host fixpoint 2077227 bytes, byte-identical
-adaptive suite     100 tests, 0 failed — wasm-GC oracle, fpprt NATIVE, and wasm-linear
+692 unit tests
+corpus fixpoint      173769 bytes, byte-identical
+self-host fixpoint 20222957 bytes, byte-identical
+conformance        113 suites, 82 negatives
+run-gates.sh --full 41 gates: 40 green, parallel-gate red for an
+                   ENVIRONMENT reason (its emscripten step fails with stderr
+                   suppressed under `set -e`, so it prints OK and exits 1)
+adaptive suite     100 tests, 0 failed — fsi-pinned, fpprt NATIVE and wasm-linear
 cback gates        parity (4 programs), mstruct, byref, podarr, gstruct,
                    interop (native + wasm32) — each fsi-pinned, mmc + semi
 ```
@@ -429,9 +442,10 @@ passed, the .NET build was clean, and the CORPUS gate died with an
 `unreachable` deep inside an unrelated lambda. Bisecting showed the nested
 branch was never reached during the failing compile — it was the SHAPE, not
 the logic. Splitting the group into two ordinary bindings fixed it with no
-other change. Banked as
-`tests/known-issues/let-rec-and-group-self-host.fpp`, which is honest that
-it does not reproduce in isolation.
+other change. It was banked as `tests/known-issues/let-rec-and-group-self-host.fpp`;
+that file is GONE, because the bug was FIXED — a forward reference inside the
+group left the first binding's receiver unresolved (Infer's `forwardVars`), and
+`tests/conformance/suites/letrecand.fpp` pins the shapes now.
 
 That is the gate earning its keep again: 637 tests and a clean .NET build
 said yes, and the compiler could not compile itself.
@@ -951,8 +965,9 @@ One reproducible defect (`tests/known-issues/`):
   library port never hits it because its enumerators were restructured
   (see DIVERGENCES.md); plain user code can.
 
-And `let-rec-and-group-self-host.fpp` stays as the record of a shape to
-avoid, not a live defect.
+And `let-rec-and-group-self-host.fpp` is no longer a record of a shape to
+avoid: the bug behind it was fixed in Infer (`forwardVars`) and the shapes are
+pinned by `tests/conformance/suites/letrecand.fpp`.
 
 ## Roadmap
 

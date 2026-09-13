@@ -208,10 +208,10 @@ together, and they have each caught things review did not.
 ```bash
 dotnet build -c Release                      # ~30 s
 dotnet run  -c Release --project tests/Fpp.Tests      # ~4 min, 692 tests
-tests/conformance/run.sh                              # 76 suites, fsi oracle
+tests/conformance/run.sh                              # 113 suites, fsi oracle
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
-./tests/run-gates.sh --full                           # ~9 min, all 32, parallel
+./tests/run-gates.sh --full                           # ~9 min, all 41, parallel
 tests/tooling/perf/regress.sh --timing                # perf, on a QUIET box
 ```
 
@@ -874,8 +874,11 @@ the raw and uniform representations, and an unspecialized binder is a
 permanent crossing point in the middle of specialized code.
 
 `substBinderTypes` (Link) now applies the same substitution to lambda
-parameters, `let`s and pattern binders. `FPP_MONO_CENSUS=1` counts what is
-left: 113 of 233 top-level functions bound a type variable before, 98 after.
+parameters, `let`s and pattern binders. It does NOT rewrite the USES that name
+them — see the section on that above, and the boxing bug it caused. When this
+was written a `FPP_MONO_CENSUS=1` counter reported 113 of 233 top-level
+functions binding a type variable before the pass and 98 after; THAT FLAG NO
+LONGER EXISTS, so treat the numbers as history, not as something to re-measure.
 
 **Only SCALAR instantiations are substituted.** Specializing a binder to a
 reference type changes no representation — both ride the uniform word — while
@@ -946,7 +949,7 @@ inference are keyed by the variable the SOURCE bound; a callee is inlined at
 most once per caller so a key cannot be bound twice, and never when its
 binder keys collide with the caller's (monomorphized clones share VarIds).
 
-With all of that, all 93 conformance suites and all 60 negatives pass with
+With all of that, all 113 conformance suites and all 82 negatives pass with
 `FPP_INLINE=1`. It stays opt-in for one thing that remains: the CORPUS
 fixpoint traps — the compiler compiled with inlining miscompiles itself
 somewhere the suites do not reach. Until that is found, this is a flag.
@@ -1046,12 +1049,17 @@ The 2026-08 pass found three real wastes, each visible only in a profile
 `Array.zeroCreate` of a POD struct spent a quarter of the benchmark seeding
 zero fields into an `array.new_default` that was already zero (the seeding
 is for CLASS-shaped elements, which need instances in the slots); every
-statement answered with a boxed unit that its context immediately dropped
-(`pushUnit`/`dropU` cancel the pair positionally, like the box/unbox
-peephole); and a store into a hoisted-base POD array still called the
-`$hwset` runtime helper whenever ANYTHING in the program pinned that
-element kind — float formatting does — so the pin test is now inlined on
-the hoisted storage, mirroring the read path. After all three: vertices
+statement answered with a boxed unit that its context immediately dropped;
+and a store into a hoisted-base POD array still called a runtime pin helper
+whenever ANYTHING in the program pinned that element kind — float formatting
+does — so the pin test is inlined on the hoisted storage, mirroring the read
+path.
+
+READ THAT PARAGRAPH AS HISTORY. It describes the wasm-GC backend, which is
+DELETED: `pushUnit`, `dropU` and `$hwset` are in no source file today, and
+the linear backend lowers `ELit LUnit` to a plain `0`, so there is no boxed
+unit to cancel. The numbers below were measured on that backend and are kept
+for the METHOD (profile, then A/B), not as a claim about the code you have. After all three: vertices
 149 ms vs C 62, add 65 vs 67, read 88 vs 103 (both now BEAT C), shapes 686
 vs 248. What remains on vertices/shapes is per-access bounds checks and no
 SIMD — wasm-GC array.get has no unchecked or vector form, so that gap
@@ -1105,7 +1113,7 @@ THE FIXPOINT CANNOT VALIDATE EITHER FLAG. `GetEnvironmentVariable` answers
 null inside the wasm-hosted compiler (`System` is one of the roots that
 reach the backend unresolved), so with `FPP_UNROLL=1` stage-0 unrolls and
 stage-1 does not, and the fixpoint reports a byte mismatch that means
-nothing. Check these passes with the CONFORMANCE suite instead — all 76 are
+nothing. Check these passes with the CONFORMANCE suite instead — all 113 are
 green under unroll, strength and both.
 
 VERIFY THE PASS FIRES BEFORE BELIEVING A NULL RESULT. The first measurement
@@ -1283,8 +1291,8 @@ body contains zero `array.len`. That one was checked, not assumed.
   first (`local`, then `localsDone`), then instructions, then `endFn`, in
   one pass. It was the wasm-GC driver that replayed, and that backend is
   gone. If you resurrect a two-pass scheme, both passes must allocate
-  locals identically: any cache that lets the second skip a `freshLocal`
-  desynchronises them.
+  locals identically: any cache that lets the second skip a local allocation
+  (`local f "$name" "i32"`, the only way one is declared) desynchronises them.
 * `wasm-tools validate -f all out.wasm` gives a far better message than the
   runtime does.
 
@@ -2165,6 +2173,50 @@ valid F#: it captures the struct RECEIVER in a closure inside a member, and a
 struct receiver is a byref (FS0406). What was fixed is a compiler crash on a
 program fsc rejects; the same capture over a struct PARAMETER is legal in
 both languages and is what the suite uses.
+
+## A BINDER is specialized by a stamp; its USES are not
+
+`substBinderTypes` rewrites a clone's lambda parameters, `let`s and pattern
+binders at the instantiation. It does NOT rewrite the `EVar`s that name them,
+so in a clone stamped at int the binder says `int` and every use still says
+`'a`. Almost nothing asks — the value rides the register the binder decided —
+but `refKindOfExpr` asks the USE, and it is what `$box` consults. So
+`box v` answered "nothing to box" and handed back the raw word:
+`erased 2` then `unbox<int> (value.Get ())` THREW (fpp.rendering's
+boxed-constant-closure). A lifted lambda's env slot holds a type-parameter
+capture as RAW storage, which is what makes the raw word reach `unbox`.
+
+The fix consults the BINDER'S type at the `$box` site only, from two seeds
+rebuilt per decl (`St.BinderTys`): the enclosing function's own binders, and —
+snapshotted per lifted lambda at discover time (`St.LamCapTys`) — its
+captures'. Both are needed: a capture (`fun () -> box v`) and a parameter used
+DIRECTLY (`Identity = box value`) hit the same gap, and the second is easy to
+miss because the first looks like a closure bug.
+
+THREE WIDER FIXES WERE MEASURED AND REVERTED. Do not re-try them without
+these numbers:
+
+* rewriting every use's scheme in `substBinderTypes` — both fixpoints, the
+  unit suite and conformance went red;
+* the same, narrowed to uses whose type is a bare settled type variable —
+  both fixpoints still red;
+* taking the binder's type for the CAPTURE ITSELF (in `freeVars`) — boxing
+  worked, and it cost `seqmod` two IEnumerable tests, because that type also
+  drives the env layout and the slot's GC kind. An "upgrade only when the use
+  is a bare variable" variant regressed it too.
+
+The rule those three share: a stamp's substitution may inform a DECISION
+without changing a REPRESENTATION. `St.BinderTys` is keyed path:offset and
+must never accumulate across decls — stamped clones share param VarIds, so one
+key would answer `int` for the $int clone and `string` for its sibling.
+
+What is NOT fixed: bool, char, byte and the narrow ints do not stamp at all
+(`boxedScalar` in Link), so they stay canonical, where a scalar rides a TAGGED
+word and no static type separates it from a pointer. `box` there is still the
+identity. It needs a runtime decision from the witness — `lowMkCellW`'s
+`refMask w` is the precedent — plus the witness naming WHICH scalar, since
+each box carries its own class id. `tests/known-issues/box-canonical-tagged-scalar.fpp`
+holds the repro; `suites/boxgenericclosure.fpp` pins the stamped half.
 
 ## A generic class' `static let` RUNS PER INSTANTIATION
 

@@ -1,5 +1,15 @@
 # Witness completeness → full moving GC
 
+> **STATUS 2026-09-13: PARTLY LANDED.** Witnesses are real and pervasive
+> (`FuncWitness`, `SlotWitness`, `LamWits`, `stampedClassWits` in WasmLin), and
+> `FPP_WITSCAN` / `FPP_WITSTRICT` / `FPP_WITWHY` exist for measuring them. The
+> goal below — EVERY generic context knowing ref-vs-raw — is NOT reached: 45
+> of 6986 witness arguments in fpp.dom's build still go out uniform, 41 of 4677
+> in fpp.adaptive's, and `tests/known-issues/witness-uniform-fallback.md`
+> records why that is an optimisation gap rather than a defect. The conservative
+> tracing that implies is still the default. Three flags named below —
+> `FPP_QUAL`, `FPP_WCLS`, `FPPRT_UNIFORM_CONSERVATIVE` — are in no source file.
+
 GOAL: every generic context knows ref-vs-raw for its type params (a WITNESS
 per param, everywhere), so nothing is traced conservatively; then evacuation
 comes back on and pinning is per-object (`fpprt_pin`), temporary — movement

@@ -1,5 +1,11 @@
 # WasmLin `--gc` self-host — status (2026-08-16, evening)
 
+> **HISTORICAL, 2026-08-16.** Kept for the diagnoses in it, not as current
+> state. `--gc` is the DEFAULT today and is not a mode to reach; the wasm-GC
+> backend this was racing is deleted. Two flags named below, `FPP_PRELUDE_TRUNC`
+> and `FPP_WDROP`, are in no source file any more — do not reach for them.
+> Current numbers live in CLAUDE.md and STATUS.md.
+
 **MILESTONE: the 16 MB growable self-host RUNS TO COMPLETION** (`DONE
 bytes=65219 hash=703075731`, exit 0, real collections firing). The crash
 class of §3 is closed. What remains is task #69: the 65219-byte emit vs the
